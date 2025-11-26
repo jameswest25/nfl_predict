@@ -1,0 +1,24 @@
+FEATURE PIPELINE AUDIT REPORT (CHUNKED) - 2025-06-21 13:12:05
+File: data/processed/statcast/statcast_processed.parquet
+Total Rows: 237,650
+Duplicate batter-game keys: 0
+
+--- Missing Values ---
+
+--- Infinite Values ---
+
+--- Pitch Shape Probabilities ---
+Invalid probability sums: 237,650 (100.0%)
+
+--- Correlation Analysis (on 21,039 random samples) ---
+Found 12 pairs with correlation > 0.95:
+  - 2b_factor & 2b_factor_norm: 1.000
+  - hr_factor & hr_factor_norm: 1.000
+  - park_factor & park_factor_norm: 1.000
+  - starter_pitcher_id & pitcher: 1.000
+  - is_hit & gets_hit: 1.000
+  - rw_iso_shape2 & rw_xbh_rate_shape2: 1.000
+  - rw_iso_shape3 & rw_xbh_rate_shape3: 0.999
+  - rw_iso_shape1 & rw_xbh_rate_shape1: 0.991
+  - rw_hit_rate_shape3 & rw_iso_shape3: 0.977
+  - game_pk & game_year: 0.973
