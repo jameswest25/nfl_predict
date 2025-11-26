@@ -36,6 +36,20 @@ def test_normalize_param_distributions_valid():
     assert grow_policy["choices"] == ["depthwise", "lossguide"]
 
 
+def test_normalize_param_distributions_infers_int_type():
+    cfg = {
+        "param_distributions": {
+            "xgboost": {
+                "n_estimators": {"low": 100, "high": 500},
+            }
+        }
+    }
+    normalized = normalize_param_distributions(cfg)
+    spec = normalized["xgboost"]["n_estimators"]
+    assert spec["type"] == "int"
+    assert spec["kind"] == "numeric"
+
+
 def test_normalize_param_distributions_invalid_range():
     cfg = {
         "param_distributions": {

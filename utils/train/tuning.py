@@ -65,17 +65,34 @@ def _normalize_param_spec(
         )
 
     declared_type = str(raw_spec.get("type", "")).lower().strip()
+    raw_low = raw_spec.get("low")
+    raw_high = raw_spec.get("high")
+    raw_int_like = all(
+        isinstance(val, (int, float)) and float(val).is_integer()
+        for val in (raw_low, raw_high)
+    )
+
+    log_forced = False
     if declared_type in {"int", "integer"}:
         param_type = "int"
     elif declared_type in {"float_log", "log_float"}:
         param_type = "float"
+        log_forced = True
     elif declared_type in {"float", ""}:
         param_type = "float"
+        log_forced = False
+        if not declared_type and raw_int_like and not raw_spec.get("log", False):
+            param_type = "int"
     else:
         raise TuningConfigError(
             f"Hyperparameter '{param_name}' for model '{model_name}' specifies unsupported type "
             f"'{declared_type}'. Allowed: int, float, float_log."
         )
+
+    if declared_type not in {"float_log", "log_float"}:
+        log_forced = bool(raw_spec.get("log", False))
+    else:
+        log_forced = True
 
     if param_type == "int":
         low = math.floor(low)
@@ -88,7 +105,7 @@ def _normalize_param_spec(
         center = default_center
     center = min(center, 1.0)
 
-    log_sampling = bool(raw_spec.get("log", False)) or declared_type == "float_log"
+    log_sampling = log_forced
 
     return {
         "kind": "numeric",

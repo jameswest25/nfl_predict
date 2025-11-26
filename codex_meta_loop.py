@@ -24,6 +24,7 @@ import time
 from pathlib import Path
 import textwrap
 from typing import Tuple, Optional
+from shutil import which
 
 # ---------------- CONFIG ----------------
 
@@ -42,6 +43,21 @@ CODEX_CMD = "codex"
 
 # Max number of implementation iterations (Prompt 3) per plan
 MAX_IMPLEMENTATION_ITERATIONS = 10
+MAX_VALIDATION_ITERATIONS = 5
+VALIDATION_SUCCESS_SENTINEL = "PIPELINE VALIDATION COMPLETE"
+
+# Command used to run the full NFL pipeline end-to-end for regression testing
+PIPELINE_VENV_PYTHON = PROJECT_DIR / "venv" / "bin" / "python"
+PIPELINE_ENTRYPOINT = PROJECT_DIR / "main.py"
+PIPELINE_EVAL_COMMAND = f"cd {PROJECT_DIR} && {PIPELINE_VENV_PYTHON} {PIPELINE_ENTRYPOINT}"
+
+# Primary metric artifacts to inspect after each pipeline run
+METRICS_ROOT = PROJECT_DIR / "output" / "metrics"
+PRIMARY_TARGET = "anytime_td"
+PRIMARY_FAMILY = "xgboost"
+PRIMARY_METRIC_FILENAME = "metrics.yaml"
+PRIMARY_IMPORTANCE_FILENAME = "feature_importance.json"
+CUTOFF_SUMMARY_FILE = METRICS_ROOT / "cutoff_backtest_summary.csv"
 
 # ----------------------------------------
 
@@ -51,6 +67,7 @@ def run_codex_chat(prompt: str) -> str:
     Call `codex chat` with the given prompt and return the output as a string.
     Adjust flags (-m, etc.) if your codex version uses a different interface.
     """
+    _ensure_codex_cli_available()
     print("\n[run_codex_chat] Starting chat call...\n")
     proc = subprocess.Popen(
         [CODEX_CMD, "chat", "-m", CHAT_MODEL],
@@ -62,6 +79,8 @@ def run_codex_chat(prompt: str) -> str:
     )
     out, _ = proc.communicate(prompt)
     print("[run_codex_chat] Finished. Exit code:", proc.returncode)
+    if proc.returncode != 0:
+        raise RuntimeError(f"'codex chat' exited with {proc.returncode}:\n{out}")
     print("---- Chat output (truncated) ----")
     print(out[:4000])
     print("-------- end chat output --------\n")
@@ -73,6 +92,7 @@ def run_codex_exec(prompt: str) -> str:
     Call `codex exec` with the given prompt and return the full output as a string.
     In exec mode, Codex can act as an agent in the repo (read/edit files, run commands, etc.).
     """
+    _ensure_codex_cli_available()
     print("\n[run_codex_exec] Starting exec call...\n")
     proc = subprocess.Popen(
         [CODEX_CMD, "exec"],
@@ -84,10 +104,117 @@ def run_codex_exec(prompt: str) -> str:
     )
     out, _ = proc.communicate(prompt)
     print("[run_codex_exec] Finished. Exit code:", proc.returncode)
+    if proc.returncode != 0:
+        raise RuntimeError(f"'codex exec' exited with {proc.returncode}:\n{out}")
     print("---- Exec output (truncated) ----")
     print(out[:4000])
     print("-------- end exec output --------\n")
     return out
+
+
+def _ensure_codex_cli_available() -> None:
+    """Verify that the codex CLI is installed and on PATH."""
+    if which(CODEX_CMD) is None:
+        raise RuntimeError(
+            f"Unable to find '{CODEX_CMD}' on PATH. "
+            "Install the Codex CLI or update CODEX_CMD in codex_meta_loop.py."
+        )
+
+
+def _latest_metric_run_dir(target: str = PRIMARY_TARGET, family: str = PRIMARY_FAMILY) -> Optional[Path]:
+    """Return the most recent metrics directory for the given model target/family."""
+    base = METRICS_ROOT / target / family
+    if not base.exists():
+        return None
+
+    run_dirs = [p for p in base.iterdir() if p.is_dir()]
+    if not run_dirs:
+        return None
+
+    return max(run_dirs, key=lambda p: p.stat().st_mtime)
+
+
+def build_model_validation_instructions() -> str:
+    """
+    Provide concrete steps for validating whether code changes improved the model.
+    """
+    latest_dir = _latest_metric_run_dir()
+
+    if latest_dir is not None:
+        baseline_metrics_path = latest_dir / PRIMARY_METRIC_FILENAME
+        baseline_importance_path = latest_dir / PRIMARY_IMPORTANCE_FILENAME
+    else:
+        placeholder_dir = METRICS_ROOT / PRIMARY_TARGET / PRIMARY_FAMILY / "<timestamp>"
+        baseline_metrics_path = placeholder_dir / PRIMARY_METRIC_FILENAME
+        baseline_importance_path = placeholder_dir / PRIMARY_IMPORTANCE_FILENAME
+
+    latest_root_hint = METRICS_ROOT / PRIMARY_TARGET / PRIMARY_FAMILY
+
+    instructions = [
+        "- Capture a baseline snapshot before running any new code:",
+        f"  * Record `auc`, `pr_auc`, `brier_score`, and `precision_at_thresh` from "
+        f"`{baseline_metrics_path}`.",
+        f"  * Note the current feature-importance distribution from `{baseline_importance_path}`.",
+        f"- Run `{PIPELINE_EVAL_COMMAND}` to rebuild datasets, retrain models, and regenerate predictions.",
+        "- After the run completes, identify the newest timestamped directory under "
+        f"`{latest_root_hint}` and repeat the metric collection.",
+        "  * Compare before/after metrics and explicitly call out improvements or regressions.",
+        "  * Re-review the refreshed `feature_importance.json` for any unexpected signal shifts.",
+        f"- Inspect `cutoff_backtest_summary.csv` (e.g., `{CUTOFF_SUMMARY_FILE}`) to confirm horizon-level "
+        "hit rates and calibration remain acceptable.",
+        "- Only declare success if the post-run metrics improve (higher AUC/PR AUC, lower Brier/log loss) "
+        "or, at minimum, hold steady with a justified explanation. Any regression must be reported."
+    ]
+
+    return "\n".join(instructions)
+
+
+def build_prompt_validation(plan: str, failure_notes: Optional[str] = None) -> str:
+    """
+    Prompt dedicated to ensuring the pipeline command runs successfully and produces metrics.
+    """
+    validation_text = build_model_validation_instructions()
+    validation_block = textwrap.indent(validation_text, "    ")
+
+    prompt = textwrap.dedent(f"""
+    You are now in the validation loop. Your job is to make sure the full pipeline command runs
+    successfully and produces refreshed metrics artifacts.
+
+    Plan context (for reference only, do NOT re-hash it unless needed):
+
+    \"\"\"PLAN_START
+    {plan}
+    PLAN_END\"\"\"
+
+    Validation requirements:
+{validation_block}
+
+    Rules for this loop:
+    - You may inspect and edit code, rerun commands, or add logging as needed to fix any issues uncovered
+      while running `{PIPELINE_EVAL_COMMAND}`.
+    - Keep commits incremental. If you end up making larger fixes, describe them clearly.
+    - After each attempt, report status using `PROGRESS:`. If the run fails, capture stack traces / log
+      pointers so the next attempt knows what to fix.
+    - Once you have successfully run the pipeline, collected the new metrics, and compared them against
+      the previous baseline, end your response with the exact line:
+          {VALIDATION_SUCCESS_SENTINEL}
+      Include the usual summary before that sentinel line.
+    - Do NOT output the sentinel unless the metrics truly exist and have been evaluated.
+    """).strip()
+
+    if failure_notes:
+        prompt += textwrap.dedent(f"""
+
+        Here is the status from the previous validation attempt:
+
+        \"\"\"VALIDATION_STATUS
+        {failure_notes}
+        VALIDATION_STATUS_END\"\"\"
+
+        Use it to avoid repeating the same debugging steps.
+        """).rstrip()
+
+    return prompt + "\n"
 
 
 # ---------- PHASE PROMPTS ----------
@@ -260,6 +387,9 @@ def build_prompt_4(plan: str) -> str:
     If fully implemented, Codex should respond ONLY with the sentinel line.
     Includes Git instructions but forbids edits.
     """
+    validation_text = build_model_validation_instructions()
+    validation_block = textwrap.indent(validation_text, "        ")
+
     return textwrap.dedent(f"""
     Okay, great.
 
@@ -296,6 +426,9 @@ def build_prompt_4(plan: str) -> str:
     If you find ANY gaps, incomplete implementations, or deviations from the plan:
     - Do NOT make edits in this step.
     - Instead, describe the gaps clearly and concisely so that we can build a new plan for them.
+
+    Model validation + success criteria:
+{validation_block}
 
     If you find that there are NO gaps and the plan is fully implemented:
     - Respond ONLY with this exact line (no extra text, no explanation):
@@ -352,6 +485,34 @@ def phase_3_implement(plan: str, max_iterations: int = MAX_IMPLEMENTATION_ITERAT
     return False, progress_notes or ""
 
 
+def phase_pipeline_validation(plan: str, max_iterations: int = MAX_VALIDATION_ITERATIONS) -> Tuple[bool, str]:
+    """
+    Loop dedicated to running the pipeline and ensuring metrics are generated.
+    """
+    failure_notes: Optional[str] = None
+
+    for iteration in range(1, max_iterations + 1):
+        print(f"[phase_pipeline_validation] Attempt {iteration}/{max_iterations}")
+
+        prompt = build_prompt_validation(plan, failure_notes=failure_notes)
+        output = run_codex_exec(prompt)
+
+        if VALIDATION_SUCCESS_SENTINEL in output:
+            print("[phase_pipeline_validation] Pipeline run completed successfully.")
+            return True, output
+
+        idx = output.rfind("PROGRESS:")
+        if idx != -1:
+            failure_notes = output[idx:].strip()
+            print("[phase_pipeline_validation] Captured failure notes for next attempt.")
+        else:
+            failure_notes = output[-2000:]
+            print("[phase_pipeline_validation] No PROGRESS marker found; storing output tail.")
+
+    print("[phase_pipeline_validation] Validation loop exhausted attempts without success.")
+    return False, failure_notes or ""
+
+
 def phase_4_audit(plan: str) -> Tuple[bool, str]:
     """
     Run audit ONCE. Never loops.
@@ -382,7 +543,8 @@ def run_one_full_cycle():
     1. Prompt 1: Analysis
     2. Prompt 2: Plan
     3. Prompt 3: Implement (loop up to MAX_IMPLEMENTATION_ITERATIONS)
-    4. Prompt 4: Audit (run exactly once)
+    4. Validation loop: ensure main.py pipeline run succeeds and metrics are refreshed
+    5. Prompt 4: Audit (run exactly once)
        - If gaps remain, treat audit output as a new "analysis" and go back through plan + implementation
          until an audit finally passes (or you stop the script).
     """
@@ -400,6 +562,14 @@ def run_one_full_cycle():
 
         if not implemented:
             print("[run_one_full_cycle] Implementation loop hit iteration limit without full completion.")
+
+        # VALIDATION LOOP
+        validation_ok, validation_notes = phase_pipeline_validation(plan, max_iterations=MAX_VALIDATION_ITERATIONS)
+        if not validation_ok:
+            print("[run_one_full_cycle] Pipeline validation failed; using validation notes as new analysis.")
+            analysis = validation_notes
+            plan = phase_2_plan(analysis)
+            continue
 
         # PHASE 4: single audit run
         plan_complete, gaps = phase_4_audit(plan)
