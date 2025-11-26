@@ -254,25 +254,24 @@ def _suggest_xgb_params(
     return params
 
 
-def _handle_max_leaves_or_depth(trial: optuna.Trial, params: Dict, param_cfg: Dict, clean_base_params: Dict, param_name: str):
-    """Helper function to handle max_leaves or max_depth with centering logic."""
-    cfg = param_cfg.get(param_name, {'low': 128, 'high': 1024})
-    base_value = clean_base_params.get(param_name, cfg['low'])
-
-    if cfg['low'] <= base_value <= cfg['high']:
-        # Base value is within range, center around it
-        low = max(cfg['low'], int(base_value * 0.5))
-        high = min(cfg['high'], int(base_value * 1.5))
-        params[param_name] = trial.suggest_int(param_name, low, high)
-    else:
-        # Use full range
-        params[param_name] = trial.suggest_int(param_name, cfg['low'], cfg['high'])
-
 # ---- public API ----
 def tune_hyperparameters(trainer, model_name: str, problem_config: Dict, X_train, y_train, groups_train, sample_weight=None):
     """Drop-in replacement for ModelTrainer.tune_hyperparameters; writes into trainer.best_params & meta."""
     task_type = problem_config.get("task_type", "classification").lower()
     direction = "minimize" if task_type == "regression" else "maximize"
+    normalized_specs = getattr(trainer, "_normalized_param_distributions", {})
+    model_param_specs = normalized_specs.get(model_name, {})
+
+    if model_name == "xgboost" and not model_param_specs:
+        logger.info(
+            "No hyperparameter distributions configured for %s; skipping tuning and using base params.",
+            model_name,
+        )
+        params_key = f"{problem_config['name']}_{model_name}"
+        base_params = copy.deepcopy(problem_config.get('xgboost_params', {}))
+        trainer.best_params[params_key] = base_params
+        trainer.best_params_meta[params_key] = {"reason": "no_param_distributions"}
+        return base_params
 
     logger.info(f"Starting hyperparameter tuning for {model_name} with Optuna...")
 
@@ -480,8 +479,7 @@ def tune_hyperparameters(trainer, model_name: str, problem_config: Dict, X_train
         else:
             # Regular XGBoost (non-selective) - use original parameter structure
             base_yaml = copy.deepcopy(problem_config.get('xgboost_params', {}))
-            param_cfg = ht_cfg['param_distributions']['xgboost']
-            params = _suggest_xgb_params(trial, base_yaml, param_cfg, task_type, is_rare)
+            params = _suggest_xgb_params(trial, base_yaml, model_param_specs, task_type, is_rare)
             patience = _compute_patience(params["n_estimators"])
 
             scores = []

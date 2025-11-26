@@ -67,7 +67,11 @@ from utils.train.conformal import regression_mean_calibrate, fit_split_conformal
     IsotonicMeanCalibratedRegressor, SplitConformalRegressor
 
 from utils.train.config_types import Paths, TrainingCfg
-from utils.train.tuning import tune_hyperparameters as tune_hyperparameters_ext
+from utils.train.tuning import (
+    tune_hyperparameters as tune_hyperparameters_ext,
+    normalize_param_distributions,
+    TuningConfigError,
+)
 from utils.train.seed import deterministic_seed, set_global_seed
 from utils.train.run_manifest import make_run_id, write_manifest
 from utils.train.team_total import TeamTotalAdjustedClassifier, TeamTotalConfig
@@ -199,6 +203,12 @@ class ModelTrainer:
             versioning_mode=str(self.config['training'].get('versioning_mode', 'run_id')),
             run_tag=str(self.config['training'].get('run_tag', '')),
         )
+        try:
+            self._normalized_param_distributions = normalize_param_distributions(
+                self.cfg.hyperparameter_tuning
+            )
+        except TuningConfigError as exc:
+            raise ValueError(f"Invalid hyperparameter tuning configuration: {exc}") from exc
         # Apply CLI overrides (if provided) by creating new config instances
         cfg_overrides = {}
         if "production_mode" in overrides:
@@ -215,6 +225,12 @@ class ModelTrainer:
         # Rebuild cfg with overrides if any exist
         if cfg_overrides:
             self.cfg = TrainingCfg(**{**self.cfg.__dict__, **cfg_overrides})
+            try:
+                self._normalized_param_distributions = normalize_param_distributions(
+                    self.cfg.hyperparameter_tuning
+                )
+            except TuningConfigError as exc:
+                raise ValueError(f"Invalid hyperparameter tuning configuration: {exc}") from exc
 
         if "problems" in overrides and overrides["problems"]:
             self.config["problems"] = [p for p in self.config["problems"] if p["name"] in set(overrides["problems"])]
