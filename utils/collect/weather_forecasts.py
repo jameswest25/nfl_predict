@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import os
 import json
 import logging
 from dataclasses import dataclass
@@ -205,6 +206,10 @@ def collect_weather_forecasts(
     list[Path]
         Paths of parquet partitions written or updated.
     """
+    if os.environ.get("VC_SKIP_API") == "1":
+        logger.warning("VC_SKIP_API=1 set; skipping weather forecast collection and using existing snapshots.")
+        return []
+
     if not seasons:
         logger.info("No seasons provided for weather forecast collection.")
         return []
@@ -510,4 +515,3 @@ def _safe_to_datetime(value: object) -> Optional[str]:
 
 
 __all__ = ["collect_weather_forecasts"]
-

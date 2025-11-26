@@ -4,6 +4,7 @@ import inspect
 import sys
 import logging
 import math
+import re
 
 
 # Move logging to top and remove global thread pinning
@@ -52,6 +53,7 @@ from utils.train.xgb_utils import (
 )
 from utils.train.data import load_feature_matrix
 from utils.train.purged_group_time_series_split import PurgedGroupTimeSeriesSplit
+from utils.train.purged_cv import compute_purged_group_splits
 from utils.train.sample_weights import compute_sample_weights as compute_sample_weights_util
 from utils.train.feature_artifacts import (
     FeatureArtifacts,
@@ -98,6 +100,8 @@ from utils.train.conformal_composite import (
     fit_team_conformal_sums,
     composite_sum_interval,
 )
+from utils.feature.leak_guard import DEFAULT_LEAK_POLICY, enforce_leak_guard
+from utils.feature.targets import require_target_column
 
 # Ignore specific, noisy warnings from dependencies
 warnings.filterwarnings(
@@ -259,6 +263,7 @@ class ModelTrainer:
 
         # Per-problem attributes initialised later
         self.target_col = None
+        self.label_version = None
         self.feature_columns = None
 
         self.models = {}
@@ -791,6 +796,57 @@ class ModelTrainer:
             )
         return df
 
+    @staticmethod
+    def _filter_odds_snapshot_columns(df: pd.DataFrame, horizon_key: str | None) -> pd.DataFrame:
+        """Keep a single odds snapshot horizon (drop other suffixes)."""
+        if df is None or df.empty or not horizon_key:
+            return df
+
+        normalized = str(horizon_key).strip().lower()
+        horizon_map = {
+            "cutoff": "",
+            "default": "",
+            "": "",
+            "2h": "_2h",
+            "h120m": "_2h",
+            "6h": "_6h",
+            "h360m": "_6h",
+            "24h": "_24h",
+            "h1440m": "_24h",
+            "open": "_open",
+        }
+        allowed_suffix = horizon_map.get(normalized, normalized)
+        if allowed_suffix and not allowed_suffix.startswith("_"):
+            allowed_suffix = f"_{allowed_suffix.lstrip('_')}"
+
+        horizon_re = re.compile(r"^(?P<base>.+)(?P<suffix>_2h|_6h|_24h|_open)$")
+        suffixes_seen: dict[str, set[str]] = {}
+        for col in df.columns:
+            match = horizon_re.match(col)
+            if match:
+                suffixes_seen.setdefault(match.group("base"), set()).add(match.group("suffix"))
+
+        drop_cols: list[str] = []
+        for col in df.columns:
+            match = horizon_re.match(col)
+            if match:
+                suffix = match.group("suffix")
+                if suffix != allowed_suffix:
+                    drop_cols.append(col)
+            else:
+                base = col
+                if base in suffixes_seen and allowed_suffix:
+                    drop_cols.append(col)
+
+        if drop_cols:
+            df = df.drop(columns=drop_cols, errors="ignore")
+            logger.info(
+                "Removed %d odds snapshot columns outside horizon '%s'.",
+                len(drop_cols),
+                horizon_key,
+            )
+        return df
+
     def _ensure_player_game_actuals(self) -> pd.DataFrame:
         if self._player_game_actuals is not None:
             return self._player_game_actuals
@@ -1061,7 +1117,16 @@ class ModelTrainer:
 
 
 
-    def tune_hyperparameters(self, model_name, problem_config, X_train, y_train, groups_train, sample_weight=None):
+    def tune_hyperparameters(
+        self,
+        model_name,
+        problem_config,
+        X_train,
+        y_train,
+        groups_train,
+        sample_weight=None,
+        time_values=None,
+    ):
         """Hyperparameter optimisation via Optuna (currently classification-only). Skips regression tasks."""
         return tune_hyperparameters_ext(
             self,
@@ -1071,6 +1136,10 @@ class ModelTrainer:
             y_train,
             groups_train,
             sample_weight=sample_weight,
+            time_values=time_values,
+            purge_days=float(self.config['data_split'].get('purge_td', 0) or self.config['data_split'].get('purge_window_days', 0) or 0),
+            purge_groups=int(self.config['data_split'].get('purge_games', self.config['data_split'].get('group_gap', 0) or 0)),
+            embargo_days=float(self.config['data_split'].get('embargo_td', 0) or 0),
         )
 
 
@@ -2073,7 +2142,7 @@ class ModelTrainer:
 
         # --- Save inference artifacts AFTER all models for the problem are trained ---
         # This ensures the state (imputation, categories) is from the pre-tuning/pre-holdout phase.
-        save_inference_artifacts(self, problem_name)
+        save_inference_artifacts(self, problem_name, problem_config)
 
     def _unwrap_base_model(self, model):
         """Return the true fitted estimator, no matter how it's wrapped."""
@@ -2163,6 +2232,7 @@ class ModelTrainer:
             
             problem_copy = copy.deepcopy(problem)
             self.target_col = problem_copy['target_col']
+            self.label_version = problem_copy.get('label_version') or problem_copy.get("labels", {}).get("version")
             derived_cfg = problem_copy.get('derived_target')
             target_load_cols: list[str] = []
             if derived_cfg:
@@ -2269,6 +2339,12 @@ class ModelTrainer:
                 df_problem = df_problem.loc[:, ~df_problem.columns.duplicated()]
 
             df_problem = self._apply_problem_level_overrides(df_problem, problem_copy)
+            df_problem = require_target_column(
+                df_problem,
+                self.target_col,
+                label_version=self.label_version,
+                min_non_null=1,
+            )
             
             # Merge input predictions if required
             if input_preds:
@@ -2306,7 +2382,34 @@ class ModelTrainer:
                             df_problem[col] = df_problem[col].fillna(df_problem[col].mean())
 
                 df_problem = self._inject_composed_features(df_problem)
-            
+
+            odds_horizon = problem_copy.get("odds_horizon")
+            if odds_horizon:
+                df_problem = self._filter_odds_snapshot_columns(df_problem, odds_horizon)
+
+            # Leak guard on the problem-scoped frame
+            allow_prefixes = tuple(problem_copy.get('feature_prefixes_to_include') or [])
+            allow_exact = set(problem_copy.get('other_features_to_include') or [])
+            allow_exact.update(input_preds or [])
+            if self.target_col:
+                allow_exact.add(self.target_col)
+            df_problem, leak_info = enforce_leak_guard(
+                df_problem,
+                policy=DEFAULT_LEAK_POLICY,
+                allow_prefixes=allow_prefixes,
+                allow_exact=allow_exact,
+                drop_banned=True,
+                drop_non_allowlisted=False,
+                raise_on_banned=True,
+            )
+            if leak_info.dropped:
+                logger.info(
+                    "Dropped %d leak-prone columns for %s: %s",
+                    len(leak_info.dropped),
+                    problem_name,
+                    sorted(leak_info.dropped),
+                )
+
             self._normalize_datetime_like_columns(df_problem, problem_name)
             df_problem[self.time_col] = pd.to_datetime(df_problem[self.time_col])
             sort_cols = [self.time_col]
@@ -2334,7 +2437,7 @@ class ModelTrainer:
                     logger.warning("Failed to initialise team total scaling for %s: %s", problem_name, exc)
             if not use_cached_for_problem:
                 self._fit_feature_artifacts(df_train, problem_copy)
-                save_inference_artifacts(self, problem_name)
+                save_inference_artifacts(self, problem_name, problem_copy)
 
             # Log final feature list used
             logger.info(f"--- Using {len(self.feature_columns)} features for {problem_name} ---")
@@ -2363,6 +2466,7 @@ class ModelTrainer:
                         y_train,
                         groups_train,
                         sample_weight=sample_weight_train,
+                        time_values=df_train[self.time_col] if self.time_col in df_train.columns else None,
                     )
             else:
                 logger.info("Skipping hyperparameter tuning as per config `run_tuning: false`.")

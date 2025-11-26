@@ -44,18 +44,17 @@ Created at play-level during data cleaning:
 - Handles multi-role players (e.g., QB who also rushes)
 - Output: `data/processed/player_game_by_week/`
 
-#### **C. Daily Totals Cache** (`utils/feature/nfl_daily_totals.py`)
+#### **C. Daily Totals Cache** (`utils/feature/daily_totals.py`)
 
 **Purpose**: Pre-aggregate player stats by date for efficient rolling window lookups
 
 **Cache Structure**:
 ```
-cache/feature/nfl_daily_totals/level={game|drive}/date=YYYY-MM-DD/part.parquet
+cache/feature/daily_totals/level=game/date=YYYY-MM-DD/part.parquet
 ```
 
 **Contexts**:
-- `vs_any`: All games for player on date
-- `vs_team`: Games vs specific opponent on date
+- `vs_any`: All games for player on date (currently used)
 
 **Columns**:
 - ID: `player_id`, `date`, `ctx`, `opponent`
@@ -70,17 +69,14 @@ cache/feature/nfl_daily_totals/level={game|drive}/date=YYYY-MM-DD/part.parquet
 - Efficient cache-based lookups
 
 **Windows Supported**:
-- Integer N: Last N games (1, 2, 3, 4)
+- Integer N: Last N games (1, 3, 5)
 - `"season"`: Current season-to-date
-- `"lifetime"`: All available history
 
 **Contexts**:
-- `vs_any`: Performance against all opponents
-- `vs_team`: Performance vs specific opponent
+- `vs_any`: Performance against all opponents (only context computed today)
 
 **Levels**:
-- `game`: Per-game rates (yards per game)
-- `drive`: Per-drive rates (yards per drive)
+- `game`: Per-game rates (yards per game) — drive-level cache is not wired yet
 
 **Feature Naming Convention**:
 ```
@@ -89,7 +85,7 @@ cache/feature/nfl_daily_totals/level={game|drive}/date=YYYY-MM-DD/part.parquet
 Examples:
   1g_receiving_yards_per_game           (last game avg, all opponents)
   3g_rushing_yards_per_game_vs_team     (last 3 games vs opponent)
-  seasong_touchdown_per_game            (season-to-date TD avg)
+  seasong_touchdowns_per_game           (season-to-date TD avg)
   lifetimeg_passing_yards_per_game      (career passing avg)
 ```
 
@@ -105,19 +101,29 @@ NFL_PLAYER_STATS = [
     "carry",
     "pass_attempt",
     "completion",
-    "touchdown",
+    "touchdowns",
 ]
 
-ROLLING_WINDOWS = [1, 2, 3, 4, "season", "lifetime"]
-ROLLING_CONTEXTS = ["vs_any", "vs_team"]
-ROLLING_LEVELS = ["game", "drive"]
+ROLLING_FEATURE_STATS = [
+    "touchdowns",
+    "target",
+    "carry",
+    "pass_attempt",
+    "red_zone_target",
+    "red_zone_carry",
+    "goal_to_go_target",
+    "goal_to_go_carry",
+    "receiving_yards",
+    "rushing_yards",
+    "passing_yards",
+]
+
+ROLLING_WINDOWS = [1, 3, 5, "season"]
+ROLLING_CONTEXTS = ["vs_any"]
+ROLLING_LEVELS = ["game"]
 ```
 
-**Total Feature Space**: 9 stats × 6 windows × 2 contexts × 2 levels = **216 possible features**
-
-## Integration into Pipeline (`pipeline/feature.py`)
-
-The feature pipeline now includes:
+**Total Feature Space**: 11 stats × 4 windows × 1 context × 1 level = **44 possible features** (initial rollout uses the curated list above)
 
 1. **Build player-game aggregations** (existing)
 2. **Build daily cache** → `build_daily_cache_range()`
@@ -263,4 +269,3 @@ df = add_rolling_features(
 **Implementation Date**: November 4, 2025
 **Status**: ✅ Complete and tested
 **Ready for**: Production pipeline run
-

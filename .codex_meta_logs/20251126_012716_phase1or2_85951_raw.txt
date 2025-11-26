@@ -1,0 +1,1925 @@
+OpenAI Codex v0.63.0 (research preview)
+--------
+workdir: /Users/jameswest/Desktop/nfl_predict
+model: gpt-5.1
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: medium
+reasoning summaries: auto
+session id: 019abf7d-11a9-7822-867b-836a2888b4c8
+--------
+user
+
+Context about this project:
+
+- This is a project that takes NFL play-by-play data and uses it for modeling so that we can
+  predict which players are likely to get an anytime touchdown (rushing or receiving, not passing)
+  in an upcoming game.
+
+- The goal is to build features and models that are as close as possible to the underlying
+  football reality that produces touchdowns: play-calling tendencies, player usage, game state,
+  defensive matchups, injuries, roles, red-zone behavior, etc.
+
+- Training featurization must conceptually and logically match prediction/inference featurization.
+  Anything that can only be known in hindsight at inference time (future data, downstream labels,
+  or derived artifacts that use future information) is a form of leakage and must be eliminated.
+
+- Over time, previous model runs and refactors may have left behind:
+    * partially-implemented ideas,
+    * experimental code paths,
+    * hallucinated features,
+    * or confusing / inconsistent logic.
+  DO NOT assume that all existing code, features, configs, or comments are intentional or correct
+  just because they exist. Treat any piece of code or configuration that does not clearly make
+  sense in the context of the project as a candidate for cleanup, simplification, or removal.
+
+Your task in this step:
+
+Please analyze the current state of this project (code, data flow, feature engineering, and modeling)
+and let me know:
+
+1. Where things conceptually are not implemented correctly or are conceptually off, given the goal of
+   predicting anytime TDs in a way that matches how football is actually played.
+2. Where the modeling or data flow could be brought closer to "reality" as it actually plays out
+  on the field. The goal of getting closer to reality is entirely so that the model is more
+  accurate and metrics like AUC or other evaluation metrics improve.
+3. Any incomplete implementations, half-finished ideas, or abandoned experimental paths.
+4. Any wrong or misleading implementations (especially where names / comments and actual behavior diverge).
+5. Any future data leaking into the modeling or feature pipeline (anything that uses knowledge from
+  after the prediction cut-off point, including label-derived features).
+6. Any underlying data sources or features that appear to not be working at all, or are effectively
+  noise / dead weight.
+7. Any areas where it looks like a previous run of a model or tool hallucinated structure, concepts,
+  or features that don't actually exist in the real data or problem domain.
+
+You should:
+
+- Be concrete and specific in your findings.
+- Call out anything that looks like hallucinated or legacy cruft that should probably be removed or
+  reworked, instead of assuming it must be intentional.
+- Focus on how each issue you find ultimately affects model realism and predictive performance.
+
+mcp startup: no servers
+
+thinking
+**Analyzing repository**
+
+I need to perform a repo analysis using a read-only sandbox where I can run shell commands. I intend to inspect the project thoroughly and prepare a multi-step plan. I'll need to utilize commands like update_plan followed by shell_command, using tools like rg and ls. Since I can only read and not ask for approvals, I'll carefully analyze the code to address any conceptual issues, leakage, or unnecessary elements while adhering to AGENTS.md.
+Plan update
+  → Scan repository structure and key docs
+  • Review data ingestion and labeling logic
+  • Review feature engineering and model training code
+  • Identify conceptual issues, leakage, and cruft
+  • Summarize concrete findings and recommendations
+codex
+I’ll first scan the repo and main pipelines, then dig into labeling, feature building, and modeling code to pinpoint conceptual issues, leakage, and cruft and summarize concrete recommendations.
+exec
+/bin/zsh -lc ls in /Users/jameswest/Desktop/nfl_predict succeeded in 795ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+README.md
+__pycache__
+audit
+cache
+codex_meta_loop.py
+codex_output.md
+config
+data
+docs
+logs
+main.py
+output
+pipeline
+pyproject.toml
+requirements.txt
+scripts
+tests
+tmp.parquet
+codex
+I’ll scan structure and key docs, then dive into data, features, and modeling code to trace labels, features, and potential leakage.
+exec
+/bin/zsh -lc 'ls config pipeline utils data docs' in /Users/jameswest/Desktop/nfl_predict succeeded in 752ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+config:
+config.yaml
+training.yaml
+
+data:
+cache
+cleaned
+prediction
+processed
+raw
+
+docs:
+Rolling.md
+analysis
+clean.md
+collect.md
+feature.md
+mlb_legacy.md
+exec
+/bin/zsh -lc 'ls utils/feature utils/train utils/predict utils/collect utils/clean utils/analysis' in /Users/jameswest/Desktop/nfl_predict succeeded in 773ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+utils/analysis:
+__init__.py
+__pycache__
+error_analysis_cli.py
+error_meta.py
+error_stats.py
+feed_latency.py
+injury_model_monitor.py
+
+utils/clean:
+__init__.py
+__pycache__
+audit.py
+clean_events.py
+clean_missing.py
+clean_optimize.py
+clean_timestamps.py
+clean_weather.py
+exec
+/bin/zsh -lc 'cat README.md' in /Users/jameswest/Desktop/nfl_predict succeeded in 785ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+# NFL Anytime TD Prediction
+
+## Key Scripts
+- `pipeline/feature.py` – builds the player-game feature matrix, enforcing as-of leakage guards.
+- `pipeline/train.py` – trains the multi-stage modeling graph (availability → usage → efficiency → TD).
+- `pipeline/predict.py` – runs inference with the latest artifacts.
+- `scripts/eval/odds_backtest.py` – compute odds-only baselines across horizons.
+- `scripts/backtest/run_backtest.py` – evaluate existing prediction columns (AUC/Brier/log-loss) and write baseline summaries.
+- `scripts/backtest/compare_baselines.py` – diff two baseline JSON files and highlight regressions.
+- `scripts/analysis/horizon_eval.py` – consolidate metrics across decision horizons (input multiple prediction files labelled by horizon).
+- `scripts/analysis/weather_travel_impact.py` – stratify TD hit rates by weather/travel features and emit plots (`docs/analysis/weather_travel/`) + JSON summaries.
+- `scripts/monitoring/asof_coverage_report.py` – summarize snapshot coverage, write Markdown to `docs/monitoring/asof_coverage.md`, and append metrics history to `output/metrics/coverage/history.parquet`.
+
+## Monitoring
+- `docs/monitoring.md` documents leak guards, snapshot coverage expectations, roster snapshot regeneration steps, and instructions for running odds/backtests & analytics scripts.
+- `docs/analysis/weather_travel.md` lists the latest weather/travel diagnostic artifacts.
+
+## Quick Start
+exec
+/bin/zsh -lc "ls docs && sed -n '1,200p' docs/feature.md" in /Users/jameswest/Desktop/nfl_predict succeeded in 799ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+Rolling.md
+analysis
+clean.md
+collect.md
+feature.md
+mlb_legacy.md
+monitoring.md
+predict.md
+rolling_window_implementation.md
+statcast_glossary.md
+train.md
+# NFL Feature Engineering Pipeline
+
+This pipeline turns cleaned NFL play-by-play into player-ready feature matrices. It is implemented in `utils/feature/` and orchestrated by `pipeline/feature.py`.
+
+## Stage Overview
+- **Play Level (`utils/feature/play_level.py`)**
+  - Scans daily cleaned Parquet partitions.
+exec
+/bin/zsh -lc "sed -n '1,240p' pipeline/feature.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 747ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+from __future__ import annotations
+
+"""Feature pipeline orchestrator for NFL player-level predictions.
+
+Stages
+------
+1. **build_play_level**         – derive cleaned play-level slices
+2. **build_player_drive_level** – aggregate per drive
+3. **build_player_game_level**  – aggregate per game and join context
+
+This wrapper triggers each stage, optionally enforces a schema after each
+write, and returns the final game-level DataFrame for downstream usage.
+"""
+
+import logging
+import os
+from datetime import date, timedelta
+from typing import Sequence
+exec
+/bin/zsh -lc "sed -n '240,620p' pipeline/feature.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 733ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+    ----------
+    end_date : date | None
+        Last `game_date` to include in rolling windows (default: today).
+    save_output : bool
+        If True (default) – call `update_daily_stats` after game stage.
+    """
+    cutoff_label = cutoff_label or "default"
+    target_output_path = output_path or FINAL_OUT
+    primary_output = primary_output_path or target_output_path
+    current_cutoff_hours = float(get_decision_cutoff_hours())
+    clean_min_date, clean_max_date = (None, None)
+    if start_date is None or end_date is None:
+        clean_min_date, clean_max_date = _get_clean_date_bounds()
+
+    end_date = end_date or clean_max_date or date.today()
+    start_date = start_date or clean_min_date or end_date          # “one-shot” default
+
+    if clean_max_date and end_date > clean_max_date:
+exec
+/bin/zsh -lc "sed -n '620,1240p' pipeline/feature.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 789ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+            "stadium_name",
+            "stadium_tz",
+            "roof",
+            "surface",
+            "home_team",
+            "away_team",
+            "position",
+            "position_group",
+            "depth_chart_position",
+            "injury_report_status",
+            "injury_practice_status",
+            "injury_report_primary",
+            "injury_practice_primary",
+            "season_type",
+        ) if col in df_player_game_all.columns
+    ]
+    if string_cols:
+        df_player_game_all = df_player_game_all.with_columns([pl.col(col).cast(pl.Utf8) for col in string_cols])
+exec
+/bin/zsh -lc 'rg "touchdown" -n utils -S' in /Users/jameswest/Desktop/nfl_predict succeeded in 788ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+utils/general/constants.py:129:    # Touchdowns (same-game outcomes)
+utils/general/constants.py:133:    "touchdowns",
+utils/general/constants.py:135:    "touchdown",
+utils/general/constants.py:136:    "touchdown_player_id",
+utils/clean/clean_events.py:19:    - pass_touchdown, rush_touchdown
+utils/feature/player_drive_level.py:100:    "touchdown_player_id",
+utils/feature/player_drive_level.py:126:        "posteam_type", "touchdown_player_id",
+utils/feature/player_drive_level.py:267:            pl.when(pl.col("touchdown_player_id") == pl.col("passer_player_id"))
+utils/feature/player_drive_level.py:268:              .then(pl.col("touchdown").fill_null(0))
+utils/feature/player_drive_level.py:272:              .alias("touchdown"),
+utils/feature/player_drive_level.py:275:            pl.when(pl.col("pass_touchdown") == 1).then(1).otherwise(0).sum().cast(pl.Int64).alias("passing_td"),
+utils/feature/player_drive_level.py:276:            pl.when(pl.col("rush_touchdown") == 1).then(1).otherwise(0).sum().cast(pl.Int64).alias("rushing_td_count"),
+utils/feature/player_drive_level.py:286:            (pl.col("touchdown") > 0).cast(pl.Int8).alias("anytime_td"),
+utils/feature/player_drive_level.py:287:            pl.col("touchdown").cast(pl.Int64).alias("td_count"),
+utils/feature/player_drive_level.py:317:            pl.when(pl.col("touchdown_player_id") == pl.col("rusher_player_id"))
+utils/feature/player_drive_level.py:318:              .then(pl.col("touchdown").fill_null(0))
+utils/feature/player_drive_level.py:322:              .alias("touchdown"),
+utils/feature/player_drive_level.py:326:            pl.when(pl.col("rush_touchdown") == 1).then(1).otherwise(0).sum().cast(pl.Int64).alias("rushing_td_count"),
+exec
+/bin/zsh -lc "sed -n '1470,1560p' utils/feature/player_game_level.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 761ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+    Creates one row per (player, game) with accumulated stats.
+    Handles all skill positions: QB, RB, WR, TE.
+    
+    Parameters
+    ----------
+    start_date : date
+        Start date (inclusive)
+    end_date : date
+        End date (inclusive)
+    """
+    PLAYER_GAME_DIR.mkdir(parents=True, exist_ok=True)
+    
+    # Load play-level data
+    force_utf8_candidates = (
+        "posteam", "defteam", "team", "opponent",
+        "passer_player_id", "rusher_player_id", "receiver_player_id",
+        "passer_player_name", "rusher_player_name", "receiver_player_name",
+        "passer_id", "rusher_id", "receiver_id",
+exec
+/bin/zsh -lc "sed -n '3080,3360p' utils/feature/player_game_level.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 771ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+        .agg([
+            # Passing stats
+            pl.col("passing_yards").fill_null(0).sum().cast(pl.Float64).alias("passing_yards"),
+            pl.col("pass_attempt").fill_null(0).sum().cast(pl.Int64).alias("pass_attempt"),
+            pl.col("completion").fill_null(0).sum().cast(pl.Int64).alias("completion"),
+            pl.when(pl.col("pass_touchdown") == 1).then(1).otherwise(0).sum().cast(pl.Int64).alias("passing_td"),
+            
+            # Passer can also rush (e.g., Lamar Jackson)
+            pl.col("rushing_yards").fill_null(0).sum().cast(pl.Float64).alias("rushing_yards"),
+            pl.col("carry").fill_null(0).sum().cast(pl.Int64).alias("carry"),
+            pl.when(pl.col("rush_touchdown") == 1).then(1).otherwise(0).sum().cast(pl.Int64).alias("rushing_td_count"),
+            pl.col("red_zone_carry").fill_null(0).sum().cast(pl.Int64).alias("red_zone_carry"),
+            pl.col("goal_to_go_carry").fill_null(0).sum().cast(pl.Int64).alias("goal_to_go_carry"),
+            
+            # No receiving for passers typically
+            pl.lit(0.0).cast(pl.Float64).alias("receiving_yards"),
+            pl.lit(0).cast(pl.Int64).alias("target"),
+            pl.lit(0).cast(pl.Int64).alias("reception"),
+exec
+/bin/zsh -lc "sed -n '1,260p' utils/feature/play_level.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 786ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+from __future__ import annotations
+
+"""Play-level feature builder.
+
+Reads cleaned daily Parquets and writes weekly play-level Parquets at
+  data/processed/play_by_week/season=YYYY/week=W/part.parquet
+"""
+
+from pathlib import Path
+from datetime import date
+import polars as pl
+
+CLEAN_DIR   = Path("data/cleaned")
+PLAY_OUTDIR = Path("data/processed/play_by_week")
+
+PLAY_COLS = [
+    # Game identifiers
+    "game_id",
+exec
+/bin/zsh -lc "sed -n '260,620p' utils/feature/play_level.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 746ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+            .cast(pl.Int8)
+            .alias("situ_pass_expected"),
+            pl.when(pl.col("xpass").is_not_null())
+            .then(pl.col("xpass") <= 0.40)
+            .otherwise(False)
+            .cast(pl.Int8)
+            .alias("situ_run_expected"),
+            pl.when(pl.col("defenders_in_box").is_not_null())
+            .then(pl.col("defenders_in_box") <= 6.0)
+            .otherwise(False)
+            .cast(pl.Int8)
+            .alias("situ_light_box"),
+            pl.when(pl.col("defenders_in_box").is_not_null())
+            .then(pl.col("defenders_in_box") >= 8.0)
+            .otherwise(False)
+            .cast(pl.Int8)
+            .alias("situ_heavy_box"),
+            pl.when(pl.col("defense_man_zone_type").is_not_null())
+exec
+/bin/zsh -lc "sed -n '1,260p' utils/feature/asof.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 771ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+from __future__ import annotations
+
+"""Helpers for aligning feature generation to a consistent decision-time snapshot."""
+
+from contextlib import contextmanager
+from contextvars import ContextVar
+from functools import lru_cache
+from typing import Any, Mapping
+
+import yaml
+
+from utils.general.paths import PROJ_ROOT
+
+
+@lru_cache(maxsize=1)
+def _load_cutoff_config() -> Mapping[str, Any]:
+    """Load decision cutoff configuration from config/config.yaml."""
+    config_path = PROJ_ROOT / "config" / "config.yaml"
+exec
+/bin/zsh -lc "sed -n '240,620p' pipeline/feature.py | sed -n '120,340p'" in /Users/jameswest/Desktop/nfl_predict succeeded in 765ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+    try:
+        asof_meta = load_asof_metadata()
+    except Exception as exc:
+        logger.warning("Failed to load existing as-of metadata: %s", exc)
+        asof_meta = pl.DataFrame()
+
+    if asof_meta.is_empty() or (game_ids and asof_meta.filter(pl.col("game_id").is_in(game_ids)).height < len(game_ids)):
+        try:
+            asof_meta = build_asof_metadata(seasons_available or [int(date.today().year)], force=True)
+        except Exception as exc:
+            logger.warning("Unable to build as-of metadata: %s", exc)
+            asof_meta = pl.DataFrame()
+
+    if not asof_meta.is_empty():
+        asof_meta = asof_meta.filter(pl.col("game_id").is_in(game_ids))
+        asof_meta = asof_meta.with_columns(
+            [
+                pl.col("cutoff_ts").alias("decision_cutoff_ts"),
+exec
+/bin/zsh -lc "sed -n '1,260p' utils/general/constants.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 764ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+"""
+Shared constants for NFL Prediction Pipeline.
+
+Centralized location for team mappings, column definitions, and utility functions
+used across multiple modules to avoid duplication.
+
+This module is the SINGLE SOURCE OF TRUTH for column definitions.
+config/training.yaml should mirror LEAK_PRONE_COLUMNS for YAML-based configuration,
+validated by tests/test_training_config_features.py.
+"""
+
+from __future__ import annotations
+
+from typing import Dict, Final, Tuple
+
+# =============================================================================
+# NFL Team Abbreviation Mappings
+# =============================================================================
+exec
+/bin/zsh -lc "sed -n '1,260p' config/training.yaml" in /Users/jameswest/Desktop/nfl_predict succeeded in 706ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+# config/training.yaml
+# Configuration for the model training pipeline (pipeline/train.py)
+# NFL Player Prediction Targets
+
+# --- Data I/O ---
+data:
+  raw_pbp_dir: 'data/raw/pbp_by_day'  # NFL play-by-play raw data
+  feature_matrix_path: 'data/processed/final/processed.parquet'  # NFL feature matrix
+  
+  # Directory to save trained model artifacts (models and feature lists).
+  model_output_dir: 'output/models'
+  
+  # Directory to save evaluation reports and metrics.
+  metrics_output_dir: 'output/metrics/'
+
+# =============================================================================
+# SHARED COLUMN DEFINITIONS (using YAML anchors to avoid duplication)
+# =============================================================================
+exec
+/bin/zsh -lc "sed -n '260,760p' config/training.yaml" in /Users/jameswest/Desktop/nfl_predict succeeded in 740ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+  # 2B. USAGE MODEL - CARRIES
+  # ============================================================================
+  # Predict carries given availability.
+  - name: 'usage_carries'
+    target_col: 'carry'
+    task_type: 'regression'
+    input_predictions: ['availability_active', 'availability_snapshare', 'team_pace', 'pre_snap_routes', 'pre_snap_scripted_touches']
+    feature_prefixes_to_include:
+      - 'pred_'
+      - 'hist_carry_share_'
+      - 'ps_targets_backfield_'
+      - 'travel_'
+      - 'team_pace_'
+      - 'opp_pace_'
+      - 'matchup_pace_'
+      - 'implied_prob_'
+      - 'moneyline_'
+      - 'spread_'
+exec
+/bin/zsh -lc "sed -n '720,1040p' config/training.yaml" in /Users/jameswest/Desktop/nfl_predict succeeded in 708ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+exec
+/bin/zsh -lc "sed -n '360,520p' config/training.yaml" in /Users/jameswest/Desktop/nfl_predict succeeded in 733ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+      - 'travel_rest_days_l3'
+      - 'rest_days_since_last_game'
+      - 'team_red_zone_'
+      - 'player_red_zone_'
+      - 'team_goal_to_go_'
+      - 'player_goal_to_go_'
+    columns_to_discard: *columns_to_discard
+
+  # ============================================================================
+  # 3C. TOUCHDOWN EFFICIENCY MODEL
+  # ============================================================================
+  - name: 'efficiency_tds'
+    target_col: 'td_count'
+    task_type: 'regression'
+    input_predictions:
+      - 'availability_active'
+      - 'availability_snapshare'
+      - 'usage_targets'
+exec
+/bin/zsh -lc "sed -n '1,260p' pipeline/train.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 725ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+import os
+import random
+import inspect
+import sys
+import logging
+import math
+
+
+# Move logging to top and remove global thread pinning
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Add project root to sys.path to allow module imports when running as script
+sys.path.append(os.getcwd())
+
+import pandas as pd
+import numpy as np
+import yaml
+import joblib
+exec
+/bin/zsh -lc 'rg "derived_target" -n' in /Users/jameswest/Desktop/nfl_predict succeeded in 744ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+pipeline/train.py:689:        derived_cfg = problem_config.get("derived_target")
+pipeline/train.py:2166:            derived_cfg = problem_copy.get('derived_target')
+exec
+/bin/zsh -lc "sed -n '640,760p' pipeline/train.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 758ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+        _team_factor(team_gtg_rate, "team_goal_to_go_rate")
+
+        if "expected_opportunities" in df.columns and "team_red_zone_rate" in df.columns:
+            df["team_based_rz_opportunities"] = df["expected_opportunities"] * df["team_red_zone_rate"]
+        if "expected_opportunities_raw" in df.columns and "team_red_zone_rate" in df.columns:
+            df["team_based_rz_opportunities_raw"] = df["expected_opportunities_raw"] * df["team_red_zone_rate"]
+
+        def _combine_rz(base: str, team_col: str, out_col: str):
+            if base in df.columns and team_col in df.columns:
+                df[out_col] = df[base].fillna(0.0) + df[team_col].fillna(0.0)
+
+        _combine_rz("expected_rz_opportunities", "team_based_rz_opportunities", "expected_rz_opportunities")
+        _combine_rz("expected_rz_opportunities_raw", "team_based_rz_opportunities_raw", "expected_rz_opportunities_raw")
+
+        if "expected_rz_targets" in df.columns and "expected_rz_carries" in df.columns:
+            df["expected_rz_opportunities"] = df["expected_rz_targets"] + df["expected_rz_carries"]
+        if "expected_rz_targets_raw" in df.columns and "expected_rz_carries_raw" in df.columns:
+            df["expected_rz_opportunities_raw"] = df["expected_rz_targets_raw"] + df["expected_rz_carries_raw"]
+exec
+/bin/zsh -lc "sed -n '760,1020p' pipeline/train.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 745ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+            else:
+                raise ValueError(
+                    f"Problem '{problem_name}' cannot derive target; '{source_col}' not in frame."
+                )
+        
+        # ... existing shift logic for standard derivation ...
+        group_cols = derived_cfg.get("group_cols") or ["team"]
+        missing_groups = [col for col in group_cols if col not in df.columns]
+        if missing_groups:
+            raise ValueError(
+                f"Problem '{problem_name}' missing group columns for derived target: {missing_groups}"
+            )
+        order_cols = [col for col in (derived_cfg.get("order_cols") or []) if col in df.columns]
+        if not order_cols:
+            order_cols = [self.time_col] if self.time_col in df.columns else []
+        sort_cols = group_cols + order_cols
+        df = df.sort_values(sort_cols).reset_index(drop=True)
+        shift = int(derived_cfg.get("shift", -1))
+exec
+/bin/zsh -lc 'rg "anytime_td" -n' in /Users/jameswest/Desktop/nfl_predict succeeded in 775ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+main.py:8:4. Train: Train models on player targets (anytime_td, yards, etc.)
+scripts/eval/odds_backtest.py:11:        --score-column market_anytime_td_prob \
+scripts/eval/odds_backtest.py:36:        default="market_anytime_td_prob",
+scripts/eval/odds_backtest.py:42:        default="anytime_td",
+docs/predict.md:14:  - Latest model + artifacts from `output/models/anytime_td/xgboost/<timestamp>/`.
+docs/predict.md:15:  - Inference artifacts (`output/models/inference_artifacts_anytime_td.joblib`) for frozen feature order + categorical levels.
+docs/predict.md:18:  - CSV under `output/predictions/anytime_td_predictions_<start>_<end>.csv` with one row per player/game.
+docs/predict.md:44:- **Model threshold** – Pulled from `output/metrics/anytime_td/xgboost/<timestamp>/metrics.yaml`.
+codex_output.md:518:    "anytime_td": pl.Int8,  # Primary MVP target: did player score a TD?
+codex_output.md:534:- anytime_td (binary): Did player score a TD (receiving or rushing)?
+codex_output.md:713:**Investigating player_game_level and anytime_td**
+codex_output.md:715:/bin/zsh -lc 'rg "anytime_td" utils/feature/player_game_level.py' in /Users/jameswest/Desktop/nfl_predict succeeded in 777ms:
+codex_output.md:717:- anytime_td (binary): Did player score a TD (receiving or rushing)?
+codex_output.md:718:    "market_anytime_td_prob",
+codex_output.md:719:    "market_anytime_td_consensus",
+codex_output.md:720:    "market_anytime_td_spread",
+codex_output.md:721:    "market_anytime_td_book_count",
+codex_output.md:722:    "market_anytime_td_prob_2h",
+exec
+/bin/zsh -lc "sed -n '1,220p' utils/feature/targets.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 799ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+"""Target column validation for NFL player prediction models.
+
+Target columns are created in utils/feature/player_game_level.py during aggregation.
+This module validates that required targets exist and have correct dtypes.
+"""
+
+import polars as pl
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+# Expected target columns and their types
+NFL_TARGET_SCHEMA = {
+    # Binary classification targets
+    "anytime_td": pl.Int8,  # Primary MVP target: did player score a TD?
+    
+    # Count/regression targets
+exec
+/bin/zsh -lc "sed -n '240,520p' pipeline/feature.py | sed -n '1,220p'" in /Users/jameswest/Desktop/nfl_predict succeeded in 794ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+    ----------
+    end_date : date | None
+        Last `game_date` to include in rolling windows (default: today).
+    save_output : bool
+        If True (default) – call `update_daily_stats` after game stage.
+    """
+    cutoff_label = cutoff_label or "default"
+    target_output_path = output_path or FINAL_OUT
+    primary_output = primary_output_path or target_output_path
+    current_cutoff_hours = float(get_decision_cutoff_hours())
+    clean_min_date, clean_max_date = (None, None)
+    if start_date is None or end_date is None:
+        clean_min_date, clean_max_date = _get_clean_date_bounds()
+
+    end_date = end_date or clean_max_date or date.today()
+    start_date = start_date or clean_min_date or end_date          # “one-shot” default
+
+    if clean_max_date and end_date > clean_max_date:
+exec
+/bin/zsh -lc "sed -n '1,260p' docs/predict.md" in /Users/jameswest/Desktop/nfl_predict succeeded in 767ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+# NFL Prediction Pipeline
+
+`pipeline/predict.py` turns a trained anytime-touchdown model into an actionable slate.  
+It mirrors the data flow established for training—schedule → roster → rolling features → inference—
+so the numbers you see match the assumptions baked into the model.
+
+## Quick Start
+
+```bash
+PYTHONPATH=. ./venv/bin/python pipeline/predict.py --date 2024-12-29 --days 1
+```
+
+- **Inputs**
+  - Latest model + artifacts from `output/models/anytime_td/xgboost/<timestamp>/`.
+  - Inference artifacts (`output/models/inference_artifacts_anytime_td.joblib`) for frozen feature order + categorical levels.
+  - Up-to-date rolling caches (`cache/feature/daily_totals/`) generated by `pipeline/feature.py`.
+- **Outputs**
+  - CSV under `output/predictions/anytime_td_predictions_<start>_<end>.csv` with one row per player/game.
+exec
+/bin/zsh -lc "sed -n '1,260p' pipeline/predict.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 737ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+"""
+NFL prediction pipeline
+=======================
+
+Generates anytime-touchdown probabilities for upcoming games by:
+
+1. Loading the upcoming schedule and weekly rosters (via nfl_data_py)
+2. Building a player-level scaffold for offensive skill positions
+3. Enriching that scaffold with rolling-window features using the same
+   caches that power the training pipeline
+4. Sequentially running the model chain:
+   Availability -> Team Pace -> Usage -> Efficiency -> Anytime TD
+5. Writing an actionable slate under `output/predictions/`
+"""
+
+from __future__ import annotations
+
+import argparse
+exec
+/bin/zsh -lc 'rg "decision_cutoff_ts" -n' in /Users/jameswest/Desktop/nfl_predict succeeded in 772ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+codex_output.md:6120:                pl.col("cutoff_ts").cast(pl.Datetime("ms", "UTC")).alias("decision_cutoff_ts"),
+pipeline/feature.py:376:                pl.col("cutoff_ts").alias("decision_cutoff_ts"),
+pipeline/feature.py:429:            "decision_cutoff_ts",
+pipeline/feature.py:458:    if "decision_cutoff_ts" in df_player_game_all.columns:
+pipeline/feature.py:472:                    pl.col(column_name) > pl.col("decision_cutoff_ts")
+pipeline/feature.py:481:                            for col in ("game_id", "player_id", "team", "decision_cutoff_ts", column_name)
+pipeline/feature.py:487:                    pl.col(column_name).is_null() | (pl.col(column_name) <= pl.col("decision_cutoff_ts"))
+pipeline/feature.py:714:            cutoff_column="decision_cutoff_ts",
+pipeline/predict.py:1275:                pl.col("cutoff_ts").cast(pl.Datetime("ms", "UTC")).alias("decision_cutoff_ts"),
+pipeline/predict.py:1396:    if "decision_cutoff_ts" in enriched.columns:
+pipeline/predict.py:1397:        enriched = enriched.with_columns(pl.col("decision_cutoff_ts").cast(pl.Datetime("ms")))
+pipeline/predict.py:1407:            .alias("decision_cutoff_ts")
+pipeline/predict.py:1425:        cutoff_column="decision_cutoff_ts",
+pipeline/predict.py:1525:        cutoff_column="decision_cutoff_ts",
+pipeline/predict.py:1530:            cutoff_column="decision_cutoff_ts",
+pipeline/predict.py:1647:    target_col = "decision_cutoff_ts" if "decision_cutoff_ts" in enriched.columns else "game_date"
+pipeline/predict.py:2053:        .alias("decision_cutoff_ts")
+pipeline/predict.py:2056:        pl.col("decision_cutoff_ts").is_null()
+exec
+/bin/zsh -lc "sed -n '1760,2140p' utils/feature/player_game_level.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 747ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+                        cast_exprs.append(
+                            pl.col("practice_status")
+                            .cast(pl.Utf8)
+                            .str.strip_chars()
+                            .str.replace_all(r"\\s+", " ", literal=False)
+                            .str.to_uppercase()
+                            .alias("practice_status_clean")
+                        )
+                    if "report_primary_injury" in injury_pl.columns:
+                        cast_exprs.append(
+                            pl.col("report_primary_injury")
+                            .cast(pl.Utf8)
+                            .str.strip_chars()
+                            .alias("report_primary_injury")
+                        )
+                    if "practice_primary_injury" in injury_pl.columns:
+                        cast_exprs.append(
+                            pl.col("practice_primary_injury")
+Plan update
+  ✓ Scan repository structure and key docs
+  → Review data ingestion and labeling logic
+  • Review feature engineering and model training code
+  • Identify conceptual issues, leakage, and cruft
+  • Summarize concrete findings and recommendations
+exec
+/bin/zsh -lc "sed -n '520,980p' utils/feature/player_game_level.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 711ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+        return pl.DataFrame()
+
+    season_list = [int(s) for s in seasons]
+    schedule = schedule.filter(pl.col("season").is_in(season_list))
+    if schedule.is_empty():
+        try:
+            from utils.collect.nfl_schedules import cache_schedules
+            cache_schedules(season_list)
+            schedule = pl.read_parquet(SCHEDULE_CACHE_PATH).filter(pl.col("season").is_in(season_list))
+        except Exception as exc:
+            logger.warning("Schedule cache lacks seasons %s and refresh failed: %s", seasons, exc)
+            return pl.DataFrame()
+        if schedule.is_empty():
+            return pl.DataFrame()
+
+    schedule = schedule.with_columns(
+        [
+            pl.col("season").cast(pl.Int32),
+exec
+/bin/zsh -lc 'rg "ps_" -n config docs pipeline utils | head' in /Users/jameswest/Desktop/nfl_predict succeeded in 700ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+pipeline/train.py:271:        self._groups_index_map = {} # Map problem -> Series(index=df_train_full.index, value=group label)
+pipeline/train.py:958:        groups_per_day = float(day_counts.mean())
+pipeline/train.py:959:        if not math.isfinite(groups_per_day) or groups_per_day <= 0:
+pipeline/train.py:960:            groups_per_day = 1.0
+pipeline/train.py:961:        gap = int(math.ceil(groups_per_day * embargo_days))
+pipeline/train.py:1064:    def tune_hyperparameters(self, model_name, problem_config, X_train, y_train, groups_train, sample_weight=None):
+pipeline/train.py:1072:            groups_train,
+pipeline/train.py:1078:    def _generate_oof_predictions(self, model_name, problem_config, X, y, groups_series, sample_weight=None):
+pipeline/train.py:1082:        if groups_series is None:
+pipeline/train.py:1083:            raise ValueError("groups_series is required for purged OOF generation.")
+exec
+/bin/zsh -lc 'rg "ps_route_participation" -n' in /Users/jameswest/Desktop/nfl_predict succeeded in 748ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+utils/feature/player_game_level.py:142:    "ps_route_participation_plays",
+utils/feature/player_game_level.py:144:    "ps_route_participation_pct",
+utils/feature/player_game_level.py:159:    "ps_route_participation_pct",
+utils/feature/player_game_level.py:268:        .agg(pl.len().alias("ps_route_participation_plays"))
+utils/feature/player_game_level.py:283:            .then(pl.col("ps_route_participation_plays") / pl.col("ps_team_dropbacks"))
+utils/feature/player_game_level.py:286:            .alias("ps_route_participation_pct")
+pipeline/predict.py:185:    "ps_route_participation_plays",
+pipeline/predict.py:187:    "ps_route_participation_pct",
+pipeline/predict.py:200:    "ps_route_participation_pct_prev",
+pipeline/predict.py:201:    "ps_route_participation_pct_l3",
+pipeline/predict.py:212:    "ps_route_participation_plays_l3",
+pipeline/predict.py:221:    "ps_route_participation_plays_l3": "ps_route_participation_plays",
+pipeline/predict.py:1318:        "1g_ps_route_participation_pct_per_game": "ps_route_participation_pct",
+pipeline/predict.py:1319:        "3g_ps_route_participation_pct_per_game": "ps_route_participation_pct_l3",
+pipeline/predict.py:1320:        "1g_ps_route_participation_plays_per_game": "ps_route_participation_plays",
+pipeline/predict.py:1321:        "3g_ps_route_participation_plays_per_game": "ps_route_participation_plays_l3",
+pipeline/predict.py:1374:        "ps_route_participation_pct",
+pipeline/predict.py:1375:        "ps_route_participation_plays",
+exec
+/bin/zsh -lc "sed -n '1,260p' utils/feature/stats.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 749ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+"""NFL player statistics configuration for rolling window features.
+
+Defines the standard set of stats tracked at all aggregation levels
+(play, drive, game) for rolling window computations.
+
+This module is the SINGLE SOURCE OF TRUTH for stat definitions used
+throughout the pipeline. Import from here rather than defining locally.
+"""
+
+from typing import List
+
+# =============================================================================
+# Core Stats (used for drive and game level aggregation)
+# =============================================================================
+
+# Basic stats aggregated at player-drive level
+PLAYER_DRIVE_STATS: List[str] = [
+    # Yardage
+Plan update
+  ✓ Scan repository structure and key docs
+  ✓ Review data ingestion and labeling logic
+  → Review feature engineering and model training code
+  • Identify conceptual issues, leakage, and cruft
+  • Summarize concrete findings and recommendations
+exec
+/bin/zsh -lc 'rg "hallucinated|legacy|MLB" -n' in /Users/jameswest/Desktop/nfl_predict succeeded in 733ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+codex_output.md:35:    * hallucinated features,
+codex_output.md:57:7. Any areas where it looks like a previous run of a model or tool hallucinated structure, concepts,
+codex_output.md:63:- Call out anything that looks like hallucinated or legacy cruft that should probably be removed or
+codex_output.md:103:    * hallucinated features,
+codex_output.md:125:7. Any areas where it looks like a previous run of a model or tool hallucinated structure, concepts,
+codex_output.md:131:- Call out anything that looks like hallucinated or legacy cruft that should probably be removed or
+codex_output.md:330:"""NFL Rolling Window Features - Direct port from MLB rolling_window.py
+codex_output.md:332:Uses the exact same vectorized Polars pattern as the working MLB implementation.
+codex_output.md:551:I'm focusing on spotting key issues like data leakage or unproduced columns in the large player_game_level file by reviewing mentions of rolling_window, MLB patterns, and stats usage around add_rolling_features. I want to understand if features rely on missing caches or incorrect columns that might disrupt aggregation or inference.
+codex_output.md:1046:- Player prop odds enrichment is leaking/hallucinated: `pipeline/feature.py` calls `add_player_props_to_df` (alias of `utils/feature/odds.add_player_odds_features_to_df`) which fetches live Odds API data with no date filter or snapshot control. When building historical training data this either (a) pulls today’s markets for long-past games or (b) fails and fills nulls/zeros, so the “anytime TD market” features are either future-looking or garbage and don’t reflect pre‑kick information. The same happens in inference if the API key is missing or network is blocked, so training/inference drift is guaranteed. Those columns should instead come from archived, pre‑cutoff snapshots (or be dropped).
+codex_output.md:1066:- Player prop odds enrichment is leaking/hallucinated: `pipeline/feature.py` calls `add_player_props_to_df` (alias of `utils/feature/odds.add_player_odds_features_to_df`) which fetches live Odds API data with no date filter or snapshot control. When building historical training data this either (a) pulls today’s markets for long-past games or (b) fails and fills nulls/zeros, so the “anytime TD market” features are either future-looking or garbage and don’t reflect pre‑kick information. The same happens in inference if the API key is missing or network is blocked, so training/inference drift is guaranteed. Those columns should instead come from archived, pre‑cutoff snapshots (or be dropped).
+codex_output.md:1133:    * hallucinated features,
+codex_output.md:1155:7. Any areas where it looks like a previous run of a model or tool hallucinated structure, concepts,
+codex_output.md:1161:- Call out anything that looks like hallucinated or legacy cruft that should probably be removed or
+codex_output.md:1360:"""NFL Rolling Window Features - Direct port from MLB rolling_window.py
+codex_output.md:1362:Uses the exact same vectorized Polars pattern as the working MLB implementation.
+codex_output.md:1581:I'm focusing on spotting key issues like data leakage or unproduced columns in the large player_game_level file by reviewing mentions of rolling_window, MLB patterns, and stats usage around add_rolling_features. I want to understand if features rely on missing caches or incorrect columns that might disrupt aggregation or inference.
+codex_output.md:2076:- Player prop odds enrichment is leaking/hallucinated: `pipeline/feature.py` calls `add_player_props_to_df` (alias of `utils/feature/odds.add_player_odds_features_to_df`) which fetches live Odds API data with no date filter or snapshot control. When building historical training data this either (a) pulls today’s markets for long-past games or (b) fails and fills nulls/zeros, so the “anytime TD market” features are either future-looking or garbage and don’t reflect pre‑kick information. The same happens in inference if the API key is missing or network is blocked, so training/inference drift is guaranteed. Those columns should instead come from archived, pre‑cutoff snapshots (or be dropped).
+exec
+/bin/zsh -lc "sed -n '1,260p' utils/feature/rolling_window.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 706ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+"""NFL Rolling Window Features - Direct port from MLB rolling_window.py
+
+Uses the exact same vectorized Polars pattern as the working MLB implementation.
+"""
+
+from __future__ import annotations
+
+from datetime import date, timedelta
+from pathlib import Path
+from typing import Iterable
+import logging
+
+import numpy as np
+import polars as pl
+
+logger = logging.getLogger(__name__)
+
+CACHE_ROOT = Path("cache/feature/daily_totals")
+Plan update
+  ✓ Scan repository structure and key docs
+  ✓ Review data ingestion and labeling logic
+  ✓ Review feature engineering and model training code
+  → Identify conceptual issues, leakage, and cruft
+  • Summarize concrete findings and recommendations
+
+
+
+
+
+thinking
+**Synthesizing key issues**
+
+I need to synthesize issues based on the specified questions. I’ll mention specific files and line paths while identifying conceptual issues and potential leaks. 
+
+The overall architecture seems mostly realistic, focusing on the player-game dynamic, but there are misalignments to address. For example, in player_game_level, `anytime_td` is derived from `touchdowns` based on `touchdown_player_id`. However, it only attributes rushing and receiving touchdowns, excluding defensive returns. The documentation clarifies that "anytime touchdowns" apply only to rushing or receiving, which means defensive touchdowns aren't included.
+thinking
+**Identifying potential issues**
+
+I’m noticing that the label uses `touchdown_player_id` for either the rusher or receiver, which may not properly account for return touchdowns. Conceptually, quarterbacks shouldn’t score points for passing touchdowns, and the code prevents this by requiring the `touchdown_player_id` to match the passer ID for QBs. 
+
+However, I see concerns regarding potential data leakage in rolling windows, where daily totals from player_game_level stats might overlap with same-game stats as features. I need to confirm the implementation ensures there's no leakage.
+thinking
+**Evaluating implementation details**
+
+The computation appears to rely on historical data using cumulative sums, which seems conceptually fine if implemented correctly. Still, there might be a bug in how `_scan_totals` filters by date. It should include the range for the batch, and the cumulative calculation subtracts current row values to prevent double counting. However, if the first window isn’t adjusted properly, that could be a problem. 
+
+I also need to look at how odds snapshots are handled in the training feature pipeline. They use `decision_cutoff_ts` for aligning odds, which seems important.
+thinking
+**Examining training pipeline consistency**
+
+In the training pipeline, features are built from `player_game`, which includes `game_date`, but not always `decision_cutoff_ts`. They later join `asof_meta` to include those timestamps and apply a guard to ensure that `snapshot_ts` is less than or equal to the cutoff. That makes sense.
+
+The `add_weather_forecast_features_training` also uses forecasts with a similar cutoff logic. However, potential issues arise with the injury snapshot pipeline. It seems to recompute `decision_cutoff_ts` based on a particular function, which filters injury data for the training horizon, but that might not align with multi-horizon tasks.
+thinking
+**Identifying potential mismatches**
+
+I think there’s a mismatch here. The training process now supports multi-horizons with `decision_cutoff_horizons`, but the injury features in `player_game_level` don’t incorporate this horizon-specific metadata. Instead, they recalculate `decision_cutoff_ts` using `get_decision_cutoff_hours()`, which defaults to a 6-hour horizon unless there’s an override for the multi-horizon build. 
+
+In the pipeline, they seem to call `_build_feature_matrix_internal` for each `cutoff_label/horizon`. I need to confirm if multi-horizon handling is indeed implemented correctly.
+exec
+/bin/zsh -lc 'rg "decision_cutoff_horizons" -n' in /Users/jameswest/Desktop/nfl_predict succeeded in 777ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+utils/main/backtest_cutoffs.py:12:from utils.feature.asof import decision_cutoff_horizons, decision_cutoff_override
+utils/main/backtest_cutoffs.py:43:    horizons = decision_cutoff_horizons()
+pipeline/feature.py:44:    decision_cutoff_horizons,
+pipeline/feature.py:973:    horizons = [float(h) for h in (cutoff_hours_list or decision_cutoff_horizons())]
+utils/feature/asof.py:69:def decision_cutoff_horizons() -> list[float]:
+utils/feature/asof.py:138:    "decision_cutoff_horizons",
+utils/general/backtest_cutoffs.py:12:from utils.feature.asof import decision_cutoff_horizons, decision_cutoff_override
+utils/general/backtest_cutoffs.py:43:    horizons = decision_cutoff_horizons()
+exec
+/bin/zsh -lc "sed -n '940,1040p' pipeline/feature.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 761ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+        primary_output.parent.mkdir(parents=True, exist_ok=True)
+        df_player_game_all.write_parquet(primary_output, compression="zstd")
+
+    logging.info("✅  Final feature matrix (%s cutoff) written → %s", cutoff_label, target_output_path)
+    if primary_output != target_output_path:
+        logging.info("    Primary feature matrix updated → %s", primary_output)
+    logging.info("    Rows: %d, Columns: %d", len(df_player_game_all), len(df_player_game_all.columns))
+    logging.info("    Date range: %s to %s", 
+                 df_player_game_all["game_date"].min(), 
+                 df_player_game_all["game_date"].max())
+    
+    # Log target distribution for anytime_td
+    if "anytime_td" in df_player_game_all.columns:
+        td_count = df_player_game_all["anytime_td"].sum()
+        td_rate = td_count / len(df_player_game_all) * 100
+        logging.info("    Anytime TD rate: %.2f%% (%d/%d)", td_rate, td_count, len(df_player_game_all))
+    
+    return df_player_game_all
+
+thinking
+**Checking feature matrices**
+
+I'm reflecting on how `build_feature_matrix` loops over horizons and wraps `_build_*` functions in `decision_cutoff_override`. This way, any call to `get_decision_cutoff_hours()` will use the current horizon, including in things like injury cutoffs in `player_game_level`. So that's a good step! Training features, injuries, and odds are using the correct horizon, which helps to address leakage. Now, I need to check odds and weather functions for any future data or incorrect assumptions.
+exec
+/bin/zsh -lc "sed -n '800,980p' utils/feature/odds.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 718ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+) -> pl.DataFrame:
+    """Add NFL game-level odds features to a Polars DataFrame.
+    
+    This enriches the DataFrame with moneyline, spread, and totals data from The Odds API.
+    """
+    if df_pl.is_empty():
+        return df_pl
+    
+    if not api_key:
+        api_key = get_odds_api_key()
+    
+    feature_cols = NFL_ODDS_COLUMNS + ODDS_FLAG_COLUMNS + ODDS_DATETIME_COLUMNS
+    base_frame = df_pl.drop(feature_cols, strict=False)
+    
+    if not api_key:
+        empty_exprs = [pl.lit(None).cast(pl.Float32).alias(c) for c in NFL_ODDS_COLUMNS]
+        empty_exprs += [pl.lit(None).cast(pl.Datetime("ms", "UTC")).alias(c) for c in ODDS_DATETIME_COLUMNS]
+        flag_expr = [pl.lit(0).cast(pl.Int8).alias("odds_expected"), pl.lit(1).cast(pl.Int8).alias("odds_schedule_fallback")]
+
+thinking
+**Evaluating game odds features**
+
+I'm thinking about how the function `add_nfl_odds_features_to_df` works with `_compute_game_odds`, specifically regarding the `cutoff_hours`, which seems to relate to the difference between `game_start_utc` and `decision_cutoff_ts`. That's good because it queries at the right time. However, it uses The Odds API directly. For historical features, they'd need to specify the event date and snapshot hour, but the API only gives current or upcoming events. I wonder if historical odds might be cached separately. I should check `collect_odds_snapshots` to see more!
+exec
+/bin/zsh -lc "rg \"collect_odds_snapshots\" -n && sed -n '1,260p' utils/feature/odds.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 713ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+codex_output.md:6043:from utils.feature.odds import collect_odds_snapshots
+codex_output.md:6049:        collect_odds_snapshots(
+codex_output.md:7515: from utils.feature.odds import collect_odds_snapshots
+codex_output.md:7602: from utils.feature.odds import collect_odds_snapshots
+codex_output.md:7764: from utils.feature.odds import collect_odds_snapshots
+codex_output.md:7939: from utils.feature.odds import collect_odds_snapshots
+codex_output.md:8110: from utils.feature.odds import collect_odds_snapshots
+codex_output.md:8289: from utils.feature.odds import collect_odds_snapshots
+codex_output.md:8467: from utils.feature.odds import collect_odds_snapshots
+codex_output.md:8822: from utils.feature.odds import collect_odds_snapshots
+codex_output.md:9093: from utils.feature.odds import collect_odds_snapshots
+codex_output.md:9371: from utils.feature.odds import collect_odds_snapshots
+codex_output.md:9654: from utils.feature.odds import collect_odds_snapshots
+codex_output.md:9919: from utils.feature.odds import collect_odds_snapshots
+codex_output.md:10191: from utils.feature.odds import collect_odds_snapshots
+codex_output.md:10293: from utils.feature.odds import collect_odds_snapshots
+codex_output.md:10474: from utils.feature.odds import collect_odds_snapshots
+codex_output.md:10734: from utils.feature.odds import collect_odds_snapshots
+exec
+/bin/zsh -lc "rg \"_compute_game_odds\" -n utils/feature/odds.py && sed -n '980,1280p' utils/feature/odds.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 713ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+645:def _compute_game_odds(
+877:            data, snapshot_ts_map, _ = _compute_game_odds(
+1250:            feature_row, snapshot_ts, event_id = _compute_game_odds(
+1358:    "_compute_game_odds",
+        for hour in _CANDIDATE_HOURS_UTC:
+            snap_dt_candidate = _snapshot_dt_pd(sample_row["game_date"], hour)
+            event_info = client.get_event_info(home_team_val, away_team_val, snap_dt_candidate)
+            if event_info:
+                event_found_hour = hour
+                break
+        
+        if event_info is None:
+            for idx in game_df.index:
+                odds_map[idx] = {"odds_anytime_td_price": None}
+            return
+        
+        event_id = event_info["id"]
+        commence_ts = pd.to_datetime(event_info["commence_time"], utc=True)
+
+
+
+thinking
+**Analyzing data snapshot usage**
+
+The function `collect_odds_snapshots` is designed to create partitions during training, while `add_nfl_odds_features_to_df` uses information from `decision_cutoff_ts` and might leverage disk caching to avoid unnecessary API queries. It seems historical seasons might already have snapshots created via a collector. This means they still reference The Odds API's data from when `collect_odds_snapshots` was executed, rather than reflecting the most recent data. This is essential for training, as it balances coverage with the need for archived data.
+thinking
+**Reviewing training configuration**
+
+I need to examine the training configuration for issues or incomplete sections. In `config/training.yaml`, I noticed there are duplicate entries for `efficiency_tds`, which leads to a truncated second block. This repetition signals a problem from an earlier version, potentially confusing the modeling code since it tends to prioritize the last entry. There could also be discrepancies regarding intended architecture. Additionally, the `NFL_TARGET_COLUMNS` includes 'offense_pct' as a target, while the config refers to 'offense_pct_active', which seems okay for our purposes. I should ensure all pre-snap features are well-defined.
+thinking
+**Verifying pre-snap concepts**
+
+In the player_game_level, it looks like they generate `ps_route_participation_plays` and `ps_targets_total` based on actual play-by-play data for the initial scripted drives, not from any pre-snap call understanding. I need to confirm if the concept of "pre-snap script" is legitimate or if it's just a misunderstanding. I’ll search for instances of `ps_` semantics in player_game_level to investigate further and clarify this aspect.
+exec
+/bin/zsh -lc "sed -n '1,220p' utils/feature/player_game_level.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 704ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+"""Player-game level aggregation for NFL predictions.
+
+Aggregates play-by-play data to player-game level for all skill positions.
+Each player gets one row per game with their total stats.
+
+Target columns created:
+- anytime_td (binary): Did player score a TD (receiving or rushing)?
+- td_count (int): Number of TDs scored (receiving + rushing)
+- passing_td (int): Number of passing TDs (for QBs)
+- receiving_yards (float): Total receiving yards
+- rushing_yards (float): Total rushing yards
+- passing_yards (float): Total passing yards
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from datetime import date
+exec
+/bin/zsh -lc "sed -n '220,540p' utils/feature/player_game_level.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 693ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+
+    pass_lists = pass_plays.with_columns(
+        [
+            _safe_split(pl.col("offense_players")).alias("off_player_ids"),
+            _safe_split(pl.col("offense_positions")).alias("off_positions_list"),
+        ]
+    ).filter(
+        pl.col("off_player_ids").list.len() == pl.col("off_positions_list").list.len()
+    )
+
+    if pass_lists.is_empty():
+        return pl.DataFrame()
+
+    pass_exploded = (
+        pass_lists
+        .explode(["off_player_ids", "off_positions_list"])
+        .with_columns(
+            [
+
+
+
+thinking
+**Analyzing pre-snap statistics**
+
+I'm exploring how the `_compute_pre_snap_usage` function uses `offense_play_rank` under 15 to determine what’s considered "scripted" based on the first 15 offensive plays. This heuristic seems plausible, yet still somewhat based on assumptions. Pre-snap features rely on play-by-play data but are only available during training — I need that for prediction! The use of rolling windows in `pipeline/predict.py` to approximate stats could create a gap; I wonder if there are actual per-game pre-snap stats for the upcoming game?
+thinking
+**Clarifying model predictions**
+
+I realize they can't use direct per-game pre-snap stats, so they rely on rolling averages from previous games for approximations. That makes sense since training and inference use the same rolling window features. However, there's confusion regarding how pre-snap routes and scripted touches are defined — they seem to predict participation and touches in upcoming games using historical features. Yet in training, these metrics actually reflect what occurs in the current game, avoiding leakage. I need to verify how these predicted values are generated in both training and inference stages!
+thinking
+**Examining training sequences**
+
+In the pipeline training process, it seems they train a sequential chain for each problem by computing features. They then generate out-of-fold predictions, labeled `pred_{problem_name}`, which are added as new columns to the entire dataset. These predicted features aim to replicate what you'd know during re-inference. For pre-snap routes and scripted touches, they do produce predictions; however, it looks like they don't generate them during real inference with specific features. I should check the pipeline for how these intermediate models are utilized!
+exec
+/bin/zsh -lc 'rg "pre_snap_routes" -n' in /Users/jameswest/Desktop/nfl_predict succeeded in 765ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+pipeline/predict.py:2414:            elif p_name == "pre_snap_routes":
+exec
+/bin/zsh -lc "sed -n '2360,2445p' pipeline/predict.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 747ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+    config = _load_config()
+    problems = config.get("problems", [])
+
+    with decision_cutoff_override(
+        cutoff_hours=args.decision_cutoff_hours,
+        fallback_hours=args.fallback_cutoff_hours,
+    ):
+        active_cutoff = get_decision_cutoff_hours()
+        print(
+            f"Generating predictions for {start_date} → {end_date} "
+            f"(cutoff {active_cutoff:.2f}h before kickoff)"
+        )
+        games = _load_schedule(start_date, end_date)
+        roster = _load_rosters(games["season"].unique())
+        scaffold = _build_scaffold(games, roster)
+
+        _ensure_injury_cache(games["season"].unique())
+        _ensure_weather_cache(games["season"].unique())
+
+thinking
+**Checking prediction process**
+
+I’m digging into the `predict.py` file to understand how it handles configuration issues while iterating through the same chain. It applies guards and writes features. At the end, the `_inject_composed_features` function takes the predicted submodel outputs to create `expected_opportunities`, similar to the training process. I need to compare `_inject_composed_features` between prediction and training to ensure they perform the same computations. That’s definitely something worth verifying!
+exec
+/bin/zsh -lc "rg \"_inject_composed_features\" -n pipeline/predict.py pipeline/train.py && sed -n '600,720p' pipeline/train.py && sed -n '2200,2380p' pipeline/predict.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 766ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+pipeline/train.py:514:    def _inject_composed_features(self, df: pd.DataFrame) -> pd.DataFrame:
+pipeline/train.py:2308:                df_problem = self._inject_composed_features(df_problem)
+pipeline/predict.py:358:def _inject_composed_features(df: pd.DataFrame) -> pd.DataFrame:
+pipeline/predict.py:2433:                features = _inject_composed_features(features)
+pipeline/predict.py:2437:            # _inject_composed_features uses 'pred_usage_targets', 'pred_efficiency_tds'.
+pipeline/predict.py:2442:        features = _inject_composed_features(features)
+
+        rz_target_share = _select_column(
+            [
+                "hist_red_zone_target_share_prev",
+                "hist_red_zone_target_share_l3",
+                "red_zone_target_share_prev",
+                "red_zone_target_share_l3",
+            ]
+        )
+        rz_carry_share = _select_column(
+            [
+                "hist_red_zone_carry_share_prev",
+exec
+/bin/zsh -lc "sed -n '358,520p' pipeline/predict.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 772ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+def _inject_composed_features(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+
+    def _ensure_availability_composites(frame: pd.DataFrame) -> None:
+        has_active = "pred_availability_active" in frame.columns
+        has_share = "pred_availability_snapshare" in frame.columns
+        if not (has_active and has_share):
+            return
+        active = pd.to_numeric(frame["pred_availability_active"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
+        share = pd.to_numeric(frame["pred_availability_snapshare"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
+        combined = (active * share).astype(np.float32)
+        if "pred_availability" not in frame.columns:
+            frame["pred_availability"] = combined
+        if "pred_availability_raw" not in frame.columns:
+            if "pred_availability_active_raw" in frame.columns:
+                raw_active = (
+                    pd.to_numeric(frame["pred_availability_active_raw"], errors="coerce")
+exec
+/bin/zsh -lc "sed -n '1,260p' utils/train/data.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 781ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+# utils/train/data.py
+import pandas as pd
+import numpy as np
+import logging
+import math
+from datetime import datetime, timedelta
+
+logger = logging.getLogger(__name__)
+
+def load_feature_matrix(path: str, time_col: str, columns=None):
+    """Was ModelTrainer.load_data; identical behavior sans 'self'."""
+    import pandas as pd
+    logger.info(f"Loading feature matrix from {path}...")
+    def _read_parquet(**kwargs):
+        try:
+            return pd.read_parquet(path, **kwargs)
+        except Exception as e:
+            logger.warning(f"pyarrow.read_parquet failed ({type(e).__name__}: {e}). Retrying with fastparquet…")
+exec
+/bin/zsh -lc "rg \"PS_BASELINE_COLUMNS\" -n pipeline/predict.py && sed -n '1280,1405p' pipeline/predict.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 717ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+184:PS_BASELINE_COLUMNS = [
+551:    required_cols = ["player_id", "game_date", *PS_BASELINE_COLUMNS]
+602:    available_cols = [col for col in PS_BASELINE_COLUMNS if col in enriched.columns and col in baseline.columns]
+            ]
+        )
+        pl_df = pl_df.join(asof_meta, on="game_id", how="left")
+
+    rolling_stats = [s for s in ROLLING_FEATURE_STATS if s in pl_df.columns]
+    missing_stats = sorted(set(ROLLING_FEATURE_STATS) - set(rolling_stats))
+    if missing_stats:
+        logger.warning("Prediction rolling features skipping missing stats: %s", ", ".join(missing_stats))
+
+    if rolling_stats:
+        enriched = add_rolling_features(
+            pl_df,
+            level="game",
+            stats=rolling_stats,
+            windows=ROLLING_WINDOWS,
+exec
+/bin/zsh -lc "sed -n '520,640p' pipeline/predict.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 681ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+
+    return df
+
+def _collect_partition_paths(base_dir: Path, seasons: Iterable[int]) -> list[Path]:
+    paths: list[Path] = []
+    for season in sorted({int(s) for s in seasons}):
+        season_dir = base_dir / f"season={season}"
+        if not season_dir.exists():
+            continue
+        paths.extend(sorted(season_dir.glob("week=*/part.parquet")))
+    return paths
+
+
+@lru_cache(maxsize=6)
+def _load_ps_baselines(season: int) -> pl.DataFrame:
+    """
+    Load the latest available pre-snap participation features for seasons prior to `season`.
+    These serve as carry-forward baselines when the current season has no tracking data yet.
+exec
+/bin/zsh -lc "sed -n '640,720p' pipeline/predict.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 692ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+                    & (pl.col(l3_col).fill_null(0) == 0)
+                )
+                .then(pl.col(src_col))
+                .otherwise(pl.col(l3_col))
+                .alias(l3_col)
+            )
+    if l3_exprs:
+        enriched = enriched.with_columns(l3_exprs)
+    enriched = enriched.drop(helper_flag)
+    return enriched
+
+
+def _load_qb_profile_features(seasons: Iterable[int]) -> pl.DataFrame:
+    paths = _collect_partition_paths(QB_PROFILE_DIR, seasons)
+    if not paths:
+        return pl.DataFrame()
+    scan = pl.scan_parquet(
+        paths,
+exec
+/bin/zsh -lc 'rg "team_red_zone" -n' in /Users/jameswest/Desktop/nfl_predict succeeded in 758ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+pipeline/predict.py:454:            "team_red_zone_play_rate_prev",
+pipeline/predict.py:455:            "team_red_zone_play_rate_l3",
+pipeline/predict.py:469:    _team_factor(team_rz_rate, "team_red_zone_rate")
+pipeline/predict.py:477:    if "expected_opportunities" in df.columns and "team_red_zone_rate" in df.columns:
+pipeline/predict.py:478:        df["team_based_rz_opportunities"] = df["expected_opportunities"] * df["team_red_zone_rate"]
+pipeline/predict.py:479:    if "expected_opportunities_raw" in df.columns and "team_red_zone_rate" in df.columns:
+pipeline/predict.py:480:        df["team_based_rz_opportunities_raw"] = df["expected_opportunities_raw"] * df["team_red_zone_rate"]
+pipeline/train.py:619:                "team_red_zone_play_rate_prev",
+pipeline/train.py:620:                "team_red_zone_play_rate_l3",
+pipeline/train.py:639:        _team_factor(team_rz_rate, "team_red_zone_rate")
+pipeline/train.py:642:        if "expected_opportunities" in df.columns and "team_red_zone_rate" in df.columns:
+pipeline/train.py:643:            df["team_based_rz_opportunities"] = df["expected_opportunities"] * df["team_red_zone_rate"]
+pipeline/train.py:644:        if "expected_opportunities_raw" in df.columns and "team_red_zone_rate" in df.columns:
+pipeline/train.py:645:            df["team_based_rz_opportunities_raw"] = df["expected_opportunities_raw"] * df["team_red_zone_rate"]
+utils/feature/offense_context.py:143:                pl.col("red_zone_target").sum().alias("off_ctx_team_red_zone_targets"),
+utils/feature/offense_context.py:163:            pl.col("off_ctx_team_red_zone_targets")
+utils/feature/offense_context.py:166:            .alias("off_ctx_team_red_zone_targets_prev"),
+utils/feature/offense_context.py:181:            pl.col("off_ctx_team_red_zone_targets_prev")
+exec
+/bin/zsh -lc 'rg "team_red_zone_play_rate" -n' in /Users/jameswest/Desktop/nfl_predict succeeded in 754ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+pipeline/train.py:619:                "team_red_zone_play_rate_prev",
+pipeline/train.py:620:                "team_red_zone_play_rate_l3",
+pipeline/predict.py:454:            "team_red_zone_play_rate_prev",
+pipeline/predict.py:455:            "team_red_zone_play_rate_l3",
+exec
+/bin/zsh -lc "sed -n '120,260p' utils/feature/offense_context.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 748ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+
+    df = player_df.with_columns(
+        pl.col("team").cast(pl.Utf8).alias("team"),
+        pl.col("season").cast(pl.Int32),
+    )
+
+    df = df.join(coord_map, on=["season", "team"], how="left")
+    df = df.with_columns(
+        pl.when(pl.col("offensive_coordinator").is_null() | (pl.col("offensive_coordinator") == ""))
+        .then(pl.concat_str([pl.lit("TEAM_"), pl.col("team")], separator="").str.to_uppercase())
+        .otherwise(pl.col("offensive_coordinator").cast(pl.Utf8).str.to_uppercase())
+        .alias("offensive_coordinator")
+    )
+
+    primary_qb = _compute_primary_qb(df)
+
+    # Team-level usage per week
+    team_usage = (
+exec
+/bin/zsh -lc 'rg "TeamTotalAdjustedClassifier" -n && rg "team_total" config/training.yaml' in /Users/jameswest/Desktop/nfl_predict exited 1 in 1.89s:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+pipeline/train.py:77:from utils.train.team_total import TeamTotalAdjustedClassifier, TeamTotalConfig
+pipeline/train.py:1053:        if isinstance(model, TeamTotalAdjustedClassifier):
+pipeline/train.py:1058:        return TeamTotalAdjustedClassifier(model, config)
+utils/train/team_total.py:68:class TeamTotalAdjustedClassifier:
+exec
+/bin/zsh -lc "sed -n '1,260p' utils/train/team_total.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 801ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import List
+
+import numpy as np
+import pandas as pd
+
+
+@dataclass
+class TeamTotalConfig:
+    """Configuration parameters required for team-level probability adjustment."""
+
+    divisor: float
+    global_scale: float
+    mean_total: float
+    group_cols: List[str]
+    min_scale: float = 0.25
+
+
+thinking
+**Identifying inference issues**
+
+I see an issue where the inference method doesn't keep the proper probabilities for classification submodels like 'availability_active.' The current setup misrepresents 0/1 outputs as probabilities, which miscalibrates the predicted "prevalence." This could lead to significant problems in inference realism. While training uses calibrated predictions as features, it seems the inference pipeline bypasses those calibrations, which could be risky. I need to inspect how training expects to be used and address this API bug in inference.
+thinking
+**Examining potential pipeline issues**
+
+I've spotted another possible misalignment within the pipeline. It seems that the `predict` function uses `_load_artifacts(problem_name)` from the utils/train/persist directory. I need to look closely at how the inference artifacts are structured to ensure everything aligns properly. This could affect the predictions and the overall integrity of the model. It's important to verify if the handling of artifacts is consistent throughout the process, as any discrepancies might lead to issues.
+exec
+/bin/zsh -lc "sed -n '1,260p' utils/train/persist.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 712ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+# utils/train/persist.py
+from __future__ import annotations
+from pathlib import Path
+from datetime import datetime
+import yaml
+import joblib
+import json
+import logging
+import numpy as np
+import xgboost as xgb
+
+logger = logging.getLogger(__name__)
+
+def _vdir(trainer, problem_name: str, model_name: str|None, kind: str) -> Path:
+    """
+    kind in {'models','metrics','analysis','artifacts'}
+    Returns a versioned directory when trainer.run_id exists; otherwise legacy dirs.
+    """
+
+
+
+thinking
+**Evaluating prediction models**
+
+I'm looking at how `persist.save_model_and_metrics` stores calibrations and sample weighting. However, `predict.py` only loads `model.joblib` without including those calibrations. This seems like a misalignment since `predict.py` uses `predict` for most cases, but anticipates calling 'model.predict_proba' for certain scenarios. There's a significant conceptual issue here with how probability outputs are miscalculated, potentially affecting the final chain and expected opportunities. I should also think about the implications regarding future data leakage.
+thinking
+**Reviewing roster and game data**
+
+I’m examining how `play_level.build_play_level` operates, using `season_type == REG` with only daily cleaned play-by-play data—nothing about future events. 
+
+For `player_game_level`, it looks at roster snapshots built from `ROSTER_CACHE_DIR`, capturing weekly details. However, the `recent_inactivity_count` should only be computed from previous weeks, which is manageable. 
+
+A possible concern arises from `_append_zero_usage_players`, which uses weekly rosters and status that could change after games. I'm unsure how we handle updates, but it seems like we're assuming they rely on aggregated statuses from earlier in the week.
+thinking
+**Analyzing player status and injury models**
+
+I'm noting that they define `is_inactive` based on `status == "INA"` and compute `recent_inactivity_count` using a rolling sum from previous weeks, which is a good approach since they avoid relying on the current week's status.
+
+There's also the injury model integration to consider. The `player_game_level` loads a trained injury model to compute `injury_inactive_probability` before training, treating these predictions as features. 
+
+For the as-of metadata, `build_asof_metadata` shares logic across training and inference, ensuring snapshots are accurately attached. I should mention any suspicious features related to future data leakage, particularly the training-time "market_anytime_td_prob" features, and check how `player_game_level` handles player prop markets.
+exec
+/bin/zsh -lc "rg \"market_anytime_td_prob\" -n utils/feature/player_game_level.py && sed -n '2800,2905p' utils/feature/player_game_level.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 798ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+85:    "market_anytime_td_prob",
+89:    "market_anytime_td_prob_2h",
+93:    "market_anytime_td_prob_6h",
+97:    "market_anytime_td_prob_24h",
+101:    "market_anytime_td_prob_open",
+113:    "market_anytime_td_prob_l3",
+2855:    if {"market_anytime_td_prob", "injury_inactive_probability"} <= set(df_merged.columns):
+2858:                pl.col("market_anytime_td_prob") - pl.col("injury_inactive_probability")
+2863:    if {"player_id", "game_date", "market_anytime_td_prob"} <= set(df_merged.columns):
+2866:            pl.col("market_anytime_td_prob")
+2869:            .alias("market_anytime_td_prob_l3")
+2884:    if "market_anytime_td_prob" in df_merged.columns:
+2886:            pl.col("market_anytime_td_prob").is_null().cast(pl.Int8).alias("market_anytime_td_missing")
+                )
+            else:
+                logger.warning("Opponent split join skipped – missing season/week/opponent columns.")
+
+        qb_profile_pl = _load_qb_profile_features(seasons_available)
+exec
+/bin/zsh -lc "rg \"_load_player_market_features\" -n utils/feature/player_game_level.py && sed -n '260,420p' utils/feature/player_market_cli.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 747ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+1257:def _load_player_market_features(seasons: list[int]) -> pl.DataFrame:
+2826:        player_market_pl = _load_player_market_features(seasons_available)
+        )
+        if result is None:
+            result = agg_under
+        else:
+            result = result.join(agg_under, on=GROUP_KEYS, how="full", suffix="_dup")
+            drop_cols = [f"{key}_dup" for key in GROUP_KEYS if f"{key}_dup" in result.columns]
+            if drop_cols:
+                result = result.drop(drop_cols)
+    return result if result is not None else pl.DataFrame()
+
+
+def _process_player_market(
+    df_raw: pl.DataFrame,
+    roster_lookup: Dict[Tuple[int, str, str], str],
+) -> pl.DataFrame:
+    if df_raw.is_empty():
+exec
+/bin/zsh -lc "sed -n '1250,1325p' utils/feature/player_game_level.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 711ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+    if not frames:
+        return pl.DataFrame()
+
+    snap_pl = pl.concat(frames, how="diagonal_relaxed")
+    return snap_pl
+
+
+def _load_player_market_features(seasons: list[int]) -> pl.DataFrame:
+    """Load processed player market priors for the given seasons."""
+    if not seasons:
+        return pl.DataFrame()
+
+    frames: list[pl.DataFrame] = []
+    for season in sorted({int(s) for s in seasons}):
+        base_dir = PLAYER_MARKET_PROCESSED_DIR / f"season={season}"
+        if not base_dir.exists():
+            continue
+        week_dirs = sorted(base_dir.glob("week=*"))
+exec
+/bin/zsh -lc 'rg "team_offensive_plays_actual" -n' in /Users/jameswest/Desktop/nfl_predict succeeded in 873ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+tests/test_training_config_features.py:56:    # The YAML may have additional columns (like team_offensive_plays_actual 
+exec
+/bin/zsh -lc "sed -n '40,120p' tests/test_training_config_features.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 734ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+    training_cfg = _load_training_config()
+
+    problems = training_cfg.get("problems", [])
+    assert problems, "No problems defined in training configuration."
+
+    # Get the shared columns_to_discard from any problem that uses the anchor
+    # (they all reference the same anchor, so just pick the first one)
+    yaml_columns = set()
+    for problem in problems:
+        discard = problem.get("columns_to_discard", [])
+        if discard:
+            yaml_columns = set(discard)
+            break
+
+    python_columns = set(LEAK_PRONE_COLUMNS)
+
+    # The YAML may have additional columns (like team_offensive_plays_actual 
+    # for the extended version), so we check that the Python constant is a
+
+
+
+
+
+thinking
+**Analyzing feature categorization**
+
+The tests prevent leak-prone columns from being used in feature prefixes, but they overlook the distinction between 'ps_' and 'LEAK_PRONE_COLUMNS'. They haven’t classified 'ps_' as leak-prone, which leads to a conceptual issue with same-game features appearing in models that should pre-define them. While they might be safe to use for same-game models, we can’t determine an overall plan in advance. I need to confirm the config around 'usage_targets' features to ensure correctness.
+thinking
+**Reviewing feature prefixes and leakage**
+
+The `feature_prefixes_to_include` has 'ps_route_participation_' and 'ps_targets_', but the tests only block leak-prone columns. Since the ‘ps_*’ columns aren’t considered leaks, they can be included for 'usage_targets'. This would extend the use of same-game pre-snap stats beyond what's predicted, which feels unrealistic because, during inference, you don't have actual 'ps_' for upcoming plays. 
+
+The training features 'ps_' derive from same games, creating a mismatch in distributions between training and inference and leading to covariate shift and potential mild leakage. This requires careful consideration of modeling assumptions.
+thinking
+**Examining feature alignment issues**
+
+The project's goal is to use features that reflect a pre-snap plan based on historical data, rather than actual play scripts. This leads to a key conceptual misalignment because of mismatched training and inference data. For example, `BASE_GAME_COLS` includes metrics like 'touchdowns', but in upcoming games, these might only represent zeros, making them low-signal features. 
+
+Additionally, many 'weather_' features depend on external APIs, which may lack complete coverage. When data is insufficient, 'ps_' features can remain null, yet they're widely used in training configurations.
+thinking
+**Identifying issues with documentation and configuration**
+
+There's more coverage and resilience in the documentation than conceptual clarity. While they keep MLB-specific modules, some references in docs, like `statcast_glossary` and `mlb_legacy`, are still relevant, even if they've been quarantined.
+
+In `training.yaml`, there's duplication regarding 'efficiency_tds', with one version using 'drive_hist_' features and another, a truncated version that includes 'pred_', 'expected_', and 'opp_def_'. This suggests a need for restructuring, possibly due to previous edits. There might be two 'efficiency_tds' entries mistakenly included as a YAML list without unique keys, leading to complications in training definitions.
+thinking
+**Checking for duplicate indexing in training**
+
+I’m considering that the ModelTrainer likely indexes items by name, which could lead to duplicate training. There’s a chance they filter out duplicates, but to be sure, I should check the `pipeline/train` for their method of handling these potential issues. It's important to understand how they process and manage these duplicates to avoid any complications in the training process and ensure efficiency. I want to make sure everything functions smoothly!
+exec
+/bin/zsh -lc "rg \"problems\" -n pipeline/train.py | head && sed -n '2160,2225p' pipeline/train.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 825ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+235:        if "problems" in overrides and overrides["problems"]:
+236:            self.config["problems"] = [p for p in self.config["problems"] if p["name"] in set(overrides["problems"])]
+295:        self.problems = self.config['problems']
+297:        # Store predictions + merge keys for downstream problems
+978:        """Prepare team total adjustment configuration for classification problems."""
+2128:        """Execute the full training pipeline for all defined problems."""
+2150:        for problem in self.problems:
+2241:            # Check if this problem requires input predictions from previous problems
+2411:        # --- NEW: build composite & team conformal sum artifacts after all problems trained ---
+2500:                for p in self.problems:
+            # Use original global seeding for consistency
+            set_global_seed(self.base_seed)
+            logger.info(f"[seed] Using global seed {self.base_seed} for problem '{problem_name}' (matching original behavior).")
+            
+            problem_copy = copy.deepcopy(problem)
+            self.target_col = problem_copy['target_col']
+            derived_cfg = problem_copy.get('derived_target')
+            target_load_cols: list[str] = []
+exec
+/bin/zsh -lc "sed -n '2140,2220p' pipeline/train.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 811ms:
+/opt/homebrew/Library/Homebrew/brew.sh: line 60: cannot create temp file for here document: Operation not permitted
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+            except Exception as e:
+                logger.warning(f"Could not read Parquet schema with pyarrow: {e}")
+                try:
+                    # Fallback to fastparquet for schema reading to match data loading behavior
+                    df_fallback = pd.read_parquet(feature_matrix_path, engine="fastparquet")
+                    all_parquet_cols = list(df_fallback.columns)
+                    logger.info(f"Using fastparquet for schema reading: {len(all_parquet_cols)} columns")
+                except Exception as e2:
+                    logger.warning(f"Could not read Parquet schema with fastparquet either: {e2}")
+
+        for problem in self.problems:
+            problem_name = problem['name']
+            logger.info(f"========== Starting Problem: {problem_name.upper()} ==========")
+
+            # (Stage-4) Deterministic per-problem seed
+            # Temporarily disable per-problem seeding to match original behavior
+            # pseed = deterministic_seed(self.base_seed, problem_name)
+            # set_global_seed(pseed)
+Plan update
+  ✓ Scan repository structure and key docs
+  ✓ Review data ingestion and labeling logic
+  ✓ Review feature engineering and model training code
+  ✓ Identify conceptual issues, leakage, and cruft
+  ✓ Summarize concrete findings and recommendations
+codex
+Here’s a concise pass through the main issues, organized to hit your 7 questions. I’ll call out concrete locations and how they affect realism / predictive performance.
+
+---
+
+**1–2. Conceptual mismatches vs “football reality”**
+
+- **Pre‑snap (`ps_`) stats: training vs inference semantics don’t match reality**
+  - Training feature matrix (`pipeline/feature.py` → `utils/feature/player_game_level.py`) computes `ps_*` columns (route participation, slot vs wide targets, scripted touches, etc.) from **actual plays in that same game**.
+  - In inference, `_compute_features` in `pipeline/predict.py` does not have those future `ps_*` stats; instead it:
+    - Builds rolling features via `add_rolling_features(...)` (`1g_ps_route_participation_pct_per_game`, etc.).
+    - Renames them to the **same column names** (`ps_route_participation_pct`, `ps_targets_total`, etc.) via the `rename_map` in `pipeline/predict.py:551–606`.
+    - Uses `_apply_ps_fallback` / `_load_ps_baselines` to carry forward last known values for players with no recent tracking (`pipeline/predict.py:520–640`).
+  - Training config uses these `ps_*` columns directly as features for multiple problems:
+    - `pre_snap_routes` and `pre_snap_scripted_touches` use `ps_route_participation_`, `ps_targets_`, `ps_scripted_` prefixes (`config/training.yaml`).
+    - Downstream usage and TD models also include `ps_*` prefixes in `feature_prefixes_to_include`.
+  - Effect:
+    - In **training**, the model sees “perfect” pre‑snap script and alignment for the *current* game.
+    - In **inference**, those exact columns are proxies constructed from **history** and baselines, not the actual script for the upcoming game.
+    - This is a big covariate shift and makes the pre‑snap models unrealistically strong in training (they’re partially learning from same‑game play outcomes), then much weaker and noisier at inference.
+    - To be realistic, the models that are supposed to approximate pre‑snap plan should be trained on the same kind of information you have at decision time (rolling historical `ps_*`, not the current game’s `ps_*`).
+
+- **Inference for intermediate classification models uses class labels, not probabilities**
+  - In `pipeline/predict.py`, `_predict_for_problem` does:
+    - `if "anytime_td" in problem_name: proba = model.predict_proba(X)[:, 1]`
+    - `else: proba = model.predict(X)` (`pipeline/predict.py:2286–2310`).
+  - `availability_active` is a **classification** problem but is treated as regression-ish: `predict()` returns class labels (0/1) for XGBoost classifiers, not calibrated probabilities.
+  - Later, you clip these outputs and treat them as probabilities and multiply them into `expected_targets`, `expected_carries`, etc. (`_inject_composed_features` in `pipeline/predict.py:358–454`).
+  - Training, however, calibrates and evaluates models using true probabilities (via `calibration.py` and `save_model_and_metrics`).
+  - Effect:
+    - Availability / snapshare / maybe other classification submodels are effectively **hard‑thresholded** at inference.
+    - The whole chain `availability → team pace → usage → efficiency → anytime_td` is then using a much cruder, miscalibrated signal than what training expected.
+    - That directly hurts realism (players go from 0 to 1 instead of smooth probabilities) and degrades AUC / calibration for all downstream targets.
+
+- **Pre‑snap “scripted touches” heuristic is strong but somewhat rigid**
+  - `_compute_pre_snap_usage` in `utils/feature/player_game_level.py:120–360` defines scripted plays as the first 15 offensive plays (`offense_play_rank < 15`).
+  - That’s a plausible heuristic but:
+    - It doesn’t adjust for tempo, two‑minute situations, or long drives that blur into non-scripted territory.
+    - It assumes every team scripts exactly 15 plays in a uniform way.
+  - Effect:
+    - For some teams/games, the `ps_scripted_*` features represent a mix of true “openers” and reactive sequences, so model may learn noisy relationships.
+    - This matters because `pre_snap_scripted_touches` and downstream TD models treat these as key levers for designed scoring touches.
+
+---
+
+**3. Incomplete implementations / half‑finished paths**
+
+- **Duplicated `efficiency_tds` problem definition in `config/training.yaml`**
+  - Around `config/training.yaml:360–430` there are **two** problem blocks with `name: 'efficiency_tds'`:
+    - First block includes `drive_hist_`, `weather_`, `travel_`, etc. and a full `other_features_to_include`.
+    - Immediately after, a second `efficiency_tds` block appears with a shorter feature set and the same name and `columns_to_discard`.
+  - `ModelTrainer` (`pipeline/train.py:2148+`) iterates through `self.problems` as-is, so both entries are used.
+  - Effect:
+    - You train the same‑named problem twice with slightly different feature configs. Saved artifacts/metrics for that name are whichever run wins last.
+    - This is classic config cruft from refactoring; it makes it harder to reason about what the “true” TD efficiency model actually is, and could hide regressions.
+
+- **Pre‑snap models rely on features that don’t exist at inference**
+  - `pre_snap_routes` / `pre_snap_scripted_touches` rely on `ps_*` features (current‑game pre‑snap metrics) at training.
+  - In inference, `_compute_features` never generates same‑game `ps_*` — it only builds rolling historical approximations and renames them.
+  - Effect:
+    - The design of pre‑snap models is internally inconsistent: they’re trained with richer, more label‑adjacent features than they will ever see at inference.
+    - Prediction pipeline then tries to compensate with `_load_ps_baselines` and `_apply_ps_fallback` (`pipeline/predict.py:520–640`), but that is bolted on rather than built into the training story.
+
+- **LightGBM config is present but effectively unused**
+  - `config/training.yaml` defines `models: [lightgbm, xgboost]` and a `lightgbm` hyperparameter block.
+  - The actual trainer uses `training.models_to_train` which is set to `['xgboost']` (see `config/training.yaml:470+` and `pipeline/train.py::__init__`).
+  - Effect:
+    - The LightGBM config is dead weight. It may confuse readers into thinking LightGBM is part of the active ensemble when it isn’t.
+
+---
+
+**4. Wrong / misleading implementations (names vs behavior)**
+
+- **Pre‑snap features reused as “history” but named like contemporaneous stats**
+  - In training features, `ps_route_participation_pct` / `ps_targets_*` refer to stats **from that game**.
+  - In prediction, the same names are aliased from rolling historical per‑game features (`1g_ps_*_per_game → ps_*`, `3g_ps_*_per_game → ps_*_l3` in `pipeline/predict.py:551–606`).
+  - So the name `ps_route_participation_pct` means “actual participation this game” in training but “most recent rolling average” at inference.
+  - Effect:
+    - The same columns have different semantics between train and predict, which is exactly the opposite of the project’s goal (“training featurization must conceptually and logically match prediction featurization”).
+    - This will produce subtle but real degradation in calibration and generalization for any problem that leans on `ps_*` features.
+
+- **Prediction code assumes only `anytime_td` is classification**
+  - `_predict_for_problem` in `pipeline/predict.py` branches on the *name* containing `"anytime_td"` to decide whether to use `predict_proba` or `predict`.
+  - Some other problems are classification or quasi‑probabilistic (e.g. availability, possibly some variants later), but they’re treated as regression.
+  - Effect:
+    - The guard code (`_apply_guards_inline`, `_apply_availability_floor`) was clearly written assuming probabilities, not hard labels; with 0/1 inputs many downstream thresholds and scalings behave poorly.
+    - The TD model chain ends up consuming mismatched semantics relative to training.
+
+---
+
+**5. Future data leakage / label-derived leakage**
+
+Most of the heavy leakage concerns have been actively guarded against, and the as‑of machinery is solid:
+
+- **Same‑game box score leakage is centrally blocked**
+  - `LEAK_PRONE_COLUMNS` in `utils/general/constants.py` lists all same‑game outcomes: yards, attempts, TDs, snaps, etc.
+  - `config/training.yaml` mirrors this via `_shared_columns_to_discard` and `_columns_to_discard_extended` and tests enforce consistency (`tests/test_training_config_features.py`).
+  - Training feature selection logic uses those discard lists so same‑game yards/targets/snaps/TDs are not used as features for usage/efficiency/anytime models.
+
+- **As-of cutoffs for injuries/odds/weather are respected**
+  - `utils/feature/asof.py` + `asof_metadata` define `decision_cutoff_ts` per game/horizon.
+  - In `pipeline/feature.py`:
+    - You join `asof_meta` onto player-game rows and drop any rows where snapshot timestamps exceed `decision_cutoff_ts` (injury, roster, odds, forecast) and write violations to audit files (`pipeline/feature.py:376–488`).
+    - `drop_missing_snapshots_enabled()` optionally drops rows without any pre‑cutoff snapshots, preventing silent leakage from “future default” data.
+  - Injury timelines inside `player_game_level` recompute a `decision_cutoff_ts` via `get_decision_cutoff_hours()` and filter to `reported_at <= decision_cutoff_ts` (`utils/feature/player_game_level.py:1760+`), inside the same `decision_cutoff_override` context used by `build_feature_matrix`.
+  - Odds and weather feature builders consult `decision_cutoff_ts` and game start time to choose snapshot times.
+
+- **Derived target usage is mostly safe**
+  - For efficiency yards models, `derived_target` with `external_source: 'player_game'` pulls `receiving_yards` / `rushing_yards` from `PLAYER_GAME_DIR` (`pipeline/train.py:760–820`).
+  - Those stats are only used as **labels**, while the same columns are dropped as features via `columns_to_discard`.
+  - Purged group time series split with `group_col: 'game_id'` and embargo ensures label info doesn’t leak across train/val splits.
+
+Where there is conceptual leakage risk:
+
+- **Pre‑snap features act as de‑facto label proxies for that game**
+  - Because `ps_*` stats are computed from full play-by-play of that same game, they encode the realized script and target tree.
+  - They’re used both as labels (`ps_route_participation_pct`, `ps_scripted_touches`) and as features (their own counts, shares, positional splits) without any “pre‑cutoff” constraint.
+  - In real life you don’t know which WRs will be heavily scripted in **this** game; you only know historical tendencies and hints from injuries/odds.
+  - So even if they’re not literally future “snapshots,” they are **post‑snap outcomes** being fed into upstream layers of the chain.
+
+---
+
+**6. Dead / noisy data sources and features**
+
+- **Pre‑snap baselines for seasons without tracking**
+  - `_load_ps_baselines` in `pipeline/predict.py:520–560` tries to backfill `PS_BASELINE_COLUMNS` from previous seasons’ `PLAYER_GAME_DIR` partitions.
+  - If tracking is missing or schema changed, it silently returns an empty frame and `_apply_ps_fallback` becomes a no‑op.
+  - Where tracking coverage is partial (early seasons, some teams), `ps_*` inputs to models are a mix of:
+    - Real pre‑snap tracking for some players and games.
+    - Forward‑filled baselines for others.
+    - Zeros for the rest.
+  - Effect:
+    - For these cohorts, `ps_*` features are effectively noise; the model will overfit to segments with tracking and underperform on segments without, unless you stratify or drop them.
+
+- **Legacy LightGBM configuration, MLB‑selective modules, etc.**
+  - Various modules are clearly marked legacy MLB (`utils/train/selective/*`, docs `mlb_legacy.md`, etc.) and not wired into the NFL path.
+  - These are harmless but clutter the mental model; for NFL‑only work they’re dead weight.
+
+- **BASE_GAME_COLS in prediction mostly zero for future games**
+  - `BASE_GAME_COLS` in `pipeline/predict.py:145–180` includes outcomes like `passing_yards`, `rushing_yards`, `touchdowns`, `td_count`, etc.
+  - For upcoming games these are inherently unknown and end up as zeros or missing; inference artifacts should be excluding them anyway via the saved feature list.
+  - Effect:
+    - If any of these leak into the active feature set for inference due to a mismatch in artifacts, they’re just constant zeros—noise at best.
+
+---
+
+**7. Hallucinated / legacy cruft**
+
+- **Duplicated `efficiency_tds` block looks like an editing artifact**
+  - As noted above, the double definition in `config/training.yaml` is extremely likely to be a copy‑paste or model‑editing artifact, not intentional design.
+  - It should be cleaned to a single, well‑documented TD efficiency problem.
+
+- **Pre‑snap model stack appears partially designed by “wish list” rather than data reality**
+  - The pre‑snap models’ feature sets (`ps_route_participation_`, `ps_targets_`, `team_red_zone_`, `player_red_zone_`, etc.) clearly encode a conceptual, multi‑layer architecture:
+    - First predict routes and scripted touches.
+    - Feed those into usage.
+    - Then efficiency.
+  - But the actual implementation:
+    - Doesn’t ensure that the **same kind of inputs** are available at inference (history vs current game mismatch).
+    - Uses quite a few prefixes (`ps_total_`, `ps_targets_slot_share_*`, etc.) that may be sparsely populated in older seasons or for low‑usage players.
+  - This is more “aspirational architecture” than tightly validated reality and is a good candidate for pruning/grounding.
+
+---
+
+**Concrete recommendations (short list)**
+
+- **Align train/inference for `ps_*` features**:
+  - Either:
+    - Re‑define `ps_*` features to be rolling history only (and rename current‑game versions), or
+    - Train pre‑snap models using *only* the same rolling historical `ps_*` features that inference uses.
+- **Fix prediction of intermediate classification problems**:
+  - Treat all classification problems (at minimum `availability_active`, `anytime_td`) as requiring `predict_proba`, not `predict`, and ensure the predictor loads calibrated wrappers if training saved them.
+- **Deduplicate and simplify config**:
+  - Collapse the duplicated `efficiency_tds` problem in `config/training.yaml` into a single canonical definition.
+  - Remove or clearly comment unused sections (LightGBM config, unused problems).
+- **Audit pre‑snap model feature lists**:
+  - Remove any same‑game ps_* features from downstream problems that are not realistically knowable pre‑kickoff; rely on historical/role and odds/injury context instead.
+- **Treat low‑coverage pre‑snap tracking as optional**:
+  - For seasons/players without reliable tracking, drop or down‑weight ps_* features rather than silently filling them—otherwise they behave like structured noise.
+
+If you’d like, next step could be to prioritize these into an actionable change list (e.g., “fix classification predict_proba” and “align ps_* semantics”) and then refactor specific pieces of the pipeline.
+tokens used
+126,595
+Here’s a concise pass through the main issues, organized to hit your 7 questions. I’ll call out concrete locations and how they affect realism / predictive performance.
+
+---
+
+**1–2. Conceptual mismatches vs “football reality”**
+
+- **Pre‑snap (`ps_`) stats: training vs inference semantics don’t match reality**
+  - Training feature matrix (`pipeline/feature.py` → `utils/feature/player_game_level.py`) computes `ps_*` columns (route participation, slot vs wide targets, scripted touches, etc.) from **actual plays in that same game**.
+  - In inference, `_compute_features` in `pipeline/predict.py` does not have those future `ps_*` stats; instead it:
+    - Builds rolling features via `add_rolling_features(...)` (`1g_ps_route_participation_pct_per_game`, etc.).
+    - Renames them to the **same column names** (`ps_route_participation_pct`, `ps_targets_total`, etc.) via the `rename_map` in `pipeline/predict.py:551–606`.
+    - Uses `_apply_ps_fallback` / `_load_ps_baselines` to carry forward last known values for players with no recent tracking (`pipeline/predict.py:520–640`).
+  - Training config uses these `ps_*` columns directly as features for multiple problems:
+    - `pre_snap_routes` and `pre_snap_scripted_touches` use `ps_route_participation_`, `ps_targets_`, `ps_scripted_` prefixes (`config/training.yaml`).
+    - Downstream usage and TD models also include `ps_*` prefixes in `feature_prefixes_to_include`.
+  - Effect:
+    - In **training**, the model sees “perfect” pre‑snap script and alignment for the *current* game.
+    - In **inference**, those exact columns are proxies constructed from **history** and baselines, not the actual script for the upcoming game.
+    - This is a big covariate shift and makes the pre‑snap models unrealistically strong in training (they’re partially learning from same‑game play outcomes), then much weaker and noisier at inference.
+    - To be realistic, the models that are supposed to approximate pre‑snap plan should be trained on the same kind of information you have at decision time (rolling historical `ps_*`, not the current game’s `ps_*`).
+
+- **Inference for intermediate classification models uses class labels, not probabilities**
+  - In `pipeline/predict.py`, `_predict_for_problem` does:
+    - `if "anytime_td" in problem_name: proba = model.predict_proba(X)[:, 1]`
+    - `else: proba = model.predict(X)` (`pipeline/predict.py:2286–2310`).
+  - `availability_active` is a **classification** problem but is treated as regression-ish: `predict()` returns class labels (0/1) for XGBoost classifiers, not calibrated probabilities.
+  - Later, you clip these outputs and treat them as probabilities and multiply them into `expected_targets`, `expected_carries`, etc. (`_inject_composed_features` in `pipeline/predict.py:358–454`).
+  - Training, however, calibrates and evaluates models using true probabilities (via `calibration.py` and `save_model_and_metrics`).
+  - Effect:
+    - Availability / snapshare / maybe other classification submodels are effectively **hard‑thresholded** at inference.
+    - The whole chain `availability → team pace → usage → efficiency → anytime_td` is then using a much cruder, miscalibrated signal than what training expected.
+    - That directly hurts realism (players go from 0 to 1 instead of smooth probabilities) and degrades AUC / calibration for all downstream targets.
+
+- **Pre‑snap “scripted touches” heuristic is strong but somewhat rigid**
+  - `_compute_pre_snap_usage` in `utils/feature/player_game_level.py:120–360` defines scripted plays as the first 15 offensive plays (`offense_play_rank < 15`).
+  - That’s a plausible heuristic but:
+    - It doesn’t adjust for tempo, two‑minute situations, or long drives that blur into non-scripted territory.
+    - It assumes every team scripts exactly 15 plays in a uniform way.
+  - Effect:
+    - For some teams/games, the `ps_scripted_*` features represent a mix of true “openers” and reactive sequences, so model may learn noisy relationships.
+    - This matters because `pre_snap_scripted_touches` and downstream TD models treat these as key levers for designed scoring touches.
+
+---
+
+**3. Incomplete implementations / half‑finished paths**
+
+- **Duplicated `efficiency_tds` problem definition in `config/training.yaml`**
+  - Around `config/training.yaml:360–430` there are **two** problem blocks with `name: 'efficiency_tds'`:
+    - First block includes `drive_hist_`, `weather_`, `travel_`, etc. and a full `other_features_to_include`.
+    - Immediately after, a second `efficiency_tds` block appears with a shorter feature set and the same name and `columns_to_discard`.
+  - `ModelTrainer` (`pipeline/train.py:2148+`) iterates through `self.problems` as-is, so both entries are used.
+  - Effect:
+    - You train the same‑named problem twice with slightly different feature configs. Saved artifacts/metrics for that name are whichever run wins last.
+    - This is classic config cruft from refactoring; it makes it harder to reason about what the “true” TD efficiency model actually is, and could hide regressions.
+
+- **Pre‑snap models rely on features that don’t exist at inference**
+  - `pre_snap_routes` / `pre_snap_scripted_touches` rely on `ps_*` features (current‑game pre‑snap metrics) at training.
+  - In inference, `_compute_features` never generates same‑game `ps_*` — it only builds rolling historical approximations and renames them.
+  - Effect:
+    - The design of pre‑snap models is internally inconsistent: they’re trained with richer, more label‑adjacent features than they will ever see at inference.
+    - Prediction pipeline then tries to compensate with `_load_ps_baselines` and `_apply_ps_fallback` (`pipeline/predict.py:520–640`), but that is bolted on rather than built into the training story.
+
+- **LightGBM config is present but effectively unused**
+  - `config/training.yaml` defines `models: [lightgbm, xgboost]` and a `lightgbm` hyperparameter block.
+  - The actual trainer uses `training.models_to_train` which is set to `['xgboost']` (see `config/training.yaml:470+` and `pipeline/train.py::__init__`).
+  - Effect:
+    - The LightGBM config is dead weight. It may confuse readers into thinking LightGBM is part of the active ensemble when it isn’t.
+
+---
+
+**4. Wrong / misleading implementations (names vs behavior)**
+
+- **Pre‑snap features reused as “history” but named like contemporaneous stats**
+  - In training features, `ps_route_participation_pct` / `ps_targets_*` refer to stats **from that game**.
+  - In prediction, the same names are aliased from rolling historical per‑game features (`1g_ps_*_per_game → ps_*`, `3g_ps_*_per_game → ps_*_l3` in `pipeline/predict.py:551–606`).
+  - So the name `ps_route_participation_pct` means “actual participation this game” in training but “most recent rolling average” at inference.
+  - Effect:
+    - The same columns have different semantics between train and predict, which is exactly the opposite of the project’s goal (“training featurization must conceptually and logically match prediction featurization”).
+    - This will produce subtle but real degradation in calibration and generalization for any problem that leans on `ps_*` features.
+
+- **Prediction code assumes only `anytime_td` is classification**
+  - `_predict_for_problem` in `pipeline/predict.py` branches on the *name* containing `"anytime_td"` to decide whether to use `predict_proba` or `predict`.
+  - Some other problems are classification or quasi‑probabilistic (e.g. availability, possibly some variants later), but they’re treated as regression.
+  - Effect:
+    - The guard code (`_apply_guards_inline`, `_apply_availability_floor`) was clearly written assuming probabilities, not hard labels; with 0/1 inputs many downstream thresholds and scalings behave poorly.
+    - The TD model chain ends up consuming mismatched semantics relative to training.
+
+---
+
+**5. Future data leakage / label-derived leakage**
+
+Most of the heavy leakage concerns have been actively guarded against, and the as‑of machinery is solid:
+
+- **Same‑game box score leakage is centrally blocked**
+  - `LEAK_PRONE_COLUMNS` in `utils/general/constants.py` lists all same‑game outcomes: yards, attempts, TDs, snaps, etc.
+  - `config/training.yaml` mirrors this via `_shared_columns_to_discard` and `_columns_to_discard_extended` and tests enforce consistency (`tests/test_training_config_features.py`).
+  - Training feature selection logic uses those discard lists so same‑game yards/targets/snaps/TDs are not used as features for usage/efficiency/anytime models.
+
+- **As-of cutoffs for injuries/odds/weather are respected**
+  - `utils/feature/asof.py` + `asof_metadata` define `decision_cutoff_ts` per game/horizon.
+  - In `pipeline/feature.py`:
+    - You join `asof_meta` onto player-game rows and drop any rows where snapshot timestamps exceed `decision_cutoff_ts` (injury, roster, odds, forecast) and write violations to audit files (`pipeline/feature.py:376–488`).
+    - `drop_missing_snapshots_enabled()` optionally drops rows without any pre‑cutoff snapshots, preventing silent leakage from “future default” data.
+  - Injury timelines inside `player_game_level` recompute a `decision_cutoff_ts` via `get_decision_cutoff_hours()` and filter to `reported_at <= decision_cutoff_ts` (`utils/feature/player_game_level.py:1760+`), inside the same `decision_cutoff_override` context used by `build_feature_matrix`.
+  - Odds and weather feature builders consult `decision_cutoff_ts` and game start time to choose snapshot times.
+
+- **Derived target usage is mostly safe**
+  - For efficiency yards models, `derived_target` with `external_source: 'player_game'` pulls `receiving_yards` / `rushing_yards` from `PLAYER_GAME_DIR` (`pipeline/train.py:760–820`).
+  - Those stats are only used as **labels**, while the same columns are dropped as features via `columns_to_discard`.
+  - Purged group time series split with `group_col: 'game_id'` and embargo ensures label info doesn’t leak across train/val splits.
+
+Where there is conceptual leakage risk:
+
+- **Pre‑snap features act as de‑facto label proxies for that game**
+  - Because `ps_*` stats are computed from full play-by-play of that same game, they encode the realized script and target tree.
+  - They’re used both as labels (`ps_route_participation_pct`, `ps_scripted_touches`) and as features (their own counts, shares, positional splits) without any “pre‑cutoff” constraint.
+  - In real life you don’t know which WRs will be heavily scripted in **this** game; you only know historical tendencies and hints from injuries/odds.
+  - So even if they’re not literally future “snapshots,” they are **post‑snap outcomes** being fed into upstream layers of the chain.
+
+---
+
+**6. Dead / noisy data sources and features**
+
+- **Pre‑snap baselines for seasons without tracking**
+  - `_load_ps_baselines` in `pipeline/predict.py:520–560` tries to backfill `PS_BASELINE_COLUMNS` from previous seasons’ `PLAYER_GAME_DIR` partitions.
+  - If tracking is missing or schema changed, it silently returns an empty frame and `_apply_ps_fallback` becomes a no‑op.
+  - Where tracking coverage is partial (early seasons, some teams), `ps_*` inputs to models are a mix of:
+    - Real pre‑snap tracking for some players and games.
+    - Forward‑filled baselines for others.
+    - Zeros for the rest.
+  - Effect:
+    - For these cohorts, `ps_*` features are effectively noise; the model will overfit to segments with tracking and underperform on segments without, unless you stratify or drop them.
+
+- **Legacy LightGBM configuration, MLB‑selective modules, etc.**
+  - Various modules are clearly marked legacy MLB (`utils/train/selective/*`, docs `mlb_legacy.md`, etc.) and not wired into the NFL path.
+  - These are harmless but clutter the mental model; for NFL‑only work they’re dead weight.
+
+- **BASE_GAME_COLS in prediction mostly zero for future games**
+  - `BASE_GAME_COLS` in `pipeline/predict.py:145–180` includes outcomes like `passing_yards`, `rushing_yards`, `touchdowns`, `td_count`, etc.
+  - For upcoming games these are inherently unknown and end up as zeros or missing; inference artifacts should be excluding them anyway via the saved feature list.
+  - Effect:
+    - If any of these leak into the active feature set for inference due to a mismatch in artifacts, they’re just constant zeros—noise at best.
+
+---
+
+**7. Hallucinated / legacy cruft**
+
+- **Duplicated `efficiency_tds` block looks like an editing artifact**
+  - As noted above, the double definition in `config/training.yaml` is extremely likely to be a copy‑paste or model‑editing artifact, not intentional design.
+  - It should be cleaned to a single, well‑documented TD efficiency problem.
+
+- **Pre‑snap model stack appears partially designed by “wish list” rather than data reality**
+  - The pre‑snap models’ feature sets (`ps_route_participation_`, `ps_targets_`, `team_red_zone_`, `player_red_zone_`, etc.) clearly encode a conceptual, multi‑layer architecture:
+    - First predict routes and scripted touches.
+    - Feed those into usage.
+    - Then efficiency.
+  - But the actual implementation:
+    - Doesn’t ensure that the **same kind of inputs** are available at inference (history vs current game mismatch).
+    - Uses quite a few prefixes (`ps_total_`, `ps_targets_slot_share_*`, etc.) that may be sparsely populated in older seasons or for low‑usage players.
+  - This is more “aspirational architecture” than tightly validated reality and is a good candidate for pruning/grounding.
+
+---
+
+**Concrete recommendations (short list)**
+
+- **Align train/inference for `ps_*` features**:
+  - Either:
+    - Re‑define `ps_*` features to be rolling history only (and rename current‑game versions), or
+    - Train pre‑snap models using *only* the same rolling historical `ps_*` features that inference uses.
+- **Fix prediction of intermediate classification problems**:
+  - Treat all classification problems (at minimum `availability_active`, `anytime_td`) as requiring `predict_proba`, not `predict`, and ensure the predictor loads calibrated wrappers if training saved them.
+- **Deduplicate and simplify config**:
+  - Collapse the duplicated `efficiency_tds` problem in `config/training.yaml` into a single canonical definition.
+  - Remove or clearly comment unused sections (LightGBM config, unused problems).
+- **Audit pre‑snap model feature lists**:
+  - Remove any same‑game ps_* features from downstream problems that are not realistically knowable pre‑kickoff; rely on historical/role and odds/injury context instead.
+- **Treat low‑coverage pre‑snap tracking as optional**:
+  - For seasons/players without reliable tracking, drop or down‑weight ps_* features rather than silently filling them—otherwise they behave like structured noise.
+
+If you’d like, next step could be to prioritize these into an actionable change list (e.g., “fix classification predict_proba” and “align ps_* semantics”) and then refactor specific pieces of the pipeline.

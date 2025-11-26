@@ -1,0 +1,1 @@
+PROGRESS: Still blocked before edits. `.git` is not writable (`touch .git/testwrite` and `git add -A` both fail with “Operation not permitted”), so I can’t create `index.lock`, stage, or commit the existing changes—which your instructions require before making new edits. Please adjust permissions or allow skipping the pre-commit requirement so I can proceed.

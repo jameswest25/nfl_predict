@@ -1,0 +1,441 @@
+Here’s a roadmap that a future agent (or you) could execute step‑by‑step. I’ll prioritize by impact, then drill into detailed steps, risks, and checks.
+
+---
+
+**Top‑Level Priorities**
+
+- **Tier 1 (High impact, relatively contained):**
+  - T1.1: Align `ps_*` train vs inference semantics and remove same‑game leakage.
+  - T1.2: Fix classification pipelines to use probabilities end‑to‑end (availability, anytime TD).
+  - T1.3: Deduplicate and simplify TD efficiency / anytime TD configs.
+
+- **Tier 2 (Important but slightly more invasive):**
+  - T2.1: Re‑design pre‑snap feature namespace (historical vs same‑game) and audit them out of downstream problems where unrealistic.
+  - T2.2: Make pre‑snap tracking coverage explicit; treat missing data sensibly.
+  - T2.3: Refine scripted touches / early‑game heuristics to better match real offensive design.
+
+- **Tier 3 (Cleanup, observability, polish):**
+  - T3.1: Prune legacy/unused model configs and modules.
+  - T3.2: Add invariant tests and monitoring around feature parity and leakage.
+  - T3.3: Document football‑mechanism assumptions and how they map into features.
+
+Below, I’ll describe each “epic” with concrete implementation steps and pitfalls.
+
+---
+
+**Epic T1.1 – Align `ps_*` semantics & eliminate same‑game leakage**
+
+**Goal:** Ensure any pre‑snap features used as inputs at training are built from the same type of information available at prediction time (historical tracking, injuries, odds), not realized same‑game outcomes. Same‑game `ps_*` stats become labels or diagnostic outputs, not features for upstream models.
+
+**Design decision (choose one path, but plan supports both):**
+
+- **Option A (Recommended):**  
+  - `ps_game_*` = realized same‑game pre‑snap stats, used only as labels.
+  - `ps_hist_*` = rolling historical estimates (what inference currently uses, e.g. `1g_ps_route_participation_pct_per_game`, `3g_*`).
+  - Models that approximate “pre‑snap plan” train solely on `ps_hist_*` + contextual features, predicting `ps_game_*` as labels.
+- **Option B:**  
+  - Retain `ps_*` as historical by definition (rename current same‑game fields to something else and keep them out of features).
+
+I’ll assume Option A for concreteness.
+
+**Steps:**
+
+1. **Audit where `ps_*` is computed and used**
+   - Identify:
+     - Where same‑game `ps_*` is created in `utils/feature/player_game_level.py` (e.g. `_compute_pre_snap_usage`, route participation, scripted touches).
+     - Where rolling `ps_*` per‑game features are created in training (feature pipeline) and inference (`pipeline/predict.py → add_rolling_features` and renaming).
+     - All problems referencing `ps_*` columns in `config/training.yaml` (`feature_prefixes_to_include`, `other_features_to_include`).
+   - Deliverable: a short mapping doc listing:
+     - `ps_game_*` columns (same‑game).
+     - `ps_hist_*` columns (rolling historical).
+     - Which problems currently use which.
+
+2. **Introduce clear namespaces for pre‑snap metrics**
+   - In the feature builders:
+     - Rename same‑game pre‑snap columns to `ps_game_*` (e.g., `ps_route_participation_pct` → `ps_game_route_participation_pct`).
+     - Ensure they are **never** used as features; mark them as labels or “diagnostic targets” in training config.
+   - For historical/pre‑snap projections:
+     - Ensure rolling per‑game features carry a separate prefix, e.g. `ps_hist_*` or `ps_roll_*`.  
+       - Example: `1g_ps_route_participation_pct_per_game` → `ps_hist_route_participation_pct_1g`.
+       - `3g_ps_route_participation_pct_per_game` → `ps_hist_route_participation_pct_3g`.
+     - Update the renaming logic in prediction to **not** alias them to names that collide with same‑game stats.
+
+3. **Refine model configs to use only historical pre‑snap inputs**
+   - For `pre_snap_routes`, `pre_snap_scripted_touches`, and any upstream pre‑snap problems:
+     - Change `feature_prefixes_to_include` to include `ps_hist_*` (and contextual stuff like `injury_`, `team_`, `odds_`, `defense_`).
+     - Explicitly exclude `ps_game_*` and all other same‑game realized stats via `columns_to_discard`.
+   - For downstream problems (usage, efficiency, anytime TDs):
+     - Ensure no `ps_game_*` columns are present as features:
+       - If they are, either:
+         - Replace with `ps_hist_*` analogs, or
+         - Drop them if there is no sensible historical proxy.
+
+4. **Re‑wire the pre‑snap model stack**
+   - Make the pipeline explicit:
+     - Stage 1: Historical & context (`ps_hist_*`, injuries, odds, team tendencies) → predict `ps_game_*` labels (`routes`, `scripted_touches`, alignment).
+     - Stage 2: Use predicted `ps_game_*` or their expectations as inputs into usage/efficiency models.
+   - Concretely:
+     - Modify `_inject_composed_features` in `pipeline/predict.py` to:
+       - Take the predicted pre‑snap distributions (e.g. expected routes, expected scripted touches) and feed them into target/carry distribution models.
+       - Avoid directly using realized same‑game stats (they won’t exist at inference anyway).
+
+5. **Align training & prediction feature selection artifacts**
+   - Regenerate and persist feature lists per problem after the namespace change.
+   - Update prediction code to always:
+     - Load the exact feature list saved during training.
+     - Enforce that `ps_game_*` columns are **never required** as inputs to inference models (they may exist in data for diagnostics, but not in `X`).
+
+6. **Add invariants / tests for leakage and parity**
+   - Tests (or assertions) to add:
+     - For each problem, assert that any column with suffix `_yards`, `_targets`, `_tds`, `ps_game_*` is never in the “input features” list.
+     - For the set of features used in training vs prediction for a given problem:
+       - They match exactly, or differences are explicitly enumerated (e.g., extra diagnostic columns that are ignored at inference).
+     - A dedicated “no same‑game `ps_game_*` as feature” check in `tests/test_training_config_features.py` or equivalent.
+
+**Risks / Pitfalls:**
+
+- Removing strong same‑game `ps_*` inputs can **reduce short‑term model performance metrics** (AUC/R²) because you’re taking away label‑adjacent inputs. That’s expected and healthy.
+- Renaming `ps_*` columns requires careful migration of:
+  - Saved models.
+  - Downstream reporting code and notebooks.
+- Need to ensure no silent back‑compat fallbacks (e.g., try/except dropping missing columns) mask broken pipelines.
+
+---
+
+**Epic T1.2 – Fix classification pipeline & probability semantics**
+
+**Goal:** Ensure all classification models (availability, anytime TD, and any others) are trained, stored, and used as probability estimators, not hard thresholds.
+
+**Steps:**
+
+1. **Inventory all classification‑type problems**
+   - From `config/training.yaml`, identify problems with:
+     - `problem_type: classification` or similar.
+     - Binary labels (e.g., `availability_active`, `anytime_td`, maybe some injury/roster problems).
+   - Document expected outputs (probabilities vs labels) for each.
+
+2. **Standardize model saving/loading for classifiers**
+   - Confirm how calibration is applied in training:
+     - If you wrap base models with calibrators (e.g., Platt scaling, isotonic), ensure the wrapper is what gets saved.
+   - Define a clear interface for loaded models:
+     - All classification models must support `predict_proba(X)[:, 1]`.
+   - If some models are stored without calibrator:
+     - Either migrate to saving calibrated wrappers.
+     - Or store metadata about calibration in the artifact and re‑apply on load.
+
+3. **Refactor `_predict_for_problem` to use model metadata, not name heuristics**
+   - Instead of `if "anytime_td" in problem_name: use predict_proba else predict`, do:
+     - Load problem metadata (e.g. from config or a small manifest saved with the model) specifying:
+       - `problem_type` (`classification`, `regression`).
+       - `output_mode` (`probability`, `count`, etc.).
+     - If `problem_type == "classification"`, always call `predict_proba`.
+   - Ensure special cases (like multi‑class, if any) are handled explicitly.
+
+4. **Update downstream usage of classification outputs**
+   - For `availability_active`:
+     - Treat `p_active = model.predict_proba(X)[:, 1]` as a probability.
+     - Use `p_active` directly in expected value calculations (e.g., `expected_targets *= p_active`).
+     - If you want a binary flag for some guardrails, derive it via thresholding (e.g., `p_active > 0.5`), but **keep both**.
+   - For `anytime_td`:
+     - Ensure chain uses `p_td` as a probability:
+       - When combining with usage/efficiency models, keep the semantics clear: `expected_td = p_anytime_td` vs `expected_td_count` from Poisson approximations, etc.
+
+5. **Guard against accidental integer clipping / casting**
+   - Review any code where outputs are:
+     - Cast to `int` or `round`ed prematurely.
+     - Clipped to `[0, 1]` under the assumption they’re probabilities, but coming from `predict()` of regression models.
+   - Make sure clipping is applied **only** to values that are logically probabilities.
+
+6. **Validation & regression checks**
+   - Recompute:
+     - Calibration curves / Brier scores for `availability_active` and `anytime_td`.
+     - Compare pre‑change vs post‑change (you should see better calibration, maybe slightly different AUC).
+   - Add tests that:
+     - For classification problems, `predict_proba` is used and output values are between 0 and 1.
+     - Downstream functions that expect probabilities receive `float` arrays, not `int` labels.
+
+**Risks / Pitfalls:**
+
+- Models trained with assumptions about `predict()` vs `predict_proba()` might require minor retraining or calibration.
+- If some classification problems are currently implemented as regression (e.g., target `0/1` with regression objective), you’ll need to either:
+  - Convert them to true classification objectives, or
+  - Treat their outputs as scores and calibrate separately.
+
+---
+
+**Epic T1.3 – Deduplicate and simplify TD efficiency / anytime TD configs**
+
+**Goal:** Have a single, clear, auditable configuration for TD‑related models with no duplicate `efficiency_tds` definitions or conflicting feature sets.
+
+**Steps:**
+
+1. **Clarify the intended TD efficiency problem definition**
+   - Decide with domain logic:
+     - What is the canonical label (`tds_per_opportunity`, `prob_td_on_touch`, etc.)?
+     - Which feature families should TD efficiency use (usage, red zone roles, team totals, pace, defense, etc.)?
+   - Capture this in a short design note.
+
+2. **Resolve the duplicate `efficiency_tds` blocks**
+   - Compare the two blocks in `config/training.yaml`:
+     - Feature prefixes.
+     - Columns to discard.
+     - Any differences in hyperparams.
+   - Choose one as canonical (or merge them):
+     - E.g., keep the richer feature set but drop obviously redundant or leaky prefixes (`ps_game_*`, same‑game outcomes).
+   - Remove the duplicate block and update any references that rely on it.
+
+3. **Align anytime TD model configuration with the efficiency chain**
+   - Document the chain:
+     - Availability → usage (targets/carries) → efficiency (yards/TD per opportunity) → anytime TD.
+   - Ensure:
+     - Anytime TD config uses:
+       - Probabilities and expected counts from upstream problems.
+       - Contextual features like team totals, game totals, pace.
+     - Avoid re‑using raw same‑game stats or label proxies as features.
+
+4. **Simplify modeling options**
+   - If LightGBM isn’t used:
+     - Either remove it from `models:` or clearly comment it as “experimental/off by default”.
+   - Ensure `training.models_to_train` includes only the models you actually train and deploy (e.g., `['xgboost']`).
+
+5. **Add consistency checks**
+   - Test to assert no duplicate `name:` entries in `problems` config.
+   - Add a small script or test that:
+     - Loads all problem definitions.
+     - Checks for unique names and consistent `problem_type`.
+
+**Risks / Pitfalls:**
+
+- Removing a duplicate block changes behavior if production unexpectedly relies on the “second” version; you’ll want to re‑run a backtest to confirm performance stays acceptable or improves.
+
+---
+
+**Epic T2.1 – Pre‑snap feature audit and realistic football semantics**
+
+**Goal:** Ensure every pre‑snap feature reflects something knowable pre‑kickoff and ties clearly to real mechanisms: role, alignment, script, red zone usage, team tendencies.
+
+**Steps:**
+
+1. **Categorize pre‑snap features by realism**
+   - For each `ps_*` (or new `ps_hist_*`/`ps_game_*`) prefix, classify:
+     - **Realistic pre‑game info:** historical role, alignment tendencies, red zone share, scripted usage trends.
+     - **Borderline:** things that correlate with game plan but may be noisy (e.g., early‑game pace within the current season).
+     - **Unrealistic (leaky):** same‑game realized stats, direct label proxies (e.g., same‑game TD shares).
+   - Document per feature family: `ps_route_participation_*`, `ps_targets_*`, `ps_scripted_*`, red zone splits, etc.
+
+2. **Prune or rename unrealistic pre‑snap features**
+   - For features that are “unrealistic” but currently used:
+     - Either:
+       - Remove them as inputs (preferred).
+       - Or redesign them as historical aggregates (e.g., last 8 games, season to date).
+   - Ensure new names reflect semantics:
+     - `rz_target_share_last_8g` rather than `player_red_zone_target_share`.
+
+3. **Re‑balance feature sets around real drivers**
+   - Emphasize:
+     - Team implied totals and spreads (odds).
+     - Historical red zone role (`targets inside 10`, `carries inside 5`, etc. per player).
+     - Positional and formation tendencies (slot vs wide vs backfield usage).
+     - Pace, pass rate over expected, run/pass splits by game script.
+   - De‑emphasize:
+     - Features that mix realized “hot hand” from the current game with historical role.
+
+4. **Define small, interpretable pre‑snap feature groups**
+   - Create 3–5 conceptual groups:
+     - `role_usage` (routes, snaps, alignment history).
+     - `scripted_intent` (openers, 3rd‑down usage).
+     - `scoring_context` (team totals, red zone history).
+     - `game_environment` (pace, spread, weather).
+   - Ensure each pre‑snap or TD model uses these groups in ways that match football logic.
+
+5. **Add documentation**
+   - Write brief docs (even in comments or a markdown file) describing:
+     - What each group means.
+     - How it ties to real decision‑making (e.g., “this approximates OC’s likely red zone plan”).
+
+**Risks / Pitfalls:**
+
+- Over‑simplifying may hurt raw accuracy; need to balance football realism with empirical performance.
+- Some features may have overlapping information; regularization/hyperparameters may need retuning after pruning.
+
+---
+
+**Epic T2.2 – Handling low‑coverage pre‑snap tracking and baselines**
+
+**Goal:** Make tracking coverage and baseline fallback explicit, avoiding silent “noisy filler” behavior for players/seasons without tracking.
+
+**Steps:**
+
+1. **Make tracking coverage visible**
+   - Add indicators:
+     - `has_tracking_this_season`, `has_tracking_last_3g`, etc.
+   - When `_load_ps_baselines` succeeds/fails, record:
+     - A flag column: `ps_baseline_source` (`actual`, `baseline`, `none`).
+
+2. **Define a clear fallback strategy**
+   - Policies for missing tracking:
+     - If no tracking and no meaningful baseline:
+       - Either drop those player‑game rows from pre‑snap models, or
+       - Use heavily shrunk priors (e.g., depth‑chart based role) with explicit indicator flags.
+   - For low‑usage players:
+     - Consider hierarchical pooling (e.g., use positional averages by team/role).
+
+3. **Update `_apply_ps_fallback` to be explicit, not silent**
+   - Instead of a no‑op on empty baseline:
+     - Set `ps_hist_*` to `NaN` or a defined prior and mark the row via an indicator.
+   - Ensure models:
+     - Either handle missing values robustly, or
+     - Use the indicator to “know” that this is a low‑info case and rely more on team/position context.
+
+4. **Stratify evaluation by tracking coverage**
+   - When evaluating pre‑snap and TD models:
+     - Slice metrics by `has_tracking_*` and `ps_baseline_source`.
+     - Confirm that:
+       - Performance on fully tracked cohorts is good.
+       - Performance on low‑coverage cohorts is at least reasonable, not driven by noise.
+
+**Risks / Pitfalls:**
+
+- Dropping low‑coverage rows reduces sample size; may need regularization tweaks.
+- Introducing NaNs requires careful handling in feature matrices and model training.
+
+---
+
+**Epic T2.3 – Refine scripted touches / early‑game heuristics**
+
+**Goal:** Move from a rigid “first 15 plays” definition to something that captures how teams actually script drives and touches.
+
+**Steps:**
+
+1. **Analyze current scripted heuristic**
+   - Use existing `offense_play_rank < 15` scripted labels to:
+     - Compute per‑team distribution of scripted plays per game.
+     - See whether 15 is a good cutoff across teams/seasons.
+   - Look for:
+     - Two‑minute drills, hurry‑up sequences that are mis‑classified.
+     - Games where the first 15 plays span multiple drives with very different context.
+
+2. **Design a more nuanced scripted definition**
+   - Candidate heuristics:
+     - “Scripted” = plays in first X minutes of game clock on early downs outside two‑minute/4‑minute situations.
+     - Or: first N plays **per offense** excluding hurry‑up scenarios (no huddles, < 1:00 on clock).
+   - Optionally:
+     - Design team‑level `script_length` parameters learned from historical behavior.
+
+3. **Adjust labels and recompute `ps_game_scripted_*`**
+   - Implement improved heuristics in `player_game_level`:
+     - New flag `is_scripted_play`.
+     - Recompute `ps_game_scripted_targets`, `ps_game_scripted_carries`, etc.
+   - Use historical data to confirm:
+     - New scripted labels correlate with expected openers (WR1/WR2, goal‑line RBs, etc.).
+
+4. **Re‑train pre‑snap models that use scripted features**
+   - Update pre‑snap models that include scripted touch features:
+     - Use `ps_hist_*` approximations to predict new `ps_game_scripted_*` labels.
+   - Re‑evaluate:
+     - How much scripted touches add over generic role metrics to anytime TD prediction.
+
+**Risks / Pitfalls:**
+
+- More complex heuristics may be harder to reason about; keep them as simple as possible while fixing major issues.
+- Some teams may have inconsistent scripting; avoid overfitting to quirks in small samples.
+
+---
+
+**Epic T3.1 – Cleanup of legacy / unused code**
+
+**Goal:** Reduce cognitive load and risk of misinterpretation by clearly marking or removing unused configs and modules.
+
+**Steps:**
+
+1. **Identify unused model families and configs**
+   - LightGBM blocks in `config/training.yaml`.
+   - Legacy MLB code under `utils/train/selective/*`, `mlb_legacy.md`, etc.
+   - Any old problems in `problems` list that are not:
+     - Trained.
+     - Saved.
+     - Used downstream in prediction.
+
+2. **Decide policy: remove vs quarantine**
+   - For NFL work, likely:
+     - Move legacy configs into a `legacy/` or `archive/` section with explicit comments.
+     - Or delete entirely if not referenced.
+
+3. **Update documentation**
+   - Document the active set of problems and model types:
+     - E.g., “Active for NFL anytime TD pipeline: availability_active, pre_snap_routes, pre_snap_scripted_touches, usage_targets, usage_carries, efficiency_yards, efficiency_tds, anytime_td.”
+
+4. **Add CI/Tests for config hygiene**
+   - Test that:
+     - All `problems.name` values are unique.
+     - All referenced problems have corresponding model artifacts.
+     - No model type is declared in `config` but never used anywhere.
+
+**Risks / Pitfalls:**
+
+- Removing code that is used in ad‑hoc scripts or by other teams. Favor quarantining with documentation over hard deletion unless you’re sure.
+
+---
+
+**Epic T3.2 – Observability & leakage guards**
+
+**Goal:** Add automated checks that protect against reintroducing leakage or train/predict feature mismatches.
+
+**Steps:**
+
+1. **Feature parity tests**
+   - For each problem:
+     - Load training feature names from artifacts.
+     - Load prediction feature names from the live pipeline.
+     - Assert parity, with a small list of allowed differences (e.g., `game_id`, `player_id`).
+
+2. **Leakage signature tests**
+   - Maintain lists of “never features”:
+     - Same‑game outcomes: `*_yards`, `*_td`, `*_touches`, `*_targets`, etc.
+     - `ps_game_*` namespace.
+   - Test that:
+     - These columns never appear in `features_to_use` for any problem.
+
+3. **As‑of and snapshot tests**
+   - Add regression tests ensuring:
+     - `decision_cutoff_ts` logic in `feature.py` and `player_game_level.py` correctly filters injury/odds/weather columns.
+     - No columns with `reported_at` > `decision_cutoff_ts` survive into training matrices.
+
+4. **Monitoring / dashboards (if applicable)**
+   - For production predictions:
+     - Track distributions of key features and outputs over time.
+     - Alert on distribution shifts, especially for:
+       - `ps_hist_*` inputs.
+       - `p_active`, `p_anytime_td`.
+
+**Risks / Pitfalls:**
+
+- Over‑constraining tests can slow iteration; keep rules minimal but high‑impact.
+
+---
+
+**Epic T3.3 – Documentation of football mechanisms**
+
+**Goal:** Make the mapping from football concepts to features and models explicit so future changes stay aligned with reality.
+
+**Steps:**
+
+1. **Write a short “anytime TD model design” doc**
+   - Sections:
+     - High‑level architecture (availability → usage → efficiency → TD).
+     - Definitions of key labels (what is “anytime TD” exactly, what is “efficiency_tds”).
+     - Explanation of pre‑snap models and how their predictions are used.
+
+2. **Document feature groups and semantics**
+   - For each group (role_usage, scripted_intent, scoring_context, game_environment):
+     - List representative features.
+     - Explain their intended connection to TD probability.
+
+3. **Add inline references from config to docs**
+   - In `config/training.yaml`:
+     - Add short comments or references to the design doc sections next to each problem.
+   - Optionally, generate a markdown summary from the config so docs stay in sync.
+
+---
+
+If you’d like, next step could be to pick one Tier‑1 epic (e.g., `ps_*` alignment or classification pipeline) and I can turn that into a more concrete implementation checklist (file‑by‑file changes, data migration steps, and specific tests to add), ready for an agent to execute.

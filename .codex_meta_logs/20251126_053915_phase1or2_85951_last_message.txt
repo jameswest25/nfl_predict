@@ -1,0 +1,168 @@
+Here’s a concrete pass over the current stack, focused on anytime TD realism, data flow, and leakage.
+
+**1. Conceptual mismatches vs “anytime TD reality”**
+
+- **Anytime TD definition includes non‑rushing/receiving TDs**  
+  - In `utils/feature/player_game_level.py:3180+`, `anytime_td` for passers is defined as “any non‑passing TD credited to the passer (rush/receive/return)” and later `_merge_multi_role_players` falls back to `rushing_td_count + receiving_td_count` if generic `touchdowns` is missing.  
+  - However, the earlier cleaning stage (`pipeline/clean.py`) attributes *all* TD types (kickoff, punt, INT, fumble, generic return) into `touchdown_player_id` and `touchdown` (and those then roll up into `touchdowns` at player‑game level).  
+  - Net effect: for non‑QB skill players, “anytime_td” is effectively “did this player score any TD at all (including return TDs)” not strictly “rushing or receiving, not passing”. That’s conceptually slightly off your stated objective.  
+  - Impact: a small but real mismatch: return specialists and defensive TDs for offensive players can leak into the label; could distort calibration for edge cases like WR/KR hybrids.
+
+- **Passers’ “anytime_td” includes rushing TDs but never receiving**  
+  - The passer aggregation branch treats passers as non‑receivers (sets receiving stats to zero and only uses `touchdown_player_id == passer_player_id`). This is realistic for ~99% of QB plays but conceptually assumes QBs never catch TDs.  
+  - Rare trick plays (e.g., Philly Special) won’t be captured correctly, but this is low impact.
+
+- **Target / carry / red‑zone flags are play‑level abstractions, not route/scheme aware**  
+  - `pipeline/clean.py` derives `target`, `carry`, `red_zone_target`, `goal_to_go_target` purely from PBP flags and yardline/goal_to_go.  
+  - This is reasonable but assumes nflfastR’s `receiver_player_id` and route classification are always aligned; the true football “design” (e.g., primary read vs check down, RPO keep vs give) is still approximated by realized targets/carries.  
+  - Impact: acceptable abstraction, but the reality is still “usage realized on the field,” not “play‑call intent.” That’s fine as long as we remember we are modeling realized usage, not scheme.
+
+- **Scripted plays / role flags are empirical, not “coach intent”**  
+  - In `utils/feature/player_game_level.py:260+` and near the end of the file, “scripted plays” and role flags (e.g., `role_primary_red_zone_target`, `role_goal_line_back`) use heuristics (first N plays, route tags, quantiles of historical share).  
+  - Conceptually this is a good attempt to approximate how coaches deploy players, but it is not directly coach‑labeled; it’s derived from realized usage. That’s fine, but the model is implicitly “who has historically gotten these types of looks” rather than “who the OC intends to feature in the next game.”
+
+**2. Where modeling / data flow could be closer to on‑field reality**
+
+- **Separating “any offensive TD” vs “rushing or receiving only”**  
+  - Currently, `anytime_td` uses generic `touchdowns` rollups which include return TDs and possibly defensive TDs for offensive players.  
+  - For betting markets, “anytime TD scorer” usually includes return TDs but excludes passing. Your stated objective excludes passing, but not fully clear on return TDs. If your intent is “rushing or receiving only”, you should:  
+    - Define `anytime_td_offense` = 1 if `rushing_td_count + receiving_td_count > 0` and use that as primary label.  
+    - Keep “all TDs” (`td_count` or `any_td_including_return`) as a separate diagnostic label.  
+  - This would align label semantics with your written definition and avoid subtle label noise from return plays.
+
+- **Usage and “expected TD signal” pipeline is fairly complex and layered**  
+  - `pipeline/train.py` builds `expected_opportunities`, `expected_td_signal`, `expected_rz_td_signal` by combining usage metrics, team totals, red zone shares, and an efficiency model.  
+  - These are conceptually strong (near football reality: team scoring expectation × player share × efficiency) but also brittle: if any upstream component is mis‑calibrated, the composite “signal” stops representing real scoring odds.  
+  - For realism:  
+    - Consider anchoring the final anytime TD model more directly on interpretable features (route participation, target share, carry share, red‑zone usage, team total, opponent red‑zone defense, injury availability) and treat “expected_td_signal” as just one candidate feature, not the central driver.  
+    - Make sure that each component (usage, team total, efficiency) is trained and validated separately with football‑grounded diagnostics (e.g., does expected routes match actual routes by position? does team_total × TD_rate match team TD outcomes?).
+
+- **Drive‑level features: good abstraction but could be more game‑state aware**  
+  - `_finalize_drive_history_features` in `pipeline/feature.py` builds `drive_hist_touch_rate_prev`, `drive_hist_td_rate_prev`, etc., across all drives.  
+  - Football reality: TD likelihood is highly concentrated in specific contexts (red zone, compressed field, trailing vs leading, hurry‑up). Right now, drive history features are “global”: no explicit separation for early‑down vs late‑down, neutral vs trailing, etc.  
+  - Potential improvements:  
+    - Split drive history by field position (starting field position, red zone starts), game script cluster (leading/neutral/trailing), and pace.  
+    - That would move from “generic drive TD rate” towards “this player’s drive impact in similar situations to the upcoming game.”
+
+- **Role flags quantiles could be more game‑situation‑specific**  
+  - `_append_role_flags` uses team×position quantiles of `hist_red_zone_target_share_l3` and `hist_goal_to_go_carry_share_l3` with a global quantile (0.7).  
+  - In reality, some teams rotate heavily in specific game scripts (goal‑line packages, 2RB sets). A global quantile may mislabel a rotational short‑yardage back as “goal_line_back” even when their usage only appears in specific formations.  
+  - Improvement: condition the quantile on game script or package (e.g., only on goal‑to‑go or within specific personnel group if available), or explicitly encode “package role” features when the data supports it.
+
+**3. Incomplete implementations / half‑finished ideas**
+
+- **Feature tuning CLI path is effectively frozen at a single point**  
+  - In `pipeline/train.py:2520+`, `tune_features` uses Optuna but:  
+    - `half_life` is suggested in range `[250, 250]` and `shrink_k` in `[45, 45]` (i.e., effectively fixed), so only `crude_window` is actually tuned.  
+    - It calls `python pipeline/feature.py --half-life ...`, but `pipeline/feature.py` has no `if __name__ == '__main__'` CLI entrypoint and does not parse these arguments, so this appears to be a legacy / incomplete path.  
+  - Impact: this block is dead / misleading; it suggests feature hyper‑parameter tuning exists, but right now it doesn’t actually alter the features. It’s conceptual cruft.
+
+- **Team‑total adjusted TD features partly wired, partly legacy MLB**  
+  - `_ensure_team_game_actuals` and `TeamTotalAdjustedClassifier` logic in `pipeline/train.py` appear to be partially general‑purpose, with references to MLB (`game_pk`, innings, etc.) still hanging around.  
+  - These mixed references suggest the team‑total machinery was ported from MLB and only partially NFL‑ized. Parts that reference innings are clearly irrelevant to NFL, and the docs/variable names don’t fully match NFL reality.
+
+- **Roster “snap_zero_usage_stub” comment vs implementation**  
+  - In `utils/feature/player_game_level.py:880+` the comment notes “Removed explicit stub feature per user preference for natural feature learning” and the code is:  
+    - If `snap_zero_usage_stub` not in columns: `pass` – i.e., no stub is added.  
+  - This is consistent with the comment, but other pieces of the stack may still assume a stub exists. It’s worth checking for references to `snap_zero_usage_stub` elsewhere; if any exist, they are now dead/inconsistent.
+
+- **Some multi‑problem hooks not fully NFL‑specific**  
+  - `utils/train/conformal_composite`, `ordinal_ev_integration`, and some composite conformal paths store meta with MLB fields like `inning_topbot`. That’s clearly from legacy MLB and is not tied to the NFL anytime TD problem.  
+  - These are not necessarily harmful, but they are conceptual clutter if they’re not actually used for NFL.
+
+**4. Wrong / misleading implementations or naming mismatches**
+
+- **“Anytime TD” label vs description**  
+  - Code comment in `player_game_level` says: “anytime_td: any non‑passing TD credited to the passer (rush/receive/return)”; more generally, non‑passers use `touchdowns` which includes return types.  
+  - Your project description explicitly: “anytime touchdown (rushing or receiving, not passing)”. The implementation is “any TD scored by the player, including return TDs, but not passing TDs.”  
+  - This is misleading if you interpret the label as only rush+receive. It should be clarified or corrected.
+
+- **Mix of MLB and NFL semantics in training stack**  
+  - Example: in `train_and_evaluate_models` regression branch, composite conformal meta uses `["game_pk", "away_team_abbr", "home_team_abbr", "inning_topbot", self.time_col]`. NFL games do not have `inning_topbot`.  
+  - Similarly, `load_feature_matrix` still talks about `game_pk` vs `game_id`. This is mostly harmless but makes reasoning about grouping and splits harder and invites configuration mistakes.
+
+- **Comment in `pipeline/feature.py` about dropping odds columns**  
+  - `player_game_scan = player_game_scan.drop(cs.starts_with("weather_"))` and later some odds columns are pruned, while `LEAK_PRONE_COLUMNS` and test guards are meant to keep leak‑prone markets out.  
+  - The code logs and comments mention dropping leak‑prone features but then selectively re‑introduce various `market_anytime_td_*` features in `player_game_level` and `odds.py`. This interplay is complex and easy to misconfigure; small naming changes could accidentally allow label‑proximal odds columns through.
+
+**5. Data leakage (future info, label‑derived features)**
+
+Within the core anytime TD path, most leakage control is intentional and fairly robust, but there are still risk points and complexity:
+
+- **Decision‑time cutoff handling is a major guardrail and appears well implemented**  
+  - `utils/feature/asof.py` and `utils/feature/asof_metadata.py` define per‑game decision cutoff timestamps and horizons.  
+  - In `pipeline/feature.py`, after joining as‑of metadata, there is explicit logic to drop rows where snapshot timestamps (`*_ts` columns) exceed `decision_cutoff_ts`, and there is a config flag `drop_missing_snapshots_enabled()` with a YAML‑backed switch.  
+  - This is good and matches the “freeze features at decision time” concept.
+
+- **Odds features can easily re‑introduce market knowledge close to kickoff**  
+  - `player_game_level` includes a battery of `market_anytime_td_prob_[lead time]` features (2h, 6h, 24h, open) and a residual (`market_anytime_td_residual`) defined as `market_anytime_td_prob - injury_inactive_probability`.  
+  - As long as (a) each market snapshot’s timestamp is <= decision cutoff and (b) at inference you have analogous snapshots at the same horizon, this isn’t classical leakage; you’re just using market expectations at your decision time.  
+  - However:  
+    - If decision cutoff is configured earlier than some markets are available (e.g., using a 24h snapshot but training on 2h snapshots), you could be injecting information that isn’t consistently available at inference.  
+    - The residual uses `injury_inactive_probability`, which itself is model‑based; if that injury model is trained with data beyond the same cutoff or uses future injury statuses, you could leak. The injury pipeline seems careful (time‑aware snapshots), but it’s complex and worth validating.
+
+- **Realized same‑game PS stats exposed as extra columns**  
+  - In `player_game_level._build_ps_features` (route participation, target alignment, scripted touches), there is a block that “expose realized same‑game stats under a clear namespace for downstream label use”:  
+    - It clones `ps_` columns into alias columns via `_ps_game_alias(col)` (e.g., `ps_route_participation_pct_game`).  
+  - Those are meant for label analysis, not for training features; if they accidentally end up in the model’s feature list, that would be severe leakage (they use same‑game stats, i.e., stats from the game you’re predicting).  
+  - Mitigation appears to be in `utils/general/constants.LEAK_PRONE_COLUMNS` and tests like `tests/test_data_leak_guard.py`, but this is fragile: any name drift or a missed alias could sneak through. This is a key area where I’d double‑check that none of the “_game” aliases, or any non‑historical PS metrics, are in the training feature set.
+
+- **Derived targets that shift by −1 week are safe, but external sources must be checked**  
+  - `_derive_target_column` in `pipeline/train.py` uses `shift(shift)` with default −1 over group columns. That is conceptually “next‑period label,” which is safe if you’re modeling next game.  
+  - However, `external_source` options `'game_by_week'` and `'player_game'` join in actuals from other Parquet datasets. If those data sources ever contain future weeks or ingest corrections after the fact, you must ensure the join is restricted to games whose actuals would have been known at decision time. Currently, the code only merges on `(game_id, team)` or `(game_id, player_id)` with no explicit time constraint; this is logically fine as long as the feature frame already filters to “games up to X” and the join doesn’t cross time boundaries. It’s a subtle assumption.
+
+- **Injury augmentation at load time uses end‑of‑week injury info if not careful**  
+  - `utils/train/data._augment_injury_signals` synthesizes `injury_inactive_probability` from `injury_report_status`, `injury_practice_status`, and `injury_practice_dnp_count`.  
+  - Those columns are supposed to be as‑of the decision cutoff due to the as‑of pipeline in features. If the underlying feature matrix is correct, this is safe. But if any downstream code re‑generates or updates these columns using full‑season injury logs (not as‑of snapshots), that would leak. The current implementation looks like a straightforward row‑wise transformation, so it’s probably safe.
+
+**6. Dead / broken data sources or effectively noisy features**
+
+- **Feature tuning path is effectively non‑functional**  
+  - As noted above, `tune_features` calls `pipeline/feature.py` as a script with parameters that the module doesn’t accept. That means any half‑life / shrink tuning you thought you were doing is not actually applied. This is dead code and conceptually misleading.
+
+- **Some MLB‑originated meta is irrelevant noise for NFL**  
+  - Meta fields like `inning_topbot`, `game_pk` in `train.py` and related modules are artifacts from MLB and don’t correspond to anything meaningful in NFL anytime TD modeling. If they accidentally enter the feature set, they’d just be noise (or constant/missing). Right now they mostly live in analysis/conformal code paths, but the presence is confusing.
+
+- **PS baseline and alignment features may be missing for many players / seasons**  
+  - The PS features rely on tracking data / enriched play‑by‑play with `offense_players`, `offense_positions`, `route`, etc. If those feeds are incomplete, the PS features default to zeros with fallback baselines.  
+  - For players and seasons with no underlying tracking, the resulting PS features are mostly “we don’t know” encoded as zeros plus flags like `ps_tracking_has_game_data` / `ps_tracking_used_baseline`. Models must be robust to these being essentially missing; otherwise, the PS namespace is noisy.
+
+- **Weather forecast features gated by ENABLE_WEATHER_FEATURES but then partially dropped**  
+  - In `pipeline/feature.py` and `pipeline/predict.py`, weather features are added and then some columns (timestamps, intermediate flags) are dropped. If the forecast collection (`collect_weather_forecasts`) fails or is spotty, many weather columns may be null/zero, functionally noise. The code logs warnings but does not systematically down‑weight them.
+
+**7. Hallucinated or legacy structure / concepts**
+
+- **MLB legacy all over the training stack**  
+  - References to `game_pk`, innings, MLB‑style conformal intervals, and generic “team total” machinery suggest this repo was originally or partially MLB‑focused and then adapted.  
+  - Some abstractions (PurgedGroupTimeSeriesSplit, composite conformal sums, ordinal EV) are over‑general relative to the NFL anytime TD objective, adding complexity but not clear incremental predictive power without careful NFL‑specific tuning and validation.
+
+- **Config and CLI interfaces that don’t match the code paths**  
+  - `tune_features` advertises hyper‑parameter tuning of feature engineering via CLI arguments, but the feature pipeline doesn’t accept or use these arguments. That’s effectively hallucinated structure: the interface exists but the implementation does not.  
+  - Similarly, parts of the odds and PS stack appear to assume richer external data (multiple books, full tracking coverage) than may actually be present for some seasons, leading to columns that exist in schema but are mostly null.
+
+- **“Snapshot” and “as‑of” nomenclature slightly ahead of implementation in some places**  
+  - The as‑of metadata is well thought out, but some modules (e.g., `player_market_cli`, parts of injury integration) rely on snapshot columns that may not be fully enforced or may be optional. This can leave you with partially populated snapshot features that conceptually suggest “as of X hours before kickoff” but in practice are “latest we had at time of ETL run.”
+
+---
+
+**Bottom‑line recommendations to improve realism and predictive performance**
+
+- **Clarify and align the label:**  
+  - Decide if anytime TD should include return TDs. Implement explicit labels: `anytime_td_offense` (rush+receive only) and `anytime_td_all` (includes returns), and use the one that matches your betting objective. Update `utils/feature/targets.py` and `player_game_level` aggregations accordingly.
+
+- **Tighten leak guards around same‑game / PS features:**  
+  - Ensure any `_ps_*_game` aliases, or same‑game realized stats, are excluded from the feature list for problems like `anytime_td`. Confirm via tests that no “_game” or obviously realized‑same‑game columns appear in `feature_columns` when training.
+
+- **Simplify or remove broken / legacy paths:**  
+  - Remove or disable the non‑functional `tune_features` pipeline until it’s actually wired to the feature builder.  
+  - Strip MLB‑only metadata (`inning_topbot`, `game_pk` semantics, etc.) from NFL‑specific training paths to reduce confusion and potential misconfig.
+
+- **Make odds & injury usage explicit and consistent with decision time:**  
+  - Confirm that all `market_anytime_td_*` and injury forecast fields used in training are computed from snapshots at or before the configured `decision_cutoff_ts`, and that prediction uses the same horizon.  
+  - Consider training a “no‑odds” model as a sanity check to ensure you’re not simply echoing the market.
+
+- **Strengthen football‑grounded context:**  
+  - Extend drive‑level and team context features with game‑state‑aware splits (leading/trailing, red‑zone only, short yardage).  
+  - Refine role flags to be more situation‑specific (goal‑line packages, scripted drives) using the existing “scripted play” machinery.
+
+If you’d like, next step I can: (a) enumerate exactly which columns should be considered “forbidden” for anytime TD training and cross‑check them against the final feature matrix schema, or (b) propose a minimal patch that introduces `anytime_td_offense` and switches the primary problem to that label.

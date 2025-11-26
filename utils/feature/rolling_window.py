@@ -165,6 +165,13 @@ class RollingWindow:
         
         schema = ds.collect_schema()
         schema_names = set(schema.names())
+
+        missing_stats = [k for k in keys if k not in schema_names]
+        if missing_stats:
+            raise ValueError(
+                f"RollingWindow.compute received missing stats in dataset: {missing_stats}. "
+                "Ensure stats requested for rolling features exist in the base frame."
+            )
         
         # Cast player_id
         ds = ds.with_columns(pl.col("player_id").cast(pl.Utf8))

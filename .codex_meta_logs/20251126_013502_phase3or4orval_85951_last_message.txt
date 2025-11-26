@@ -1,0 +1,9 @@
+- Introduced explicit same-game vs historical namespaces: pre-snap stats now emit `ps_game_*` aliases and `ps_hist_*` historical counterparts, rolling stat surface includes pre-snap metrics, prediction renames/fallbacks honor the new hist names, and training config consumes only `ps_hist_` while marking `ps_game_/ps_*` as leak-prone (`utils/feature/player_game_level.py`, `utils/feature/stats.py`, `pipeline/predict.py`, `config/training.yaml`, `utils/general/constants.py`, `tests/test_training_config_features.py`).
+- Classification inference is metadata-driven: inference artifacts now carry `task_type/output_mode`, `_predict_for_problem` always uses `predict_proba` for classifiers, and calls were updated accordingly (`utils/train/persist.py`, `pipeline/train.py`, `pipeline/predict.py`); added a unit test to lock in the proba behavior (`tests/test_predict_probabilities.py`).
+- Cleaned TD config duplication and added config hygiene (unique problem names, ps_hist namespace guard) plus deduped the double `efficiency_tds` block (`config/training.yaml`, `tests/test_training_config_features.py`).
+
+Tests: `python3 -m pytest tests/test_training_config_features.py tests/test_predict_probabilities.py` (pytest not installed in the environment).
+
+Notes: Unable to stage/commit because the sandbox blocks writes inside `.git` (index.lock/permission errors remain). Models will need retraining so artifacts include the new `ps_hist_*` feature names and task metadata.
+
+PROGRESS: Tier-1 scaffolding done (ps_hist namespace, classifier probabilities, TD config cleanup); remaining epics (T2/T3 feature audits, tracking coverage, scripted heuristics, docs) still outstanding. Next steps: install pytest, rerun the targeted tests, retrain pipelines to regenerate artifacts with the updated feature set, and extend audits/tests for leakage across the remaining epics.

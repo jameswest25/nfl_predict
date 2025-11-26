@@ -1,0 +1,1 @@
+PROGRESS: Blocked at start because `.git` is read‑only and I can’t create `index.lock`, so I couldn’t stage/commit the existing changes as required. Commands like `git add -A` and `touch .git/testwrite` fail with “Operation not permitted.” Please adjust permissions or allow writing inside `.git`, then I can checkpoint the current state and proceed with the plan.

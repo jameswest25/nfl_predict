@@ -1,0 +1,13 @@
+Implemented coverage-aware pre-snap handling and refined scripted heuristics.
+- `utils/feature/player_game_level.py`: added scripted-play heuristic (first 20 snaps within early-game window, excluding two-minute/hurry and late downs), introduced coverage columns (`ps_tracking_team_dropbacks`, `ps_tracking_has_game_data`) rolled into `ps_hist_*`, and kept ps_game aliases for labels only.
+- `pipeline/predict.py`: `_apply_ps_fallback` now tracks actual vs baseline coverage, emits `ps_baseline_source` plus `ps_tracking_*` flags, and includes new tracking columns in fallback maps.
+- `config/training.yaml` + `utils/general/constants.py`: marked new ps_tracking fields (and ps_game equivalents) as leak-prone/columns_to_discard to keep them out of features; test guard updated to allow future ps_tracking prefixes if needed.
+- Added docs/pre_snap_semantics.md documenting namespaces, coverage signals, and scripted assumptions; added `tests/test_predict_probabilities.py` fallback coverage test and updated prefix guard test.
+
+Tests:
+- `pytest tests/test_predict_probabilities.py tests/test_training_config_features.py` (fails: `pytest` not installed in environment).
+
+Git/CI:
+- Unable to stage/commit/push; filesystem denies writes to `.git` (index.lock cannot be created).
+
+PROGRESS: Added coverage flags/baseline diagnostics, refined scripted heuristics, leak guards, docs, and tests; remaining plan items include broader Tier-2/3 audits, installing pytest/running full suite, and retraining artifacts with the updated feature set.

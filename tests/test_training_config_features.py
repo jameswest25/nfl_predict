@@ -14,6 +14,19 @@ def _load_training_config() -> Dict:
         return yaml.safe_load(fh)
 
 
+def test_problem_names_unique():
+    training_cfg = _load_training_config()
+    problems = training_cfg.get("problems", [])
+    names = [p.get("name") for p in problems]
+    seen = {}
+    duplicates = set()
+    for name in names:
+        if name in seen:
+            duplicates.add(name)
+        seen[name] = True
+    assert not duplicates, f"Duplicate problem names in config: {sorted(duplicates)}"
+
+
 def test_training_config_feature_guards():
     """Ensure columns_to_discard and other_features_to_include don't overlap."""
     training_cfg = _load_training_config()
@@ -113,6 +126,25 @@ def test_feature_prefixes_cannot_select_leak_prone_columns():
     )
 
 
+def test_ps_prefixes_use_hist_namespace():
+    """Prevent accidental inclusion of same-game ps_* columns as features."""
+    training_cfg = _load_training_config()
+    problems = training_cfg.get("problems", [])
+    offenders = {}
+    for problem in problems:
+        name = problem.get("name", "<unknown>")
+        prefixes = problem.get("feature_prefixes_to_include") or []
+        allowed_ps_prefixes = ("ps_hist_", "ps_tracking_")
+        bad = [
+            p
+            for p in prefixes
+            if p.startswith("ps_") and not any(p.startswith(pref) for pref in allowed_ps_prefixes)
+        ]
+        if bad:
+            offenders[name] = bad
+    assert not offenders, f"Same-game pre-snap prefixes should be removed; found {offenders}"
+
+
 def test_asof_snapshots_not_after_cutoff():
     """Validate that stored snapshot timestamps never exceed the decision cutoff."""
     asof_path = Path(__file__).resolve().parents[1] / "data" / "processed" / "asof_metadata.parquet"
@@ -150,4 +182,3 @@ def test_asof_snapshots_not_after_cutoff():
         "As-of snapshot coverage dropped below expected thresholds: "
         f"{coverage_failures}"
     )
-

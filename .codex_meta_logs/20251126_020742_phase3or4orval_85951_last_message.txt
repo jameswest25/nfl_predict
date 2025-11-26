@@ -1,0 +1,1 @@
+PROGRESS: Still blocked before any edits this run. `git status` works but `git add -A` fails with “Unable to create '.git/index.lock': Operation not permitted”, indicating `.git` is not writable. I haven’t touched files because requirements say to commit prior changes first. Please make `.git` writable or allow proceeding without staging/committing so I can implement the plan.

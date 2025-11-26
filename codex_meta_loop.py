@@ -2,47 +2,46 @@
 """
 codex_meta_loop.py
 
-Hybrid orchestrator for the `codex` CLI that runs a multi-prompt, multi-phase loop:
+Orchestrator for the `codex` CLI that runs a multi-prompt, multi-phase loop:
 
-1. Prompt 1 (chat): Conceptual analysis (data realism, leakage, incomplete/wrong implementations).
-2. Prompt 2 (chat): Rich, detailed plan (no edits).
-3. Prompt 3 (exec): Agent-style implementation of the plan, up to N iterations (default 10).
-4. Prompt 4 (exec): Single audit pass to check if plan is fully implemented.
+1. Prompt 1 (analysis): Conceptual analysis (data realism, leakage, incomplete/wrong implementations).
+2. Prompt 2 (plan): Rich, detailed plan (no edits).
+3. Prompt 3 (implement): Agent-style implementation of the plan, up to N iterations (default 10).
+4. Validation loop: run full pipeline and ensure metrics exist.
+5. Prompt 4 (audit): Single audit pass to check if plan is fully implemented (no edits).
 
-If audit finds gaps:
-- Treat audit output as new "analysis",
-- Build a new plan,
-- Repeat implementation loop (max 10),
-- Audit once again, etc.
-
-When a plan + audit confirm that "The plan is completely implemented",
-the meta-cycle ends and the script starts over at Prompt 1.
+Key robustness changes:
+- Uses `codex exec -` (prompt via stdin) so Codex won’t hang waiting for a CLI prompt argument.
+- Uses `--output-last-message` to capture ONLY the assistant final message for parsing.
+  This prevents false-positives from echoed prompts or “thinking” output.
+- Streams Codex stdout to console for visibility, but decisions are based on last-message file.
 """
 
 from __future__ import annotations
 
 import os
-import pty
-import select
 import signal
 import subprocess
-import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 import textwrap
 from typing import Tuple, Optional
 from shutil import which
+import tempfile
+
 
 # ---------------- CONFIG ----------------
 
 PROJECT_DIR = Path(".").resolve()
 SLEEP_BETWEEN_CYCLES = 30
 
-CHAT_MODEL = "gpt-5.1"
+CHAT_MODEL = "gpt-5.1"         # Used for analysis/plan steps (read-only runs)
 CODEX_CMD = "codex"
 
 MAX_IMPLEMENTATION_ITERATIONS = 10
 MAX_VALIDATION_ITERATIONS = 5
+
 VALIDATION_SUCCESS_SENTINEL = "PIPELINE VALIDATION COMPLETE"
 
 PIPELINE_VENV_PYTHON = PROJECT_DIR / "venv" / "bin" / "python"
@@ -56,14 +55,14 @@ PRIMARY_METRIC_FILENAME = "metrics.yaml"
 PRIMARY_IMPORTANCE_FILENAME = "feature_importance.json"
 CUTOFF_SUMMARY_FILE = METRICS_ROOT / "cutoff_backtest_summary.csv"
 
-# Streaming/robustness
-HEARTBEAT_SECONDS = 20  # print a heartbeat if codex produces no output for this many seconds
+LOG_DIR = PROJECT_DIR / "logs" / "codex_meta_loop"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-# Track current subprocess so Ctrl-C can kill it
-_CURRENT_PROC: Optional[subprocess.Popen] = None
+# Optional: kill codex if it produces no stdout for too long (seconds). Set None to disable.
+MAX_STDOUT_INACTIVITY_SECONDS: Optional[int] = None
 
+# ----------------------------------------
 
-# ---------------- UTILITIES ----------------
 
 def _ensure_codex_cli_available() -> None:
     if which(CODEX_CMD) is None:
@@ -73,198 +72,154 @@ def _ensure_codex_cli_available() -> None:
         )
 
 
-def _kill_process_group(proc: subprocess.Popen) -> None:
-    """Kill the whole process group (Codex may spawn children)."""
-    try:
-        pgid = os.getpgid(proc.pid)
-    except Exception:
-        pgid = None
-
-    try:
-        if pgid is not None:
-            os.killpg(pgid, signal.SIGTERM)
-        else:
-            proc.terminate()
-    except Exception:
-        pass
-
-    # Give it a moment, then hard kill if needed
-    t0 = time.time()
-    while proc.poll() is None and (time.time() - t0) < 2.0:
-        time.sleep(0.05)
-
-    try:
-        if proc.poll() is None:
-            if pgid is not None:
-                os.killpg(pgid, signal.SIGKILL)
-            else:
-                proc.kill()
-    except Exception:
-        pass
+@dataclass
+class CodexRunResult:
+    returncode: int
+    stdout_text: str
+    last_message: str
+    last_message_path: Path
 
 
-def _codex_cmd_for_exec(*, model: str, sandbox: str, approval: str) -> list[str]:
+def _now_tag() -> str:
+    return time.strftime("%Y%m%d_%H%M%S")
+
+
+def _run_codex_exec_streaming(
+    prompt: str,
+    *,
+    model: Optional[str] = None,
+    sandbox: str = "read-only",
+    label: str = "run",
+) -> CodexRunResult:
     """
-    IMPORTANT: The Codex CLI treats these as GLOBAL flags, which must be placed BEFORE the subcommand.
-    This avoids: "unexpected argument '--ask-for-approval' found".
+    Run: codex exec - ... (prompt via stdin)
+    Stream formatted output to console AND write assistant final message to a temp file via -o.
+
+    IMPORTANT: Our control logic reads only the last-message file, not stdout, so “thinking” output
+    and echoed prompts cannot trigger sentinels.
     """
-    # Using short flags:
-    # -a = ask-for-approval
-    # -s = sandbox
-    # -m = model
-    #
-    # `exec -` means: read the prompt from stdin.
-    return [
-        CODEX_CMD,
-        "-a", approval,
-        "-s", sandbox,
-        "-m", model,
-        "exec",
-        "-",
-    ]
+    _ensure_codex_cli_available()
 
-
-def _run_codex_streaming(cmd: list[str], prompt: str) -> Tuple[int, str]:
-    """
-    Run codex with:
-      - stdin as a pipe (so we can send prompt then close -> EOF)
-      - stdout/stderr connected to a PTY (so Codex thinks it's a terminal and streams output)
-
-    Returns (exit_code, full_output_text).
-    """
-    global _CURRENT_PROC
-
+    # Print prompt to console exactly as sent (as you requested)
     print("\n================ PROMPT SENT TO CODEX ================\n")
     print(prompt)
     print("\n======================================================\n")
-    sys.stdout.flush()
+    print("\n================ CODEX OUTPUT (streaming) ================\n")
 
-    master_fd, slave_fd = pty.openpty()
+    tag = _now_tag()
+    log_path = LOG_DIR / f"{tag}_{label}.log"
 
-    # start_new_session=True => proc becomes its own process group (killpg works)
+    with tempfile.NamedTemporaryFile(prefix="codex_last_message_", suffix=".txt", delete=False) as tmp:
+        last_msg_path = Path(tmp.name)
+
+    cmd = [
+        CODEX_CMD, "exec", "-",                # "-" => read prompt from stdin
+        "--cd", str(PROJECT_DIR),
+        "--sandbox", sandbox,
+        "--color", "never",
+        "--output-last-message", str(last_msg_path),
+    ]
+    if model:
+        cmd += ["--model", model]
+
+    # Start child in its own process group so we can SIGINT/SIGTERM the whole group.
     proc = subprocess.Popen(
         cmd,
         cwd=str(PROJECT_DIR),
         stdin=subprocess.PIPE,
-        stdout=slave_fd,
-        stderr=slave_fd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
-        start_new_session=True,
-        env={**os.environ, "TERM": os.environ.get("TERM", "xterm-256color")},
+        bufsize=1,
+        preexec_fn=os.setsid if hasattr(os, "setsid") else None,
     )
-    _CURRENT_PROC = proc
 
-    # Parent doesn't need the slave
-    os.close(slave_fd)
+    # Send prompt then close stdin.
+    assert proc.stdin is not None
+    proc.stdin.write(prompt if prompt.endswith("\n") else prompt + "\n")
+    proc.stdin.flush()
+    proc.stdin.close()
 
-    # Feed prompt and close stdin so `codex exec -` gets EOF and proceeds
-    try:
-        if proc.stdin is not None:
-            proc.stdin.write(prompt if prompt.endswith("\n") else prompt + "\n")
-            proc.stdin.flush()
-            proc.stdin.close()
-    except Exception:
-        pass
-
-    print("\n================ CODEX OUTPUT (streaming) ================\n")
-    sys.stdout.flush()
-
-    chunks: list[str] = []
+    stdout_chunks: list[str] = []
     last_output_time = time.time()
 
     try:
-        while True:
-            # If proc exited and there's nothing left to read, break
-            if proc.poll() is not None:
-                # drain any remaining output quickly
-                drained_any = False
-                while True:
-                    r, _, _ = select.select([master_fd], [], [], 0.0)
-                    if not r:
-                        break
-                    data = os.read(master_fd, 4096)
-                    if not data:
-                        break
-                    drained_any = True
-                    s = data.decode(errors="replace")
-                    chunks.append(s)
-                    sys.stdout.write(s)
-                    sys.stdout.flush()
-                if not drained_any:
-                    break
-
-            r, _, _ = select.select([master_fd], [], [], 0.2)
-            if r:
-                data = os.read(master_fd, 4096)
-                if not data:
-                    break
-                s = data.decode(errors="replace")
-                chunks.append(s)
-                sys.stdout.write(s)
-                sys.stdout.flush()
+        assert proc.stdout is not None
+        with open(log_path, "w", encoding="utf-8", errors="replace") as lf:
+            for line in proc.stdout:
                 last_output_time = time.time()
-            else:
-                # heartbeat
-                now = time.time()
-                if (now - last_output_time) >= HEARTBEAT_SECONDS:
-                    elapsed = int(now - last_output_time)
-                    sys.stdout.write(f"\n[codex_meta_loop] (heartbeat) no output from codex for {elapsed}s...\n")
-                    sys.stdout.flush()
-                    last_output_time = now
+                stdout_chunks.append(line)
+                # Mirror to console
+                print(line, end="")
+                # Mirror to log
+                lf.write(line)
+
+                if MAX_STDOUT_INACTIVITY_SECONDS is not None:
+                    # since we're in a blocking iterator over lines, this only applies
+                    # when lines actually arrive; keep as simple optional guard elsewhere
+                    pass
+
+        returncode = proc.wait()
 
     except KeyboardInterrupt:
-        # guaranteed kill of codex + children
-        sys.stdout.write("\n[codex_meta_loop] KeyboardInterrupt: terminating codex...\n")
-        sys.stdout.flush()
-        _kill_process_group(proc)
-        raise
+        print("\n[meta] KeyboardInterrupt — attempting to stop Codex cleanly…")
+        _terminate_process_group(proc)
+        returncode = proc.wait()
     finally:
+        print("\n================ END CODEX OUTPUT ================\n")
+
+    stdout_text = "".join(stdout_chunks)
+
+    # Read assistant final message (this is what we parse)
+    last_message = ""
+    try:
+        last_message = last_msg_path.read_text(encoding="utf-8", errors="replace").strip()
+    except FileNotFoundError:
+        last_message = ""
+
+    # If last-message file is empty for any reason, fall back to stdout tail (best effort).
+    if not last_message:
+        last_message = stdout_text.strip()[-5000:]
+
+    return CodexRunResult(
+        returncode=returncode,
+        stdout_text=stdout_text,
+        last_message=last_message,
+        last_message_path=last_msg_path,
+    )
+
+
+def _terminate_process_group(proc: subprocess.Popen) -> None:
+    """
+    Try SIGINT, then SIGTERM, then SIGKILL (process group if possible).
+    """
+    try:
+        if proc.poll() is not None:
+            return
+
+        if hasattr(os, "killpg") and hasattr(proc, "pid"):
+            pgid = os.getpgid(proc.pid)
+            os.killpg(pgid, signal.SIGINT)
+            time.sleep(1.0)
+            if proc.poll() is None:
+                os.killpg(pgid, signal.SIGTERM)
+                time.sleep(1.0)
+            if proc.poll() is None:
+                os.killpg(pgid, signal.SIGKILL)
+        else:
+            proc.send_signal(signal.SIGINT)
+            time.sleep(1.0)
+            if proc.poll() is None:
+                proc.terminate()
+                time.sleep(1.0)
+            if proc.poll() is None:
+                proc.kill()
+    except Exception:
+        # best-effort termination
         try:
-            os.close(master_fd)
+            proc.kill()
         except Exception:
             pass
-        _CURRENT_PROC = None
-
-    rc = proc.wait()
-    out = "".join(chunks)
-
-    print("\n================ END CODEX OUTPUT ================\n")
-    sys.stdout.flush()
-    return rc, out
-
-
-# ---------------- CODEX WRAPPERS ----------------
-
-def run_codex_chat(prompt: str) -> str:
-    """
-    We do NOT use `codex chat` because it requires a TTY ("stdout is not a terminal").
-    Instead we use `codex exec -` with read-only sandbox for analysis/plan.
-    """
-    _ensure_codex_cli_available()
-    print("\n[run_codex_chat] Starting (exec - read-only) call...\n")
-    cmd = _codex_cmd_for_exec(model=CHAT_MODEL, sandbox="read-only", approval="never")
-    exit_code, out = _run_codex_streaming(cmd, prompt)
-    print("[run_codex_chat] Finished. Exit code:", exit_code)
-    if exit_code != 0:
-        raise RuntimeError(f"'codex exec' exited with {exit_code}:\n{out}")
-    return out
-
-
-def run_codex_exec(prompt: str, *, sandbox: str = "workspace-write") -> str:
-    """
-    `codex exec -` agent mode.
-    sandbox:
-      - workspace-write for implementation/validation (so it can edit & run).
-      - read-only if you want strict safety (but then tests/pipeline that write artifacts may fail).
-    """
-    _ensure_codex_cli_available()
-    print(f"\n[run_codex_exec] Starting exec call... (sandbox={sandbox})\n")
-    cmd = _codex_cmd_for_exec(model=CHAT_MODEL, sandbox=sandbox, approval="never")
-    exit_code, out = _run_codex_streaming(cmd, prompt)
-    print("[run_codex_exec] Finished. Exit code:", exit_code)
-    if exit_code != 0:
-        raise RuntimeError(f"'codex exec' exited with {exit_code}:\n{out}")
-    return out
 
 
 # ---------------- METRICS UTILS ----------------
@@ -280,7 +235,7 @@ def _latest_metric_run_dir(target: str = PRIMARY_TARGET, family: str = PRIMARY_F
 def build_model_validation_instructions() -> str:
     latest_dir = _latest_metric_run_dir()
 
-    if latest_dir:
+    if latest_dir is not None:
         baseline_metrics_path = latest_dir / PRIMARY_METRIC_FILENAME
         baseline_importance_path = latest_dir / PRIMARY_IMPORTANCE_FILENAME
     else:
@@ -354,7 +309,7 @@ def build_prompt_validation(plan: str, failure_notes: Optional[str] = None) -> s
     return prompt + "\n"
 
 
-# ---------- PHASE PROMPTS (UNCHANGED TEXT) ----------
+# ---------- PHASE PROMPTS (UNCHANGED) ----------
 
 def build_prompt_1() -> str:
     return textwrap.dedent("""
@@ -558,14 +513,43 @@ def build_prompt_4(plan: str) -> str:
 
 # ---------- PHASE RUNNERS ----------
 
+def run_codex_chat_readonly(prompt: str, label: str) -> str:
+    # Use exec with read-only sandbox; model override for “chat-like” steps.
+    res = _run_codex_exec_streaming(
+        prompt,
+        model=CHAT_MODEL,
+        sandbox="read-only",
+        label=label,
+    )
+    if res.returncode != 0:
+        raise RuntimeError(f"'codex exec' exited with {res.returncode}. Last message:\n{res.last_message}")
+    print("\n================ ASSISTANT FINAL MESSAGE ================\n")
+    print(res.last_message)
+    print("\n=========================================================\n")
+    return res.last_message
+
+
+def run_codex_exec_write(prompt: str, label: str, sandbox: str = "workspace-write") -> str:
+    res = _run_codex_exec_streaming(
+        prompt,
+        model=None,
+        sandbox=sandbox,
+        label=label,
+    )
+    if res.returncode != 0:
+        raise RuntimeError(f"'codex exec' exited with {res.returncode}. Last message:\n{res.last_message}")
+    print("\n================ ASSISTANT FINAL MESSAGE ================\n")
+    print(res.last_message)
+    print("\n=========================================================\n")
+    return res.last_message
+
+
 def phase_1_analysis() -> str:
-    prompt = build_prompt_1()
-    return run_codex_chat(prompt)
+    return run_codex_chat_readonly(build_prompt_1(), label="phase1_analysis")
 
 
 def phase_2_plan(analysis: str) -> str:
-    prompt = build_prompt_2(analysis)
-    return run_codex_chat(prompt)
+    return run_codex_chat_readonly(build_prompt_2(analysis), label="phase2_plan")
 
 
 def phase_3_implement(plan: str, max_iterations: int = MAX_IMPLEMENTATION_ITERATIONS) -> Tuple[bool, str]:
@@ -573,21 +557,17 @@ def phase_3_implement(plan: str, max_iterations: int = MAX_IMPLEMENTATION_ITERAT
 
     for iteration in range(1, max_iterations + 1):
         print(f"[phase_3_implement] Iteration {iteration}/{max_iterations}")
-
         prompt = build_prompt_3(plan, progress_notes=progress_notes)
-        output = run_codex_exec(prompt, sandbox="workspace-write")
+        last_msg = run_codex_exec_write(prompt, label=f"phase3_impl_iter{iteration}", sandbox="workspace-write")
 
-        if "The plan is completely implemented" in output:
+        # IMPORTANT: only examine the final assistant message (last_msg), not the noisy stdout.
+        if last_msg.strip().endswith("The plan is completely implemented") or last_msg.strip() == "The plan is completely implemented":
             print("[phase_3_implement] Implementation complete.")
-            return True, output
+            return True, last_msg
 
-        idx = output.rfind("PROGRESS:")
-        if idx != -1:
-            progress_notes = output[idx:].strip()
-            print("[phase_3_implement] Updated progress notes.")
-        else:
-            progress_notes = output[-2000:]
-            print("[phase_3_implement] No PROGRESS marker found; using output tail.")
+        idx = last_msg.rfind("PROGRESS:")
+        progress_notes = last_msg[idx:].strip() if idx != -1 else last_msg[-2000:]
+        print("[phase_3_implement] Updated progress notes.")
 
     print("[phase_3_implement] Reached max iterations without completion.")
     return False, progress_notes or ""
@@ -598,21 +578,16 @@ def phase_pipeline_validation(plan: str, max_iterations: int = MAX_VALIDATION_IT
 
     for iteration in range(1, max_iterations + 1):
         print(f"[phase_pipeline_validation] Attempt {iteration}/{max_iterations}")
-
         prompt = build_prompt_validation(plan, failure_notes=failure_notes)
-        output = run_codex_exec(prompt, sandbox="workspace-write")
+        last_msg = run_codex_exec_write(prompt, label=f"phase_validation_iter{iteration}", sandbox="workspace-write")
 
-        if VALIDATION_SUCCESS_SENTINEL in output:
+        if last_msg.strip().endswith(VALIDATION_SUCCESS_SENTINEL) or VALIDATION_SUCCESS_SENTINEL in last_msg:
             print("[phase_pipeline_validation] Pipeline run completed successfully.")
-            return True, output
+            return True, last_msg
 
-        idx = output.rfind("PROGRESS:")
-        if idx != -1:
-            failure_notes = output[idx:].strip()
-            print("[phase_pipeline_validation] Captured failure notes for next attempt.")
-        else:
-            failure_notes = output[-2000:]
-            print("[phase_pipeline_validation] No PROGRESS marker found; storing output tail.")
+        idx = last_msg.rfind("PROGRESS:")
+        failure_notes = last_msg[idx:].strip() if idx != -1 else last_msg[-2000:]
+        print("[phase_pipeline_validation] Captured failure notes for next attempt.")
 
     print("[phase_pipeline_validation] Validation loop exhausted attempts without success.")
     return False, failure_notes or ""
@@ -620,19 +595,14 @@ def phase_pipeline_validation(plan: str, max_iterations: int = MAX_VALIDATION_IT
 
 def phase_4_audit(plan: str) -> Tuple[bool, str]:
     print("[phase_4_audit] Running a single audit pass…")
+    last_msg = run_codex_chat_readonly(build_prompt_4(plan), label="phase4_audit")
 
-    prompt = build_prompt_4(plan)
-
-    # NOTE: audit may run tests/scripts that write metrics/artifacts. Using workspace-write is pragmatic.
-    # The prompt forbids code edits; sandbox here is about shell-command policy, not "editing discipline".
-    output = run_codex_exec(prompt, sandbox="workspace-write").strip()
-
-    if output == "The plan is completely implemented":
+    if last_msg.strip() == "The plan is completely implemented":
         print("[phase_4_audit] Verified full implementation.")
         return True, ""
 
     print("[phase_4_audit] Gaps found (audit does not loop).")
-    return False, output
+    return False, last_msg
 
 
 # ---------- TOP-LEVEL LOOP ----------
@@ -644,7 +614,7 @@ def run_one_full_cycle():
     plan = phase_2_plan(analysis)
 
     while True:
-        implemented, _progress_or_output = phase_3_implement(plan, max_iterations=MAX_IMPLEMENTATION_ITERATIONS)
+        implemented, progress_or_output = phase_3_implement(plan, max_iterations=MAX_IMPLEMENTATION_ITERATIONS)
         if not implemented:
             print("[run_one_full_cycle] Implementation loop hit iteration limit without full completion.")
 
@@ -667,24 +637,12 @@ def run_one_full_cycle():
 
 
 def main():
-    _ensure_codex_cli_available()
-
     print(f"[codex_meta_loop] Project directory: {PROJECT_DIR}")
     print(f"[codex_meta_loop] Using codex CLI command: {CODEX_CMD}")
     print(f"[codex_meta_loop] Chat model: {CHAT_MODEL}")
     print(f"[codex_meta_loop] Max implementation iterations per plan: {MAX_IMPLEMENTATION_ITERATIONS}")
+    print(f"[codex_meta_loop] Logs dir: {LOG_DIR}")
     print()
-
-    # Ensure Ctrl-C kills codex too
-    def _sigint_handler(sig, frame):
-        global _CURRENT_PROC
-        if _CURRENT_PROC is not None and _CURRENT_PROC.poll() is None:
-            sys.stdout.write("\n[codex_meta_loop] SIGINT received: terminating codex...\n")
-            sys.stdout.flush()
-            _kill_process_group(_CURRENT_PROC)
-        raise KeyboardInterrupt
-
-    signal.signal(signal.SIGINT, _sigint_handler)
 
     while True:
         try:

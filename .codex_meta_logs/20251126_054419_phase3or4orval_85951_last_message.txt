@@ -1,0 +1,1 @@
+PROGRESS: Still blocked at the pre-work checkpoint. `git add .` fails with “Unable to create .git/index.lock: Operation not permitted,” and even `touch .git/testwrite` is denied. Because the instructions require a clean commit before edits, I couldn’t proceed. Please adjust permissions so I can write inside `.git` (create index.lock, etc.), then I can continue with the plan.

@@ -7,6 +7,8 @@ This module validates that required targets exist and have correct dtypes.
 import polars as pl
 import logging
 
+from utils.feature.labels import DEFAULT_LABEL_VERSION, get_label_spec
+
 logger = logging.getLogger(__name__)
 
 
@@ -14,9 +16,16 @@ logger = logging.getLogger(__name__)
 NFL_TARGET_SCHEMA = {
     # Binary classification targets
     "anytime_td": pl.Int8,  # Primary MVP target: did player score a TD?
+    "anytime_td_offense": pl.Int8,
+    "anytime_td_all": pl.Int8,
+    "anytime_td_rush": pl.Int8,
+    "anytime_td_rec": pl.Int8,
+    "anytime_td_pass_thrown": pl.Int8,
     
     # Count/regression targets
     "td_count": pl.Int64,  # Number of TDs scored (receiving + rushing)
+    "td_count_offense": pl.Int64,
+    "td_count_all": pl.Int64,
     "passing_td": pl.Int64,  # Number of passing TDs (QB only)
     
     # Yardage regression targets
@@ -104,3 +113,39 @@ def add_target_columns(df: pl.DataFrame) -> pl.DataFrame:
         DataFrame with validated target columns
     """
     return validate_target_columns(df, strict=False)
+
+
+def require_target_column(
+    df: pl.DataFrame,
+    target_col: str,
+    *,
+    label_version: str | None = None,
+    min_non_null: int = 1,
+) -> pl.DataFrame:
+    """Ensure the configured target column exists and is populated.
+
+    Raises a ValueError if the column is missing or entirely null.
+    """
+
+    if target_col not in df.columns:
+        alias_hint = ""
+        if label_version:
+            try:
+                spec = get_label_spec(label_version or DEFAULT_LABEL_VERSION)
+                if target_col in spec.aliases:
+                    alias_hint = f" Target maps to '{spec.aliases[target_col]}' under {spec.name}."
+            except Exception:
+                alias_hint = ""
+        raise ValueError(f"Target column '{target_col}' not found in feature frame.{alias_hint}")
+
+    series = df[target_col]
+    non_null = series.drop_nulls().height
+    if non_null < min_non_null:
+        raise ValueError(
+            f"Target column '{target_col}' has insufficient non-null rows "
+            f"({non_null}/{len(series)})."
+        )
+    nulls = len(series) - non_null
+    if nulls > 0:
+        logger.warning("Target %s contains %d null rows; they will be dropped.", target_col, nulls)
+    return df

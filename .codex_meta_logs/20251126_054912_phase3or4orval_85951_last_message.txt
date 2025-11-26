@@ -1,0 +1,14 @@
+**Changes**
+- Added an offline guard (`VC_SKIP_API=1`) to skip Visual Crossing API calls in both `utils/collect/visual_crossing_weather.py` and `utils/collect/weather_forecasts.py` so runs don’t hang in restricted-network environments.
+- Fixed the `NameError` in `pipeline/train.py` by passing the correct `problem_config` into `save_inference_artifacts`.
+
+**Run & Metrics**
+- PROGRESS: Pipeline run succeeded with `VC_SKIP_API=1`; newest artifacts at `output/metrics/anytime_td/xgboost/20251126_072200_c4fc638_cutoff_h090m`.
+- Anytime TD metrics vs baseline (`20251126_001001_ab12e68_cutoff_h090m` → new): AUC 0.8333 → 0.8432, PR AUC 0.2684 → 0.2774, Brier 0.0872 → 0.0849 (all improved); precision_at_thresh dipped 0.2512 → 0.2462.
+- Feature importance shifted: still led by `pred_efficiency_tds`, but prior leaders (`expected_td_prob_*`, `expected_td_signal_raw`) dropped from the top; drive-history and usage signals now carry more weight. Worth a quick sanity check if that rebalancing was expected.
+- `cutoff_backtest_summary.csv` (4 rows) shows h090m calibration raw ECE ~0.0416 with similar or better ECE for longer horizons (≈0.038–0.041), suggesting acceptable calibration across horizons.
+
+**Notes / Next**
+1) If you need fresh weather forecasts, unset `VC_SKIP_API`; otherwise keep it for offline runs. 2) Consider reviewing the new threshold choice since precision_at_thresh slipped slightly despite overall lift.
+
+PIPELINE VALIDATION COMPLETE

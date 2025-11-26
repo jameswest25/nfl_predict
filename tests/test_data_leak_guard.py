@@ -3,6 +3,14 @@ from __future__ import annotations
 import yaml
 from pathlib import Path
 
+import polars as pl
+
+from utils.feature.leak_guard import (
+    DEFAULT_LEAK_POLICY,
+    enforce_leak_guard,
+    evaluate_leak_prone_columns,
+)
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 TRAINING_CONFIG = PROJECT_ROOT / "config" / "training.yaml"
@@ -47,4 +55,42 @@ def test_anytime_td_prefixes_do_not_cover_banned_columns():
         f"{disallowed}"
     )
 
+
+def test_leak_guard_flags_pattern_columns():
+    cols = [
+        "market_anytime_td_prob",
+        "final_score",
+        "postgame_anytime_td",
+        "actual_td_count",
+        "safe_feature",
+    ]
+    result = evaluate_leak_prone_columns(cols, policy=DEFAULT_LEAK_POLICY)
+    assert set(result.banned.keys()) == {"final_score", "postgame_anytime_td", "actual_td_count"}
+    assert "safe_feature" in result.kept
+    assert "market_anytime_td_prob" in result.kept
+
+
+def test_enforce_leak_guard_drops_banned_and_keeps_allowlisted():
+    df = pl.DataFrame(
+        {
+            "game_id": ["g1", "g2"],
+            "safe_feature": [1.0, 2.0],
+            "postgame_anytime_td": [1, 0],
+            "final_score": [30, 24],
+        }
+    )
+    cleaned, info = enforce_leak_guard(
+        df,
+        policy=DEFAULT_LEAK_POLICY,
+        allow_prefixes=("safe_",),
+        allow_exact=("game_id",),
+        drop_banned=True,
+        drop_non_allowlisted=False,
+        raise_on_banned=False,
+    )
+    assert "postgame_anytime_td" not in cleaned.columns
+    assert "final_score" not in cleaned.columns
+    assert "safe_feature" in cleaned.columns
+    assert "game_id" in cleaned.columns
+    assert set(info.dropped) == {"postgame_anytime_td", "final_score"}
 

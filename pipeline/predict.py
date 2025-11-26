@@ -55,7 +55,7 @@ from utils.general.paths import (
 )
 from utils.collect.weather_forecasts import collect_weather_forecasts
 from utils.feature.odds import collect_odds_snapshots
-from utils.feature.stats import NFL_PLAYER_STATS, ROLLING_WINDOWS, ROLLING_CONTEXTS
+from utils.feature.stats import ROLLING_FEATURE_STATS, ROLLING_WINDOWS, ROLLING_CONTEXTS
 from utils.feature.odds import (
     add_nfl_odds_features_to_df,
     NFL_ODDS_COLUMNS,
@@ -197,6 +197,8 @@ PS_BASELINE_COLUMNS = [
     "ps_total_touches",
     "ps_scripted_touches",
     "ps_scripted_touch_share",
+    "ps_tracking_team_dropbacks",
+    "ps_tracking_has_game_data",
     "ps_route_participation_pct_prev",
     "ps_route_participation_pct_l3",
     "ps_scripted_touch_share_prev",
@@ -215,6 +217,39 @@ PS_BASELINE_COLUMNS = [
     "ps_targets_wide_count_l3",
     "ps_targets_inline_count_l3",
     "ps_targets_backfield_count_l3",
+    # Historical namespace (preferred)
+    "ps_hist_route_participation_pct_prev",
+    "ps_hist_route_participation_pct_l3",
+    "ps_hist_route_participation_plays_prev",
+    "ps_hist_route_participation_plays_l3",
+    "ps_hist_targets_total_prev",
+    "ps_hist_targets_total_l3",
+    "ps_hist_targets_slot_count_prev",
+    "ps_hist_targets_slot_count_l3",
+    "ps_hist_targets_wide_count_prev",
+    "ps_hist_targets_wide_count_l3",
+    "ps_hist_targets_inline_count_prev",
+    "ps_hist_targets_inline_count_l3",
+    "ps_hist_targets_backfield_count_prev",
+    "ps_hist_targets_backfield_count_l3",
+    "ps_hist_targets_slot_share_prev",
+    "ps_hist_targets_slot_share_l3",
+    "ps_hist_targets_wide_share_prev",
+    "ps_hist_targets_wide_share_l3",
+    "ps_hist_targets_inline_share_prev",
+    "ps_hist_targets_inline_share_l3",
+    "ps_hist_targets_backfield_share_prev",
+    "ps_hist_targets_backfield_share_l3",
+    "ps_hist_total_touches_prev",
+    "ps_hist_total_touches_l3",
+    "ps_hist_scripted_touches_prev",
+    "ps_hist_scripted_touches_l3",
+    "ps_hist_scripted_touch_share_prev",
+    "ps_hist_scripted_touch_share_l3",
+    "ps_hist_tracking_team_dropbacks_prev",
+    "ps_hist_tracking_team_dropbacks_l3",
+    "ps_hist_tracking_has_game_data_prev",
+    "ps_hist_tracking_has_game_data_l3",
 ]
 
 PS_L3_FALLBACK_MAP = {
@@ -224,6 +259,22 @@ PS_L3_FALLBACK_MAP = {
     "ps_targets_wide_count_l3": "ps_targets_wide_count",
     "ps_targets_inline_count_l3": "ps_targets_inline_count",
     "ps_targets_backfield_count_l3": "ps_targets_backfield_count",
+    "ps_hist_route_participation_plays_l3": "ps_hist_route_participation_plays_prev",
+    "ps_hist_targets_total_l3": "ps_hist_targets_total_prev",
+    "ps_hist_targets_slot_count_l3": "ps_hist_targets_slot_count_prev",
+    "ps_hist_targets_wide_count_l3": "ps_hist_targets_wide_count_prev",
+    "ps_hist_targets_inline_count_l3": "ps_hist_targets_inline_count_prev",
+    "ps_hist_targets_backfield_count_l3": "ps_hist_targets_backfield_count_prev",
+    "ps_hist_total_touches_l3": "ps_hist_total_touches_prev",
+    "ps_hist_scripted_touches_l3": "ps_hist_scripted_touches_prev",
+    "ps_hist_route_participation_pct_l3": "ps_hist_route_participation_pct_prev",
+    "ps_hist_scripted_touch_share_l3": "ps_hist_scripted_touch_share_prev",
+    "ps_hist_targets_slot_share_l3": "ps_hist_targets_slot_share_prev",
+    "ps_hist_targets_wide_share_l3": "ps_hist_targets_wide_share_prev",
+    "ps_hist_targets_inline_share_l3": "ps_hist_targets_inline_share_prev",
+    "ps_hist_targets_backfield_share_l3": "ps_hist_targets_backfield_share_prev",
+    "ps_hist_tracking_team_dropbacks_l3": "ps_hist_tracking_team_dropbacks_prev",
+    "ps_hist_tracking_has_game_data_l3": "ps_hist_tracking_has_game_data_prev",
 }
 
 OUTPUT_COLUMN_PREFIXES = (
@@ -593,59 +644,123 @@ def _load_opponent_split_features(seasons: Iterable[int]) -> pl.DataFrame:
 
 
 def _apply_ps_fallback(enriched: pl.DataFrame, *, season_hint: int | None) -> pl.DataFrame:
-    if season_hint is None or enriched.is_empty():
+    if enriched.is_empty():
         return enriched
-    missing_guard = "ps_team_dropbacks" in enriched.columns
-    baseline = _load_ps_baselines(season_hint)
-    if baseline.is_empty():
-        return enriched
-    available_cols = [col for col in PS_BASELINE_COLUMNS if col in enriched.columns and col in baseline.columns]
-    if not available_cols:
-        return enriched
-    rename_map = {col: f"__ps_base_{col}" for col in available_cols if col in baseline.columns}
-    baseline = baseline.rename(rename_map)
-    enriched = enriched.join(baseline, on="player_id", how="left")
+
+    def _safe_any(exprs: list[pl.Expr], *, alias: str, default: bool = False) -> pl.Expr:
+        expr = pl.any_horizontal(exprs) if exprs else pl.lit(default)
+        return expr.alias(alias)
+
+    existing_cols = set(enriched.columns)
+    has_actual_signals: list[pl.Expr] = []
+    recent_hist_signals: list[pl.Expr] = []
+    for col in (
+        "ps_team_dropbacks",
+        "ps_route_participation_plays",
+        "ps_hist_route_participation_pct_prev",
+        "ps_hist_total_touches_prev",
+        "ps_hist_scripted_touches_prev",
+        "ps_tracking_has_game_data",
+        "ps_hist_tracking_has_game_data_prev",
+    ):
+        if col in existing_cols:
+            has_actual_signals.append(pl.col(col).fill_null(0) > 0)
+    for col in (
+        "ps_hist_route_participation_pct_prev",
+        "ps_hist_route_participation_pct_l3",
+        "ps_hist_scripted_touch_share_prev",
+        "ps_hist_scripted_touch_share_l3",
+        "ps_hist_tracking_has_game_data_prev",
+        "ps_hist_tracking_has_game_data_l3",
+    ):
+        if col in existing_cols:
+            recent_hist_signals.append(pl.col(col).is_not_null())
+
+    enriched = enriched.with_columns(
+        [
+            _safe_any(has_actual_signals, alias="__ps_has_actual"),
+            _safe_any(recent_hist_signals, alias="__ps_has_recent_hist"),
+        ]
+    )
+
+    missing_guard = "ps_team_dropbacks" in existing_cols
+    baseline_used_signals: list[pl.Expr] = []
     helper_flag = "__ps_missing_flag"
-    if missing_guard:
-        enriched = enriched.with_columns(
-            pl.col("ps_team_dropbacks").fill_null(0).le(0).alias(helper_flag)
-        )
-    else:
-        enriched = enriched.with_columns(pl.lit(True).alias(helper_flag))
+    enriched = enriched.with_columns(
+        pl.col("ps_team_dropbacks").fill_null(0).le(0).alias(helper_flag)
+        if missing_guard
+        else pl.lit(True).alias(helper_flag)
+    )
     missing_flag = pl.col(helper_flag)
 
-    fill_exprs: list[pl.Expr] = []
-    drop_cols: list[str] = []
-    for col in available_cols:
-        base_col = f"__ps_base_{col}"
-        if base_col in enriched.columns:
-            fill_exprs.append(
-                pl.when(missing_flag & pl.col(base_col).is_not_null())
-                .then(pl.col(base_col))
-                .otherwise(pl.col(col))
-                .alias(col)
-            )
-            drop_cols.append(base_col)
-    if fill_exprs:
-        enriched = enriched.with_columns(fill_exprs)
-    if drop_cols:
-        enriched = enriched.drop(drop_cols)
-    l3_exprs: list[pl.Expr] = []
-    for l3_col, src_col in PS_L3_FALLBACK_MAP.items():
-        if l3_col in enriched.columns and src_col in enriched.columns:
-            l3_exprs.append(
-                pl.when(
-                    pl.col(src_col).is_not_null()
-                    & (pl.col(src_col).fill_null(0) > 0)
-                    & (pl.col(l3_col).fill_null(0) == 0)
-                )
-                .then(pl.col(src_col))
-                .otherwise(pl.col(l3_col))
-                .alias(l3_col)
-            )
-    if l3_exprs:
-        enriched = enriched.with_columns(l3_exprs)
-    enriched = enriched.drop(helper_flag)
+    if season_hint is not None:
+        baseline = _load_ps_baselines(season_hint)
+    else:
+        baseline = pl.DataFrame()
+
+    if not baseline.is_empty():
+        available_cols = [
+            col
+            for col in PS_BASELINE_COLUMNS
+            if col in enriched.columns and col in baseline.columns
+        ]
+        if available_cols:
+            rename_map = {col: f"__ps_base_{col}" for col in available_cols if col in baseline.columns}
+            baseline = baseline.rename(rename_map)
+            enriched = enriched.join(baseline, on="player_id", how="left")
+
+            fill_exprs: list[pl.Expr] = []
+            drop_cols: list[str] = []
+            for col in available_cols:
+                base_col = f"__ps_base_{col}"
+                if base_col in enriched.columns:
+                    baseline_used_signals.append(missing_flag & pl.col(base_col).is_not_null())
+                    fill_exprs.append(
+                        pl.when(missing_flag & pl.col(base_col).is_not_null())
+                        .then(pl.col(base_col))
+                        .otherwise(pl.col(col))
+                        .alias(col)
+                    )
+                    drop_cols.append(base_col)
+            if fill_exprs:
+                enriched = enriched.with_columns(fill_exprs)
+            if drop_cols:
+                enriched = enriched.drop(drop_cols)
+
+            l3_exprs: list[pl.Expr] = []
+            for l3_col, src_col in PS_L3_FALLBACK_MAP.items():
+                if l3_col in enriched.columns and src_col in enriched.columns:
+                    l3_exprs.append(
+                        pl.when(
+                            pl.col(src_col).is_not_null()
+                            & (pl.col(src_col).fill_null(0) > 0)
+                            & (pl.col(l3_col).fill_null(0) == 0)
+                        )
+                        .then(pl.col(src_col))
+                        .otherwise(pl.col(l3_col))
+                        .alias(l3_col)
+                    )
+            if l3_exprs:
+                enriched = enriched.with_columns(l3_exprs)
+
+    enriched = enriched.with_columns(
+        _safe_any(baseline_used_signals, alias="__ps_used_baseline", default=False)
+    )
+
+    enriched = enriched.with_columns(
+        [
+            pl.col("__ps_has_actual").cast(pl.Int8).alias("ps_tracking_has_actual"),
+            pl.col("__ps_has_recent_hist").cast(pl.Int8).alias("ps_tracking_has_recent_hist"),
+            pl.col("__ps_used_baseline").cast(pl.Int8).alias("ps_tracking_used_baseline"),
+            pl.when(pl.col("__ps_has_actual"))
+            .then(pl.lit("actual"))
+            .when(pl.col("__ps_used_baseline"))
+            .then(pl.lit("baseline"))
+            .otherwise(pl.lit("none"))
+            .alias("ps_baseline_source"),
+        ]
+    )
+    enriched = enriched.drop([helper_flag, "__ps_has_actual", "__ps_has_recent_hist", "__ps_used_baseline"])
     return enriched
 
 
@@ -1281,16 +1396,24 @@ def _compute_features(scaffold: pd.DataFrame) -> pd.DataFrame:
         )
         pl_df = pl_df.join(asof_meta, on="game_id", how="left")
 
-    enriched = add_rolling_features(
-        pl_df,
-        level="game",
-        stats=NFL_PLAYER_STATS,
-        windows=ROLLING_WINDOWS,
-        contexts=ROLLING_CONTEXTS,
-        date_col="game_date",
-        player_col="player_id",
-        opponent_col="opponent",
-    )
+    rolling_stats = [s for s in ROLLING_FEATURE_STATS if s in pl_df.columns]
+    missing_stats = sorted(set(ROLLING_FEATURE_STATS) - set(rolling_stats))
+    if missing_stats:
+        logger.warning("Prediction rolling features skipping missing stats: %s", ", ".join(missing_stats))
+
+    if rolling_stats:
+        enriched = add_rolling_features(
+            pl_df,
+            level="game",
+            stats=rolling_stats,
+            windows=ROLLING_WINDOWS,
+            contexts=ROLLING_CONTEXTS,
+            date_col="game_date",
+            player_col="player_id",
+            opponent_col="opponent",
+        )
+    else:
+        enriched = pl_df
 
     # Rename rolling features to match model expectations (snap counts)
     # The model was trained on features named like 'snap_offense_pct_prev'
@@ -1306,29 +1429,35 @@ def _compute_features(scaffold: pd.DataFrame) -> pd.DataFrame:
         "3g_st_pct_per_game": "snap_st_pct_l3",
         "1g_st_snaps_per_game": "snap_st_snaps_prev",
 
-        # Pre-snap participation/target splits
-        "1g_ps_route_participation_pct_per_game": "ps_route_participation_pct",
-        "3g_ps_route_participation_pct_per_game": "ps_route_participation_pct_l3",
-        "1g_ps_route_participation_plays_per_game": "ps_route_participation_plays",
-        "3g_ps_route_participation_plays_per_game": "ps_route_participation_plays_l3",
-        "1g_ps_targets_total_per_game": "ps_targets_total",
-        "3g_ps_targets_total_per_game": "ps_targets_total_l3",
-        "1g_ps_targets_slot_count_per_game": "ps_targets_slot_count",
-        "3g_ps_targets_slot_count_per_game": "ps_targets_slot_count_l3",
-        "1g_ps_targets_wide_count_per_game": "ps_targets_wide_count",
-        "3g_ps_targets_wide_count_per_game": "ps_targets_wide_count_l3",
-        "1g_ps_targets_inline_count_per_game": "ps_targets_inline_count",
-        "3g_ps_targets_inline_count_per_game": "ps_targets_inline_count_l3",
-        "1g_ps_targets_backfield_count_per_game": "ps_targets_backfield_count",
-        "3g_ps_targets_backfield_count_per_game": "ps_targets_backfield_count_l3",
-        "1g_ps_targets_slot_share_per_game": "ps_targets_slot_share",
-        "3g_ps_targets_slot_share_per_game": "ps_targets_slot_share_l3",
-        "1g_ps_targets_wide_share_per_game": "ps_targets_wide_share",
-        "3g_ps_targets_wide_share_per_game": "ps_targets_wide_share_l3",
-        "1g_ps_targets_inline_share_per_game": "ps_targets_inline_share",
-        "3g_ps_targets_inline_share_per_game": "ps_targets_inline_share_l3",
-        "1g_ps_targets_backfield_share_per_game": "ps_targets_backfield_share",
-        "3g_ps_targets_backfield_share_per_game": "ps_targets_backfield_share_l3",
+        # Pre-snap participation/target splits (historical projections)
+        "1g_ps_route_participation_pct_per_game": "ps_hist_route_participation_pct_prev",
+        "3g_ps_route_participation_pct_per_game": "ps_hist_route_participation_pct_l3",
+        "1g_ps_route_participation_plays_per_game": "ps_hist_route_participation_plays_prev",
+        "3g_ps_route_participation_plays_per_game": "ps_hist_route_participation_plays_l3",
+        "1g_ps_targets_total_per_game": "ps_hist_targets_total_prev",
+        "3g_ps_targets_total_per_game": "ps_hist_targets_total_l3",
+        "1g_ps_targets_slot_count_per_game": "ps_hist_targets_slot_count_prev",
+        "3g_ps_targets_slot_count_per_game": "ps_hist_targets_slot_count_l3",
+        "1g_ps_targets_wide_count_per_game": "ps_hist_targets_wide_count_prev",
+        "3g_ps_targets_wide_count_per_game": "ps_hist_targets_wide_count_l3",
+        "1g_ps_targets_inline_count_per_game": "ps_hist_targets_inline_count_prev",
+        "3g_ps_targets_inline_count_per_game": "ps_hist_targets_inline_count_l3",
+        "1g_ps_targets_backfield_count_per_game": "ps_hist_targets_backfield_count_prev",
+        "3g_ps_targets_backfield_count_per_game": "ps_hist_targets_backfield_count_l3",
+        "1g_ps_targets_slot_share_per_game": "ps_hist_targets_slot_share_prev",
+        "3g_ps_targets_slot_share_per_game": "ps_hist_targets_slot_share_l3",
+        "1g_ps_targets_wide_share_per_game": "ps_hist_targets_wide_share_prev",
+        "3g_ps_targets_wide_share_per_game": "ps_hist_targets_wide_share_l3",
+        "1g_ps_targets_inline_share_per_game": "ps_hist_targets_inline_share_prev",
+        "3g_ps_targets_inline_share_per_game": "ps_hist_targets_inline_share_l3",
+        "1g_ps_targets_backfield_share_per_game": "ps_hist_targets_backfield_share_prev",
+        "3g_ps_targets_backfield_share_per_game": "ps_hist_targets_backfield_share_l3",
+        "1g_ps_total_touches_per_game": "ps_hist_total_touches_prev",
+        "3g_ps_total_touches_per_game": "ps_hist_total_touches_l3",
+        "1g_ps_scripted_touches_per_game": "ps_hist_scripted_touches_prev",
+        "3g_ps_scripted_touches_per_game": "ps_hist_scripted_touches_l3",
+        "1g_ps_scripted_touch_share_per_game": "ps_hist_scripted_touch_share_prev",
+        "3g_ps_scripted_touch_share_per_game": "ps_hist_scripted_touch_share_l3",
     }
     existing = set(enriched.columns)
     valid_renames = {k: v for k, v in rename_map.items() if k in existing}
@@ -1360,28 +1489,6 @@ def _compute_features(scaffold: pd.DataFrame) -> pd.DataFrame:
     ]
     if alias_exprs:
         enriched = enriched.with_columns(alias_exprs)
-
-    available_cols = set(enriched.columns)
-    ps_base_cols = [
-        "ps_route_participation_pct",
-        "ps_route_participation_plays",
-        "ps_targets_total",
-        "ps_targets_slot_count",
-        "ps_targets_wide_count",
-        "ps_targets_inline_count",
-        "ps_targets_backfield_count",
-        "ps_targets_slot_share",
-        "ps_targets_wide_share",
-        "ps_targets_inline_share",
-        "ps_targets_backfield_share",
-    ]
-    ps_prev_exprs = [
-        pl.col(col).alias(f"{col}_prev")
-        for col in ps_base_cols
-        if col in enriched.columns and f"{col}_prev" not in enriched.columns
-    ]
-    if ps_prev_exprs:
-        enriched = enriched.with_columns(ps_prev_exprs)
 
     cutoff_hours = float(get_decision_cutoff_hours())
     fallback_hours = float(get_fallback_cutoff_hours())
@@ -2323,27 +2430,36 @@ def _apply_availability_floor(features_df: pd.DataFrame, preds: np.ndarray) -> n
              
     return adj
 
-def _predict_for_problem(features: pd.DataFrame, problem_name: str, artifacts: dict, threshold: float = 0.5) -> np.ndarray:
+def _predict_for_problem(features: pd.DataFrame, problem_config: dict, artifacts: dict, threshold: float = 0.5) -> np.ndarray:
+    """Load the trained model and return probability or point forecasts based on task metadata."""
+    problem_name = problem_config.get("name", "<unknown>")
+    task_type = str(
+        problem_config.get("task_type")
+        or artifacts.get("task_type")
+        or ""
+    ).lower()
+    output_mode = artifacts.get("output_mode") or problem_config.get("output_mode")
+
     X, _ = _prepare_feature_matrix(features, artifacts)
-    
     model = joblib.load(_latest_model_path(problem_name))
-    
-    # Assuming XGBoost or similar with predict_proba for classification and predict for regression
-    # But for simplicity and compatibility with regression, check model type or problem definition?
-    # Actually, regression models in sklearn/xgb return values directly on predict().
-    # Classification models return class labels on predict(), and probas on predict_proba().
-    
-    try:
-        # Heuristic: Try predict_proba first if it looks like a classifier (anytime_td)
-        # But we need to know task type.
-        if "anytime_td" in problem_name:
-             proba = model.predict_proba(X)[:, 1]
+
+    is_classification = task_type in {"classification", "binary", "multiclass"}
+    if is_classification:
+        if hasattr(model, "predict_proba"):
+            preds = model.predict_proba(X)
+            if preds.ndim > 1 and preds.shape[1] > 1:
+                preds = preds[:, 1]
         else:
-             proba = model.predict(X)
-    except AttributeError:
-        proba = model.predict(X)
-        
-    return proba
+            preds = model.predict(X)
+        preds = np.asarray(preds, dtype=float)
+        preds = np.clip(preds, 0.0, 1.0)
+    else:
+        preds = np.asarray(model.predict(X), dtype=float)
+
+    if output_mode and output_mode == "logit":
+        preds = 1.0 / (1.0 + np.exp(-preds))
+
+    return preds
 
 def main() -> None:
     _ensure_imports_ready()
@@ -2393,7 +2509,7 @@ def main() -> None:
                 logger.warning("Skipping %s (artifacts not found).", p_name)
                 continue
 
-            preds = _predict_for_problem(features, p_name, artifacts)
+            preds = _predict_for_problem(features, problem, artifacts)
             
             # Apply guards for availability components immediately
             if p_name == "availability_active":

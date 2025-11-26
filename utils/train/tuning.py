@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Mapping, Tuple
 from sklearn.metrics import roc_auc_score, average_precision_score, mean_squared_error, precision_score
 from sklearn.model_selection import TimeSeriesSplit
 from utils.train.purged_group_time_series_split import PurgedGroupTimeSeriesSplit
+from utils.train.purged_cv import compute_purged_group_splits
 
 logger = logging.getLogger(__name__)
 
@@ -168,11 +169,62 @@ def _auto_spw(y) -> float:
         return 1.0
     return float(np.clip((1.0 - p) / p, 0.25, 50.0))
 
-def _prepare_splits(X_train, y_train, groups_train):
-    # Try purged CV; fallback to time series
+def _prepare_splits(
+    X_train,
+    y_train,
+    groups_train,
+    *,
+    time_values=None,
+    purge_days: float = 0.0,
+    purge_groups: int = 0,
+    embargo_days: float = 0.0,
+    max_train_group_size=np.inf,
+    max_test_group_size=np.inf,
+):
+    # Prefer explicit time-aware purge when timestamps are available
+    n_splits = 5
+    if time_values is not None:
+        try:
+            import pandas as pd
+
+            meta_df = pd.DataFrame(
+                {
+                    "time": pd.to_datetime(time_values),
+                    "group": groups_train,
+                }
+            )
+            splits = compute_purged_group_splits(
+                meta_df,
+                time_col="time",
+                group_col="group",
+                n_splits=max(2, int(n_splits)),
+                purge_days=purge_days,
+                purge_groups=int(purge_groups),
+                embargo_days=embargo_days,
+                max_train_group_size=max_train_group_size,
+                max_test_group_size=max_test_group_size,
+            )
+            if splits:
+                logger.info(
+                    "Pre-computing CV splits with time-aware purge (n_splits=%d, purge_days=%.1f, purge_groups=%d).",
+                    n_splits,
+                    float(purge_days),
+                    int(purge_groups),
+                )
+                return splits
+        except Exception as e:  # pragma: no cover - guarded fallback
+            logger.warning(
+                "Time-aware purged CV failed (%s); falling back to group-gap only.",
+                e,
+            )
+
+    # Try group-gap based purged CV; fallback to time series
     try:
-        cv = PurgedGroupTimeSeriesSplit(n_splits=5, group_gap=5)
-        logger.info("Pre-computing CV splits with PurgedGroupTimeSeriesSplit...")
+        cv = PurgedGroupTimeSeriesSplit(n_splits=max(2, int(n_splits)), group_gap=int(purge_groups))
+        logger.info(
+            "Pre-computing CV splits with PurgedGroupTimeSeriesSplit (group_gap=%d)...",
+            int(purge_groups),
+        )
         return list(cv.split(X_train, y_train, groups=groups_train))
     except ValueError as e:
         logger.warning(f"PurgedGroupTimeSeriesSplit failed with error: {e}. Falling back to standard TimeSeriesSplit.")
@@ -272,7 +324,19 @@ def _suggest_xgb_params(
 
 
 # ---- public API ----
-def tune_hyperparameters(trainer, model_name: str, problem_config: Dict, X_train, y_train, groups_train, sample_weight=None):
+def tune_hyperparameters(
+    trainer,
+    model_name: str,
+    problem_config: Dict,
+    X_train,
+    y_train,
+    groups_train,
+    sample_weight=None,
+    time_values=None,
+    purge_days: float = 0.0,
+    purge_groups: int = 0,
+    embargo_days: float = 0.0,
+):
     """Drop-in replacement for ModelTrainer.tune_hyperparameters; writes into trainer.best_params & meta."""
     task_type = problem_config.get("task_type", "classification").lower()
     direction = "minimize" if task_type == "regression" else "maximize"
@@ -301,7 +365,17 @@ def tune_hyperparameters(trainer, model_name: str, problem_config: Dict, X_train
         logger.info(f"Re-using cached CV splits for {problem_name}.")
     else:
         logger.info(f"Pre-computing CV splits for {problem_name}...")
-        splits = _prepare_splits(X_train, y_train, groups_train)
+        splits = _prepare_splits(
+            X_train,
+            y_train,
+            groups_train,
+            time_values=time_values,
+            purge_days=purge_days,
+            purge_groups=purge_groups,
+            embargo_days=embargo_days,
+            max_train_group_size=problem_config.get("max_train_group_size", np.inf),
+            max_test_group_size=problem_config.get("max_test_group_size", np.inf),
+        )
         trainer._cached_splits[cache_key] = splits
         logger.info(f"CV splits cached ({len(splits)} splits).")
 

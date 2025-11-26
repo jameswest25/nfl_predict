@@ -1,0 +1,180 @@
+Here’s a concise pass through the main issues, organized to hit your 7 questions. I’ll call out concrete locations and how they affect realism / predictive performance.
+
+---
+
+**1–2. Conceptual mismatches vs “football reality”**
+
+- **Pre‑snap (`ps_`) stats: training vs inference semantics don’t match reality**
+  - Training feature matrix (`pipeline/feature.py` → `utils/feature/player_game_level.py`) computes `ps_*` columns (route participation, slot vs wide targets, scripted touches, etc.) from **actual plays in that same game**.
+  - In inference, `_compute_features` in `pipeline/predict.py` does not have those future `ps_*` stats; instead it:
+    - Builds rolling features via `add_rolling_features(...)` (`1g_ps_route_participation_pct_per_game`, etc.).
+    - Renames them to the **same column names** (`ps_route_participation_pct`, `ps_targets_total`, etc.) via the `rename_map` in `pipeline/predict.py:551–606`.
+    - Uses `_apply_ps_fallback` / `_load_ps_baselines` to carry forward last known values for players with no recent tracking (`pipeline/predict.py:520–640`).
+  - Training config uses these `ps_*` columns directly as features for multiple problems:
+    - `pre_snap_routes` and `pre_snap_scripted_touches` use `ps_route_participation_`, `ps_targets_`, `ps_scripted_` prefixes (`config/training.yaml`).
+    - Downstream usage and TD models also include `ps_*` prefixes in `feature_prefixes_to_include`.
+  - Effect:
+    - In **training**, the model sees “perfect” pre‑snap script and alignment for the *current* game.
+    - In **inference**, those exact columns are proxies constructed from **history** and baselines, not the actual script for the upcoming game.
+    - This is a big covariate shift and makes the pre‑snap models unrealistically strong in training (they’re partially learning from same‑game play outcomes), then much weaker and noisier at inference.
+    - To be realistic, the models that are supposed to approximate pre‑snap plan should be trained on the same kind of information you have at decision time (rolling historical `ps_*`, not the current game’s `ps_*`).
+
+- **Inference for intermediate classification models uses class labels, not probabilities**
+  - In `pipeline/predict.py`, `_predict_for_problem` does:
+    - `if "anytime_td" in problem_name: proba = model.predict_proba(X)[:, 1]`
+    - `else: proba = model.predict(X)` (`pipeline/predict.py:2286–2310`).
+  - `availability_active` is a **classification** problem but is treated as regression-ish: `predict()` returns class labels (0/1) for XGBoost classifiers, not calibrated probabilities.
+  - Later, you clip these outputs and treat them as probabilities and multiply them into `expected_targets`, `expected_carries`, etc. (`_inject_composed_features` in `pipeline/predict.py:358–454`).
+  - Training, however, calibrates and evaluates models using true probabilities (via `calibration.py` and `save_model_and_metrics`).
+  - Effect:
+    - Availability / snapshare / maybe other classification submodels are effectively **hard‑thresholded** at inference.
+    - The whole chain `availability → team pace → usage → efficiency → anytime_td` is then using a much cruder, miscalibrated signal than what training expected.
+    - That directly hurts realism (players go from 0 to 1 instead of smooth probabilities) and degrades AUC / calibration for all downstream targets.
+
+- **Pre‑snap “scripted touches” heuristic is strong but somewhat rigid**
+  - `_compute_pre_snap_usage` in `utils/feature/player_game_level.py:120–360` defines scripted plays as the first 15 offensive plays (`offense_play_rank < 15`).
+  - That’s a plausible heuristic but:
+    - It doesn’t adjust for tempo, two‑minute situations, or long drives that blur into non-scripted territory.
+    - It assumes every team scripts exactly 15 plays in a uniform way.
+  - Effect:
+    - For some teams/games, the `ps_scripted_*` features represent a mix of true “openers” and reactive sequences, so model may learn noisy relationships.
+    - This matters because `pre_snap_scripted_touches` and downstream TD models treat these as key levers for designed scoring touches.
+
+---
+
+**3. Incomplete implementations / half‑finished paths**
+
+- **Duplicated `efficiency_tds` problem definition in `config/training.yaml`**
+  - Around `config/training.yaml:360–430` there are **two** problem blocks with `name: 'efficiency_tds'`:
+    - First block includes `drive_hist_`, `weather_`, `travel_`, etc. and a full `other_features_to_include`.
+    - Immediately after, a second `efficiency_tds` block appears with a shorter feature set and the same name and `columns_to_discard`.
+  - `ModelTrainer` (`pipeline/train.py:2148+`) iterates through `self.problems` as-is, so both entries are used.
+  - Effect:
+    - You train the same‑named problem twice with slightly different feature configs. Saved artifacts/metrics for that name are whichever run wins last.
+    - This is classic config cruft from refactoring; it makes it harder to reason about what the “true” TD efficiency model actually is, and could hide regressions.
+
+- **Pre‑snap models rely on features that don’t exist at inference**
+  - `pre_snap_routes` / `pre_snap_scripted_touches` rely on `ps_*` features (current‑game pre‑snap metrics) at training.
+  - In inference, `_compute_features` never generates same‑game `ps_*` — it only builds rolling historical approximations and renames them.
+  - Effect:
+    - The design of pre‑snap models is internally inconsistent: they’re trained with richer, more label‑adjacent features than they will ever see at inference.
+    - Prediction pipeline then tries to compensate with `_load_ps_baselines` and `_apply_ps_fallback` (`pipeline/predict.py:520–640`), but that is bolted on rather than built into the training story.
+
+- **LightGBM config is present but effectively unused**
+  - `config/training.yaml` defines `models: [lightgbm, xgboost]` and a `lightgbm` hyperparameter block.
+  - The actual trainer uses `training.models_to_train` which is set to `['xgboost']` (see `config/training.yaml:470+` and `pipeline/train.py::__init__`).
+  - Effect:
+    - The LightGBM config is dead weight. It may confuse readers into thinking LightGBM is part of the active ensemble when it isn’t.
+
+---
+
+**4. Wrong / misleading implementations (names vs behavior)**
+
+- **Pre‑snap features reused as “history” but named like contemporaneous stats**
+  - In training features, `ps_route_participation_pct` / `ps_targets_*` refer to stats **from that game**.
+  - In prediction, the same names are aliased from rolling historical per‑game features (`1g_ps_*_per_game → ps_*`, `3g_ps_*_per_game → ps_*_l3` in `pipeline/predict.py:551–606`).
+  - So the name `ps_route_participation_pct` means “actual participation this game” in training but “most recent rolling average” at inference.
+  - Effect:
+    - The same columns have different semantics between train and predict, which is exactly the opposite of the project’s goal (“training featurization must conceptually and logically match prediction featurization”).
+    - This will produce subtle but real degradation in calibration and generalization for any problem that leans on `ps_*` features.
+
+- **Prediction code assumes only `anytime_td` is classification**
+  - `_predict_for_problem` in `pipeline/predict.py` branches on the *name* containing `"anytime_td"` to decide whether to use `predict_proba` or `predict`.
+  - Some other problems are classification or quasi‑probabilistic (e.g. availability, possibly some variants later), but they’re treated as regression.
+  - Effect:
+    - The guard code (`_apply_guards_inline`, `_apply_availability_floor`) was clearly written assuming probabilities, not hard labels; with 0/1 inputs many downstream thresholds and scalings behave poorly.
+    - The TD model chain ends up consuming mismatched semantics relative to training.
+
+---
+
+**5. Future data leakage / label-derived leakage**
+
+Most of the heavy leakage concerns have been actively guarded against, and the as‑of machinery is solid:
+
+- **Same‑game box score leakage is centrally blocked**
+  - `LEAK_PRONE_COLUMNS` in `utils/general/constants.py` lists all same‑game outcomes: yards, attempts, TDs, snaps, etc.
+  - `config/training.yaml` mirrors this via `_shared_columns_to_discard` and `_columns_to_discard_extended` and tests enforce consistency (`tests/test_training_config_features.py`).
+  - Training feature selection logic uses those discard lists so same‑game yards/targets/snaps/TDs are not used as features for usage/efficiency/anytime models.
+
+- **As-of cutoffs for injuries/odds/weather are respected**
+  - `utils/feature/asof.py` + `asof_metadata` define `decision_cutoff_ts` per game/horizon.
+  - In `pipeline/feature.py`:
+    - You join `asof_meta` onto player-game rows and drop any rows where snapshot timestamps exceed `decision_cutoff_ts` (injury, roster, odds, forecast) and write violations to audit files (`pipeline/feature.py:376–488`).
+    - `drop_missing_snapshots_enabled()` optionally drops rows without any pre‑cutoff snapshots, preventing silent leakage from “future default” data.
+  - Injury timelines inside `player_game_level` recompute a `decision_cutoff_ts` via `get_decision_cutoff_hours()` and filter to `reported_at <= decision_cutoff_ts` (`utils/feature/player_game_level.py:1760+`), inside the same `decision_cutoff_override` context used by `build_feature_matrix`.
+  - Odds and weather feature builders consult `decision_cutoff_ts` and game start time to choose snapshot times.
+
+- **Derived target usage is mostly safe**
+  - For efficiency yards models, `derived_target` with `external_source: 'player_game'` pulls `receiving_yards` / `rushing_yards` from `PLAYER_GAME_DIR` (`pipeline/train.py:760–820`).
+  - Those stats are only used as **labels**, while the same columns are dropped as features via `columns_to_discard`.
+  - Purged group time series split with `group_col: 'game_id'` and embargo ensures label info doesn’t leak across train/val splits.
+
+Where there is conceptual leakage risk:
+
+- **Pre‑snap features act as de‑facto label proxies for that game**
+  - Because `ps_*` stats are computed from full play-by-play of that same game, they encode the realized script and target tree.
+  - They’re used both as labels (`ps_route_participation_pct`, `ps_scripted_touches`) and as features (their own counts, shares, positional splits) without any “pre‑cutoff” constraint.
+  - In real life you don’t know which WRs will be heavily scripted in **this** game; you only know historical tendencies and hints from injuries/odds.
+  - So even if they’re not literally future “snapshots,” they are **post‑snap outcomes** being fed into upstream layers of the chain.
+
+---
+
+**6. Dead / noisy data sources and features**
+
+- **Pre‑snap baselines for seasons without tracking**
+  - `_load_ps_baselines` in `pipeline/predict.py:520–560` tries to backfill `PS_BASELINE_COLUMNS` from previous seasons’ `PLAYER_GAME_DIR` partitions.
+  - If tracking is missing or schema changed, it silently returns an empty frame and `_apply_ps_fallback` becomes a no‑op.
+  - Where tracking coverage is partial (early seasons, some teams), `ps_*` inputs to models are a mix of:
+    - Real pre‑snap tracking for some players and games.
+    - Forward‑filled baselines for others.
+    - Zeros for the rest.
+  - Effect:
+    - For these cohorts, `ps_*` features are effectively noise; the model will overfit to segments with tracking and underperform on segments without, unless you stratify or drop them.
+
+- **Legacy LightGBM configuration, MLB‑selective modules, etc.**
+  - Various modules are clearly marked legacy MLB (`utils/train/selective/*`, docs `mlb_legacy.md`, etc.) and not wired into the NFL path.
+  - These are harmless but clutter the mental model; for NFL‑only work they’re dead weight.
+
+- **BASE_GAME_COLS in prediction mostly zero for future games**
+  - `BASE_GAME_COLS` in `pipeline/predict.py:145–180` includes outcomes like `passing_yards`, `rushing_yards`, `touchdowns`, `td_count`, etc.
+  - For upcoming games these are inherently unknown and end up as zeros or missing; inference artifacts should be excluding them anyway via the saved feature list.
+  - Effect:
+    - If any of these leak into the active feature set for inference due to a mismatch in artifacts, they’re just constant zeros—noise at best.
+
+---
+
+**7. Hallucinated / legacy cruft**
+
+- **Duplicated `efficiency_tds` block looks like an editing artifact**
+  - As noted above, the double definition in `config/training.yaml` is extremely likely to be a copy‑paste or model‑editing artifact, not intentional design.
+  - It should be cleaned to a single, well‑documented TD efficiency problem.
+
+- **Pre‑snap model stack appears partially designed by “wish list” rather than data reality**
+  - The pre‑snap models’ feature sets (`ps_route_participation_`, `ps_targets_`, `team_red_zone_`, `player_red_zone_`, etc.) clearly encode a conceptual, multi‑layer architecture:
+    - First predict routes and scripted touches.
+    - Feed those into usage.
+    - Then efficiency.
+  - But the actual implementation:
+    - Doesn’t ensure that the **same kind of inputs** are available at inference (history vs current game mismatch).
+    - Uses quite a few prefixes (`ps_total_`, `ps_targets_slot_share_*`, etc.) that may be sparsely populated in older seasons or for low‑usage players.
+  - This is more “aspirational architecture” than tightly validated reality and is a good candidate for pruning/grounding.
+
+---
+
+**Concrete recommendations (short list)**
+
+- **Align train/inference for `ps_*` features**:
+  - Either:
+    - Re‑define `ps_*` features to be rolling history only (and rename current‑game versions), or
+    - Train pre‑snap models using *only* the same rolling historical `ps_*` features that inference uses.
+- **Fix prediction of intermediate classification problems**:
+  - Treat all classification problems (at minimum `availability_active`, `anytime_td`) as requiring `predict_proba`, not `predict`, and ensure the predictor loads calibrated wrappers if training saved them.
+- **Deduplicate and simplify config**:
+  - Collapse the duplicated `efficiency_tds` problem in `config/training.yaml` into a single canonical definition.
+  - Remove or clearly comment unused sections (LightGBM config, unused problems).
+- **Audit pre‑snap model feature lists**:
+  - Remove any same‑game ps_* features from downstream problems that are not realistically knowable pre‑kickoff; rely on historical/role and odds/injury context instead.
+- **Treat low‑coverage pre‑snap tracking as optional**:
+  - For seasons/players without reliable tracking, drop or down‑weight ps_* features rather than silently filling them—otherwise they behave like structured noise.
+
+If you’d like, next step could be to prioritize these into an actionable change list (e.g., “fix classification predict_proba” and “align ps_* semantics”) and then refactor specific pieces of the pipeline.

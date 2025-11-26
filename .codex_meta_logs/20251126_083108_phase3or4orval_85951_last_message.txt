@@ -1,0 +1,9 @@
+- Added structured leak guard (`utils/feature/leak_guard.py`) with pattern-based banning, allowlists, schema snapshot rendering, and wired it into feature assembly (`pipeline/feature.py`) and per-problem training load (`pipeline/train.py`); feature builds now emit schema artifacts under `audit/feature/schema/anytime_td/`.
+- Extended target constants to cover label variants (`utils/general/constants.py`), filtered decision-time odds to a single configured horizon via new `odds_horizon` config on the anytime TD problem (`config/training.yaml`) and `_filter_odds_snapshot_columns`, and documented the knob plus schema/audit trail in `docs/pre_snap_semantics.md`.
+- Hardened leak guard testing and odds horizon selection with new cases (`tests/test_data_leak_guard.py`, `tests/test_odds_horizon_filter.py`).
+
+Tests: python3 -m pytest tests/test_data_leak_guard.py tests/test_odds_horizon_filter.py -q (fails: pytest module not installed).
+
+Note: Unable to stage/commit because the environment blocks writing under `.git` (cannot create index.lock or touch `.git/*`).
+
+PROGRESS: Leak guardrails and odds-horizon filtering with tests/docs are in place; remaining plan items include decision-time injury alignment, purge-aware CV/slicing, richer football features, and broader docs/evaluation.

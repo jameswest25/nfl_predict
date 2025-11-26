@@ -1,0 +1,2203 @@
+OpenAI Codex v0.63.0 (research preview)
+--------
+workdir: /Users/jameswest/Desktop/nfl_predict
+model: gpt-5.1-codex-max
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: none
+reasoning summaries: auto
+session id: 019ac06c-e214-75a3-8139-caf6bc0d8a0e
+--------
+user
+You are now in the validation loop. Your job is to make sure the full pipeline command runs
+    successfully and produces refreshed metrics artifacts.
+
+    Plan context (for reference only, do NOT re-hash it unless needed):
+
+    <BEGIN_PLAN_START>
+    **Overview and Priorities**
+
+- **Priority 1: Labels and leakage** – Fix the “anytime TD” label semantics and harden leak‑guards so the model never sees post‑decision or same‑game realized stats.
+- **Priority 2: Decision‑time realism for odds/injuries** – Make sure every feature (especially markets and injuries) is truly as‑of the configured decision cutoff and consistent at train vs inference.
+- **Priority 3: Football‑grounded feature set** – Refine usage, role, drive/game‑state, and team context features to track the real mechanisms that drive TDs.
+- **Priority 4: Cleanup of legacy/hallucinated structure** – Remove or fully implement dead paths (e.g., feature tuning CLI), MLB leftovers, and dangling assumptions.
+- **Priority 5: Evaluation & monitoring** – Add tests, diagnostics, and calibration checks to guard against regressions and confirm football realism.
+
+Below is a detailed, implementation‑ready plan organized by these priorities.
+
+---
+
+**Phase 1 – Clarify and Fix the Anytime TD Label**
+
+**1.1 Decide label semantics (product decision)**  
+(Non‑code but mandatory before implementation.)
+
+- Choose between:
+  - **Option A – “Offensive only”:** TDs where the player is the rusher or receiver (no passing, no returns).  
+  - **Option B – “All non‑passing”:** TDs where the player is credited with any non‑passing TD (rush, receive, return, defensive scores).
+- Align this choice with:
+  - How books define “anytime TD scorer” in your markets.
+  - Your analytics use‑cases (e.g., do you want WR/KR return TDs included?).
+- Record the decision in:
+  - A short design doc (label definition, edge cases, examples).
+  - In‑code docs where the label is defined and in any config/README.
+
+**1.2 Implement explicit label columns**
+
+Goal: make label semantics explicit and non‑ambiguous.
+
+- In the player‑game aggregation layer (e.g., `utils/feature/player_game_level.py`):
+  - Define:
+    - `anytime_td_offense = 1{rushing_td_count + receiving_td_count > 0}`
+    - `anytime_td_all = 1{touchdowns > 0 and passing_td_count == 0}` (or equivalent explicit logic combining all non‑passing TD types).
+  - Keep existing generic `touchdowns` and `passing_td_count`, but treat them as building blocks, not labels.
+- Update any label construction helpers (e.g., `utils/feature/targets.py` or equivalent) to:
+  - Reference these explicit columns instead of re‑deriving the logic ad hoc.
+  - Make the target name (`label_anytime_td_offense` vs `label_anytime_td_all`) explicit.
+
+**1.3 Wire labels into training configs**
+
+- In the training pipeline (e.g., `pipeline/train.py`):
+  - Introduce a configuration option for the problem definition, e.g.:
+    - `label_name: anytime_td_offense` (default) or `anytime_td_all`.
+  - Ensure:
+    - Target derivation (`_derive_target_column` and any external source joins) uses the configured label column.
+    - Downstream evaluation/reporting code (metrics, plots, CSV exports) read the same label.
+- Add a brief warning in configs if you change the default semantics, to avoid silent breakage of existing analyses.
+
+**1.4 Validate label correctness**
+
+- Create a small label‑audit script/notebook that:
+  - Samples games and players, printing:
+    - Raw TD events (from PBP).
+    - Aggregated TD counts (rush, receive, return, defensive, passing).
+    - `anytime_td_offense` and `anytime_td_all`.
+  - Check tricky edge cases:
+    - QBs with rushing TDs.
+    - WRs/RBs with fumble‑return or INT‑return TDs.
+    - Special teams players (KR/PR specialists).
+- Add a unit/integration test:
+  - Build a tiny synthetic PBP frame with known TD types.
+  - Assert the aggregated label columns match expected values.
+
+**Risks / pitfalls**
+
+- Changing label semantics will:
+  - Break comparability with old offline analyses if not clearly versioned.
+  - Potentially change model performance and calibration, especially for rare return/defensive TDs.
+- Mitigation:
+  - Version the label (e.g., `anytime_td_offense_v1`), and clearly log which version is used in each run.
+
+---
+
+**Phase 2 – Eliminate Data Leakage (Core Guardrails)**
+
+**2.1 Inventory and classify leak‑prone columns**
+
+- Build an introspection script around the feature matrix builder (e.g., in `pipeline/feature.py` + `pipeline/train.py`) that:
+  - For each problem (`anytime_td`), captures:
+    - Final training feature matrix column names.
+    - Their groups/namespaces (odds, injury, PS, drive history, etc.).
+  - Stores this schema snapshot to a simple artifact (e.g., JSON per run).
+- Manually inspect and categorize:
+  - **Definitely forbidden for training** (for anytime TD):
+    - Any column referencing same‑game realized stats (e.g., `_ps_*_game`, `_game_stats`, etc.).
+    - Completed boxscore stats for the prediction game.
+    - Post‑decision injury statuses (e.g., final inactives) if present.
+    - Any label‑derived columns (rolling accuracy, residuals that use actual labels).
+  - **Potentially allowed but time‑sensitive:**
+    - Market snapshots.
+    - Injury and participation probabilities.
+    - Team totals derived from markets.
+  - **Safe:**
+    - Historical usage aggregates.
+    - Pre‑game context (schedule, rest days, travel).
+    - Weather forecast as‑of decision time.
+
+**2.2 Strengthen central leak‑guard lists**
+
+- In `utils/general/constants` (or equivalent):
+  - Expand `LEAK_PRONE_COLUMNS` to include:
+    - Patterns: `*_game`, `*_post`, `*_actual`, `*_label`, `*final*`, `*boxscore*`, etc.
+    - Known problematic columns from the inventory.
+  - Add a **positive allowlist per problem**:
+    - E.g., `ALLOWED_COLUMNS_ANYTIME_TD` which is either:
+      - Explicit list of safe prefixes/namespaces; or
+      - Rules like “allow `ps_*` but not `*_game` or `*_same_game`”.
+- In the feature selection logic during training:
+  - Enforce:
+    - `features = (raw_features - LEAK_PRONE_COLUMNS) ∩ ALLOWED_COLUMNS(problem)`.
+  - Fail fast with a clear error if:
+    - Any `LEAK_PRONE_COLUMNS` survive into the training set.
+    - Any unlabeled “suspicious” column (matching forbidden patterns) is encountered.
+
+**2.3 Add structural tests for leakage**
+
+- Extend or add tests (e.g., `tests/test_data_leak_guard.py`) to:
+  - Build a small training matrix for `anytime_td` with the real pipeline.
+  - Assert that:
+    - No columns with `_game`, `_same_game`, `_post`, etc. patterns appear.
+    - No label column (or obvious transformations like `label_*`) appears in the feature list.
+    - PS aliases created explicitly for analysis (`_ps_*_game`) do not show up in `feature_columns`.
+  - Include a regression test:
+    - Intentionally introduce a fake leak‑prone column in the feature builder and assert the training path fails.
+
+**2.4 Validate as‑of and decision‑time correctness**
+
+- Odds and market snapshots:
+  - In `utils/feature/asof.py` / `asof_metadata` and odds feature construction:
+    - Verify each `market_anytime_td_*` column is tagged with:
+      - A source timestamp (snapshot_ts).
+      - The intended horizon (e.g., `24h`, `6h`, `2h`, `open`).
+    - Enforce at feature build:
+      - `snapshot_ts <= decision_cutoff_ts` for the selected horizon.
+      - If a snapshot is missing before cutoff, the corresponding feature is null/flagged as missing.
+  - In training configs:
+    - Require explicit choice of horizon (e.g., `odds_horizon: 24h`) and use only matching columns.
+- Injury and participation:
+  - Confirm that:
+    - Injury features (`injury_report_status`, `injury_practice_status`, etc.) used for training are the as‑of snapshots, not end‑of‑week statuses.
+    - `injury_inactive_probability` is always derived from as‑of injury columns, not from final inactive lists.
+- External actuals join:
+  - In `_derive_target_column` and any `external_source` join:
+    - Confirm that the feature frame already filters by `game_date <= decision_cutoff_date` (or similar) before joining actuals.
+    - Add an assertion that:
+      - No joined row has a game timestamp > max timestamp in the feature window for that fold.
+
+**2.5 Audit conformal / CV splitting for leakage**
+
+- For `PurgedGroupTimeSeriesSplit` and conformal composite:
+  - Verify group structure:
+    - Splits ensure that no game’s future weeks leak into its training folds.
+    - For per‑player splits, ensure a purge window so labels don’t leak via rolling features.
+- Add a test:
+  - Simulate toy data with time and group labels.
+  - Assert that:
+    - Any time window used for test is at least `purge_window` ahead of training rows.
+
+**Risks / pitfalls**
+
+- Over‑aggressive filters may drop genuinely useful features if pattern rules are too broad.
+- Market/injury pipelines are complex; small misalignments between training and inference time horizons are easy to miss without explicit assertions.
+
+---
+
+**Phase 3 – Align Features with Real Football Mechanisms**
+
+**3.1 Usage and opportunity features**
+
+Goal: base predictions on how players are actually used in ways that lead to TDs.
+
+- Review existing usage features:
+  - Target share (overall, red zone, goal‑to‑go).
+  - Carry share (overall, inside 10, goal‑line).
+  - Route participation and alignment (slot, wide, inline TE, backfield).
+- Implementation steps:
+  - Ensure historical aggregates:
+    - Are position‑sensible (e.g., RB targets vs WR targets).
+    - Use decay/half‑life consistent with plausible coaching adjustments (e.g., stronger weight on last 3–5 games, but include season).
+  - Add missing key features where data allows:
+    - **Inside‑5 and inside‑10 usage:** counts and shares for carries/targets in these zones.
+    - **2‑min drill and hurry‑up targets:** to capture late‑game TD chances for specific roles (e.g., satellite backs, slot receivers).
+    - **Red‑zone route participation by alignment:** e.g., fraction of red‑zone routes from slot vs outside for WRs.
+- Normalize features:
+  - Use team‑relative shares (e.g., red‑zone target share among WRs, RBs) rather than raw counts to better reflect role vs volume.
+
+**3.2 Game‑state‑aware drive features**
+
+- Extend `_finalize_drive_history_features` to:
+  - Compute drive history conditional on game state:
+    - **Field position buckets:** starting field position, red‑zone starts.
+    - **Score differential buckets:** leading, tied, trailing; maybe more granular.
+    - **Down & distance types:** short‑yardage vs long; especially near the goal line.
+  - Examples:
+    - `drive_hist_td_rate_prev_trailing`: TD rate on drives when trailing.
+    - `drive_hist_rush_heavy_td_rate_rz`: TD rate on drives in red zone where team skewed run‑heavy.
+- Use these features to:
+  - Better capture contexts when TDs are more likely and which players are on the field in those contexts.
+
+**3.3 Role flags and packages**
+
+- Revisit `_append_role_flags` and similar role inference logic:
+  - For flags like `role_goal_line_back`, `role_primary_red_zone_target`:
+    - Condition role determination on the relevant context only:
+      - Goal‑line back: share of carries inside the 5 or inside the 3.
+      - Primary RZ target: share of RZ targets on passing plays from specific formations (if available).
+  - Introduce package‑aware roles if data supports it:
+    - e.g., 12 personnel red‑zone specialists vs 11 personnel field stretchers.
+- Use quantiles stratified by:
+  - Team, position, and context (red zone, goal‑line).
+- Add tests:
+  - Synthetic player histories where a short‑yardage back only appears in goal‑line situations; assert they are correctly tagged as `role_goal_line_back`.
+
+**3.4 Team context and scoring environment**
+
+- Clean up and NFL‑ize team total / scoring features:
+  - Simplify and re‑implement `TeamTotalAdjustedClassifier` for NFL:
+    - Use implied team totals from markets plus historical scoring.
+    - Remove MLB‑specific innings logic.
+  - Build features like:
+    - `team_implied_td_total` from spreads and totals.
+    - `team_scoring_rate_season` and `red_zone_td_rate_season`.
+- Use these as multipliers:
+  - Combine team scoring environment with player usage to approximate expected TD opportunities.
+
+**3.5 Injury and playing time expectations**
+
+- Strengthen `injury_inactive_probability` and related features:
+  - Confirm transformation in `utils/train/data._augment_injury_signals`:
+    - Uses only practice status and injury reports available pre‑decision.
+  - Add features:
+    - Expected snap share given injury status (e.g., limited practice trend).
+    - Positional depth chart signals (if available) indicating likely next‑man‑up.
+- Ensure the model:
+  - Uses injury probabilities primarily as **availability and volume modifiers**, not as label predictors via hidden leakage (e.g., using final inactive lists).
+
+**Risks / pitfalls**
+
+- Over‑engineering rare context features (e.g., very granular game‑state buckets) may create sparse, noisy features.
+- Role flags might misclassify players on small samples; use minimum sample thresholds and fallback to neutral/no role when uncertain.
+
+---
+
+**Phase 4 – Cleanup of Legacy / Hallucinated Structure**
+
+**4.1 Feature tuning CLI (tune_features) – decide: remove or implement**
+
+- Option A (if you want tuning): fully implement.
+  - Add a CLI entrypoint to `pipeline/feature.py` that:
+    - Accepts `--half-life`, `--shrink-k`, `--crude-window` (or similar).
+    - Passes these params through to feature construction functions affecting historical decay and shrinkage.
+  - Ensure:
+    - `tune_features` in `pipeline/train.py` calls this CLI correctly.
+    - The resulting feature matrices are versioned/tagged by their hyper‑parameters.
+- Option B (if not needed now): deprecate/remove.
+  - Remove or comment out `tune_features` and any config references.
+  - Add a note in docs that feature hyper‑parameters are currently fixed and how to change them manually.
+
+**4.2 Remove or confine MLB‑specific artifacts**
+
+- Identify all MLB leftovers:
+  - Fields like `inning_topbot`, `game_pk`, MLB‑style conformal meta.
+  - MLB‑specific config keys or dataset names.
+- For NFL anytime TD paths:
+  - Either:
+    - Strip these fields from:
+      - Meta schemas in conformal/ensemble outputs.
+      - Group/ID columns used for splits and stacking.
+    - Or wrap them under a generic, unused namespace that is never part of NFL feature selection.
+- Add a guard:
+  - Tests that building the NFL anytime TD feature matrix and training models:
+    - Does not require or reference `inning_*` or `game_pk`.
+
+**4.3 Clean up dangling assumptions (e.g., snap_zero_usage_stub)**
+
+- Search for references to:
+  - `snap_zero_usage_stub`.
+  - Any other stub/placeholder from prior iterations.
+- For each:
+  - If no longer used:
+    - Delete references and comments, or clearly mark them as deprecated.
+  - If still conceptually needed:
+    - Re‑implement consistently:
+      - Add the stub in `player_game_level` with clear semantics.
+      - Ensure tests validate the presence or absence of the stub in features as intended.
+
+**4.4 Normalize naming and IDs**
+
+- Canonicalize `game_id` vs `game_pk` and related IDs:
+  - Choose a single canonical internal name for NFL games (`game_id`).
+  - Add adapters only at IO boundaries (e.g., when reading external data that uses `game_pk`).
+- Refactor training and feature code:
+  - Replace ambiguous references with the canonical names.
+  - Ensure groupings (for CV, conformal, etc.) use the canonical game and team ids.
+
+**4.5 Documentation and discoverability**
+
+- Add a concise, up‑to‑date overview file (e.g., `docs/anytime_td_pipeline.md`) covering:
+  - Label definitions and semantics.
+  - High‑level feature groups (usage, odds, injury, PS, drives).
+  - Strict rules about leakage and as‑of time handling.
+- In the code:
+  - Add short docstrings for central entrypoints:
+    - Feature builder.
+    - Training setup.
+    - Prediction CLI.
+
+**Risks / pitfalls**
+
+- Removing legacy elements may break other problem types (e.g., MLB models) if they share code paths.
+- Mitigation:
+  - Isolate NFL‑specific changes behind configuration flags or separate entrypoints, and run existing ML problems (if any) through basic regression checks.
+
+---
+
+**Phase 5 – Evaluation, Calibration, and Ongoing Safety**
+
+**5.1 Calibration and performance by football segments**
+
+- Implement evaluation slices:
+  - By position (RB/WR/TE/QB).
+  - By role flags (goal‑line back, primary RZ target, gadget/return).
+  - By odds bucket (favorites vs longshots).
+  - By game state contexts (high total vs low total games).
+- For each slice:
+  - Compute:
+    - Brier score, log‑loss.
+    - Reliability curves (predicted vs actual TD rates).
+- Use this to:
+  - Identify segments where features or labels misrepresent football reality (e.g., overconfidence for gadget players).
+
+**5.2 No‑odds baseline model**
+
+- Train a variant of the model that:
+  - Excludes all market‑derived features (`market_anytime_td_*`, implied team totals from markets, etc.).
+  - Uses only usage, context, PS, injury, and schedule features.
+- Compare:
+  - Performance vs “full” model.
+  - Calibration and error patterns.
+- Use this to:
+  - Confirm that the model provides incremental information beyond the market.
+  - Have a fallback when odds are unavailable or unreliable.
+
+**5.3 Continuous leak monitoring**
+
+- For every training run:
+  - Save:
+    - The feature schema (column list + basic stats).
+    - A “leak audit” summary, e.g.:
+      - Count of suspicious patterns in feature names.
+      - Any columns close to labels or same‑game stats.
+  - Optionally implement an automated rule:
+    - Fail the run if the audit detects unknown suspicious columns.
+- Extend tests to:
+  - Run the full training pipeline on a small subset of data regularly in CI.
+  - Confirm leak‑guards and feature selections behave as expected.
+
+**5.4 Change management and versioning**
+
+- Version:
+  - Label definitions.
+  - Major feature set revisions (e.g., introduction of game‑state‑aware drive features).
+  - Model architectures and important training configs.
+- Maintain a short changelog for anytime TD:
+  - Each entry: date, change, rationale, expected impact (e.g., “label now excludes return TDs”).
+
+**Risks / pitfalls**
+
+- Evaluation and monitoring can become noisy if too many slices are tracked without clear thresholds.
+- Mitigate by:
+  - Prioritizing key slices (e.g., RB goal‑line usage, WR red‑zone roles).
+  - Using visual dashboards or a small set of summary metrics.
+
+---
+
+**How an Agent Should Execute This Plan**
+
+- **Start with Phase 1 & 2**: fix label semantics and harden leak‑guards before touching feature additions—these are the highest‑leverage and lowest‑ambiguity changes.
+- **Then Phase 3**: refine features aligned with real TD mechanisms, using existing infra and tests to keep complexity manageable.
+- **Next Phase 4**: simplify and de‑clutter the codebase, removing dead or misleading paths that make reasoning and debugging harder.
+- **Finally Phase 5**: add tests, diagnostics, and calibration tooling so future changes don’t reintroduce leakage or football‑unrealistic behavior.
+
+If you’d like, the next step can be to select a concrete subset of this (e.g., “fix label + leak‑guards only”) and I can outline a file‑by‑file, function‑by‑function implementation checklist for that slice.
+    <END_PLAN_END>
+
+    Validation requirements:
+    - Capture a baseline snapshot before running any new code:
+      * Record `auc`, `pr_auc`, `brier_score`, and `precision_at_thresh` from `/Users/jameswest/Desktop/nfl_predict/output/metrics/anytime_td/xgboost/20251126_001001_ab12e68_cutoff_h090m/metrics.yaml`.
+      * Note the current feature-importance distribution from `/Users/jameswest/Desktop/nfl_predict/output/metrics/anytime_td/xgboost/20251126_001001_ab12e68_cutoff_h090m/feature_importance.json`.
+    - Run `cd /Users/jameswest/Desktop/nfl_predict && /Users/jameswest/Desktop/nfl_predict/venv/bin/python /Users/jameswest/Desktop/nfl_predict/main.py` to rebuild datasets, retrain models, and regenerate predictions.
+    - After the run completes, identify the newest timestamped directory under `/Users/jameswest/Desktop/nfl_predict/output/metrics/anytime_td/xgboost` and repeat the metric collection.
+      * Compare before/after metrics and explicitly call out improvements or regressions.
+      * Re-review the refreshed `feature_importance.json` for any unexpected signal shifts.
+    - Inspect `cutoff_backtest_summary.csv` (e.g., `/Users/jameswest/Desktop/nfl_predict/output/metrics/cutoff_backtest_summary.csv`) to confirm horizon-level hit rates and calibration remain acceptable.
+    - Only declare success if the post-run metrics improve (higher AUC/PR AUC, lower Brier/log loss) or, at minimum, hold steady with a justified explanation. Any regression must be reported.
+
+    Rules for this loop:
+    - You may inspect and edit code, rerun commands, or add logging as needed to fix any issues uncovered
+      while running `cd /Users/jameswest/Desktop/nfl_predict && /Users/jameswest/Desktop/nfl_predict/venv/bin/python /Users/jameswest/Desktop/nfl_predict/main.py`.
+    - Keep commits incremental. If you end up making larger fixes, describe them clearly.
+    - After each attempt, report status using `PROGRESS:`. If the run fails, capture stack traces / log
+      pointers so the next attempt knows what to fix.
+    - Once you have successfully run the pipeline, collected the new metrics, and compared them against
+      the previous baseline, end your response with the exact line:
+          PIPELINE VALIDATION COMPLETE
+      Include the usual summary before that sentinel line.
+    - Do NOT output the sentinel unless the metrics truly exist and have been evaluated.
+
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: .codex_meta_logs (877 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+thinking
+**Preparing baseline metrics extraction**
+exec
+/bin/zsh -lc "python - <<'PY'
+import json, yaml, pathlib
+base_dir = pathlib.Path('/Users/jameswest/Desktop/nfl_predict/output/metrics/anytime_td/xgboost/20251126_001001_ab12e68_cutoff_h090m')
+metrics_path = base_dir / 'metrics.yaml'
+feat_path = base_dir / 'feature_importance.json'
+with open(metrics_path) as f:
+    metrics = yaml.safe_load(f)
+print('Baseline metrics:')
+for k in ['auc','pr_auc','brier_score','precision_at_thresh']:
+    print(f\"  {k}: {metrics.get(k)}\")
+with open(feat_path) as f:
+    feats = json.load(f)
+# assume list of dicts with 'feature' 'importance'
+# sort by importance desc
+feats_sorted = sorted(feats, key=lambda x: x.get('importance',0), reverse=True)
+print('\\nTop 10 feature importances:')
+for row in feats_sorted[:10]:
+    print(f\"  {row.get('feature')}: {row.get('importance')}\")
+# basic distribution
+import statistics
+vals = [f.get('importance',0) for f in feats_sorted]
+print('\\nImportance stats:')
+print('  count', len(vals))
+print('  min', min(vals) if vals else None)
+print('  max', max(vals) if vals else None)
+print('  mean', statistics.mean(vals) if vals else None)
+print('  median', statistics.median(vals) if vals else None)
+PY" in /Users/jameswest/Desktop/nfl_predict exited 127 in 831ms:
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+zsh:1: command not found: python
+
+thinking
+**Resolving python path issues**
+exec
+/bin/zsh -lc "/Users/jameswest/Desktop/nfl_predict/venv/bin/python - <<'PY'
+import json, yaml, pathlib, statistics
+base_dir = pathlib.Path('/Users/jameswest/Desktop/nfl_predict/output/metrics/anytime_td/xgboost/20251126_001001_ab12e68_cutoff_h090m')
+metrics_path = base_dir / 'metrics.yaml'
+feat_path = base_dir / 'feature_importance.json'
+with open(metrics_path) as f:
+    metrics = yaml.safe_load(f)
+print('Baseline metrics:')
+for k in ['auc','pr_auc','brier_score','precision_at_thresh']:
+    print(f\"  {k}: {metrics.get(k)}\")
+with open(feat_path) as f:
+    feats = json.load(f)
+feats_sorted = sorted(feats, key=lambda x: x.get('importance',0), reverse=True)
+print('\\nTop 10 feature importances:')
+for row in feats_sorted[:10]:
+    print(f\"  {row.get('feature')}: {row.get('importance')}\")
+vals = [f.get('importance',0) for f in feats_sorted]
+print('\\nImportance stats:')
+print('  count', len(vals))
+print('  min', min(vals) if vals else None)
+print('  max', max(vals) if vals else None)
+print('  mean', statistics.mean(vals) if vals else None)
+print('  median', statistics.median(vals) if vals else None)
+PY" in /Users/jameswest/Desktop/nfl_predict exited 1 in 879ms:
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+Baseline metrics:
+  auc: 0.8333
+  pr_auc: 0.2684
+  brier_score: 0.0872
+  precision_at_thresh: 0.2512
+Traceback (most recent call last):
+  File "<stdin>", line 12, in <module>
+  File "<stdin>", line 12, in <lambda>
+AttributeError: 'str' object has no attribute 'get'
+
+thinking
+**Inspecting feature importance structure**
+exec
+/bin/zsh -lc "/Users/jameswest/Desktop/nfl_predict/venv/bin/python - <<'PY'
+import json, pathlib
+feat_path = pathlib.Path('/Users/jameswest/Desktop/nfl_predict/output/metrics/anytime_td/xgboost/20251126_001001_ab12e68_cutoff_h090m/feature_importance.json')
+with open(feat_path) as f:
+    feats = json.load(f)
+print(type(feats))
+print(list(feats.items())[:5])
+PY" in /Users/jameswest/Desktop/nfl_predict succeeded in 797ms:
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+<class 'dict'>
+[('features', ['drive_hist_count_l3', 'drive_hist_count_prev', 'drive_hist_td_drives_l3', 'drive_hist_td_drives_prev', 'drive_hist_td_rate_l3', 'drive_hist_td_rate_prev', 'drive_hist_total_yards_l3', 'drive_hist_total_yards_prev', 'drive_hist_touch_drives_l3', 'drive_hist_touch_drives_prev', 'drive_hist_touch_rate_l3', 'drive_hist_touch_rate_prev', 'drive_hist_yards_per_drive_l3', 'drive_hist_yards_per_drive_prev', 'expected_carries', 'expected_carries_raw', 'expected_opportunities', 'expected_opportunities_raw', 'expected_receiving_yards', 'expected_rushing_yards', 'expected_targets', 'expected_targets_raw', 'expected_td_prob_poisson', 'expected_td_prob_poisson_raw', 'expected_td_signal', 'expected_td_signal_raw', 'expected_team_plays', 'expected_total_yards', 'position', 'pred_availability', 'pred_availability_active', 'pred_availability_raw', 'pred_availability_snapshare', 'pred_efficiency_rec_yards', 'pred_efficiency_rush_yards', 'pred_efficiency_tds', 'pred_team_pace', 'pred_usage_carries', 'pred_usage_targets', 'rest_days_since_last_game', 'season', 'spread_line', 'team_implied_total', 'travel_bye_week_flag', 'travel_consecutive_home_games', 'travel_consecutive_road_games', 'travel_distance_km', 'travel_distance_km_l3', 'travel_distance_miles', 'travel_east_to_west_late_flag', 'travel_game_timezone_offset', 'travel_local_start_hour', 'travel_long_rest_flag', 'travel_rest_days', 'travel_rest_days_l3', 'travel_rest_hours', 'travel_short_week_flag', 'travel_team_timezone_offset', 'travel_time_diff_from_home_hours', 'travel_timezone_change_hours', 'travel_west_to_east_early_flag', 'weather_bad_passing_flag', 'weather_cloud_cover_pct', 'weather_dew_point_f', 'weather_extreme_wind_flag', 'weather_feels_like_f', 'weather_forecast_is_backfill', 'weather_forecast_is_historical', 'weather_forecast_lead_hours', 'weather_forecast_uncertainty_temp', 'weather_forecast_uncertainty_wind', 'weather_freezing_flag', 'weather_heavy_precip_flag', 'weather_humidity_pct', 'weather_precip_amount_in', 'weather_precip_prob_trend', 'weather_precip_probability_pct', 'weather_pressure_mb', 'weather_snow_amount_in', 'weather_temp_air_f', 'weather_temp_trend', 'weather_visibility_miles', 'weather_wind_gust_mph', 'weather_wind_mph', 'weather_wind_trend', 'week']), ('importance', {'drive_hist_count_l3': 22.25420379638672, 'drive_hist_count_prev': 4.328996181488037, 'drive_hist_td_drives_l3': 3.303638219833374, 'drive_hist_td_drives_prev': 4.992429256439209, 'drive_hist_td_rate_l3': 2.3106777667999268, 'drive_hist_td_rate_prev': 3.54589581489563, 'drive_hist_total_yards_l3': 12.366357803344727, 'drive_hist_total_yards_prev': 12.9301118850708, 'drive_hist_touch_drives_l3': 4.476215362548828, 'drive_hist_touch_drives_prev': 5.1545867919921875, 'drive_hist_touch_rate_prev': 2.2270007133483887, 'drive_hist_yards_per_drive_l3': 17.68923568725586, 'drive_hist_yards_per_drive_prev': 6.14043664932251, 'expected_carries': 4.068063259124756, 'expected_carries_raw': 4.403553485870361, 'expected_opportunities': 12.768014907836914, 'expected_opportunities_raw': 10.453889846801758, 'expected_receiving_yards': 8.034473419189453, 'expected_rushing_yards': 6.45242977142334, 'expected_targets': 3.854857921600342, 'expected_targets_raw': 2.977379322052002, 'expected_td_prob_poisson': 51.88859558105469, 'expected_td_prob_poisson_raw': 29.742591857910156, 'expected_td_signal': 25.72814178466797, 'expected_td_signal_raw': 29.4103946685791, 'expected_team_plays': 1.963468074798584, 'expected_total_yards': 15.344914436340332, 'position': 2.388518810272217, 'pred_availability': 1.6068334579467773, 'pred_availability_active': 1.9598534107208252, 'pred_availability_raw': 2.4126462936401367, 'pred_availability_snapshare': 1.8703349828720093, 'pred_efficiency_rec_yards': 5.83900260925293, 'pred_efficiency_rush_yards': 5.155553340911865, 'pred_efficiency_tds': 77.7385025024414, 'pred_team_pace': 3.664811849594116, 'pred_usage_carries': 4.9242777824401855, 'pred_usage_targets': 5.404415130615234, 'season': 3.4532644748687744, 'spread_line': 1.8308967351913452, 'travel_consecutive_home_games': 2.3219716548919678, 'travel_distance_km': 1.5486832857131958, 'travel_distance_km_l3': 1.328561544418335, 'travel_distance_miles': 2.0549566745758057, 'travel_game_timezone_offset': 1.6187328100204468, 'travel_local_start_hour': 2.186598539352417, 'travel_rest_days': 1.6390495300292969, 'travel_rest_days_l3': 1.3755898475646973, 'travel_rest_hours': 4.59040641784668, 'travel_team_timezone_offset': 1.5894732475280762, 'travel_time_diff_from_home_hours': 0.9084656834602356, 'travel_timezone_change_hours': 2.02656888961792, 'weather_cloud_cover_pct': 1.1075385808944702, 'weather_extreme_wind_flag': 2.709768295288086, 'weather_feels_like_f': 1.5291064977645874, 'weather_humidity_pct': 2.1326889991760254, 'weather_pressure_mb': 1.1504626274108887, 'weather_temp_air_f': 2.864535093307495, 'weather_visibility_miles': 2.99349308013916, 'weather_wind_gust_mph': 1.5324591398239136, 'weather_wind_mph': 2.148653745651245, 'week': 1.0179940462112427})]
+
+thinking
+**Adjusting script for dict handling**
+exec
+/bin/zsh -lc "/Users/jameswest/Desktop/nfl_predict/venv/bin/python - <<'PY'
+import json, pathlib, statistics
+feat_path = pathlib.Path('/Users/jameswest/Desktop/nfl_predict/output/metrics/anytime_td/xgboost/20251126_001001_ab12e68_cutoff_h090m/feature_importance.json')
+with open(feat_path) as f:
+    data = json.load(f)
+features = data.get('features', [])
+importance = data.get('importance', {})
+items = [(feat, importance.get(feat, 0)) for feat in features]
+items.sort(key=lambda x: x[1], reverse=True)
+print('Top 10 features:')
+for feat, imp in items[:10]:
+    print(f\"  {feat}: {imp}\")
+vals = [imp for _, imp in items]
+print('\\nImportance stats:')
+print('  count', len(vals))
+print('  min', min(vals) if vals else None)
+print('  max', max(vals) if vals else None)
+print('  mean', statistics.mean(vals) if vals else None)
+print('  median', statistics.median(vals) if vals else None)
+PY" in /Users/jameswest/Desktop/nfl_predict succeeded in 758ms:
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+Top 10 features:
+  pred_efficiency_tds: 77.7385025024414
+  expected_td_prob_poisson: 51.88859558105469
+  expected_td_prob_poisson_raw: 29.742591857910156
+  expected_td_signal_raw: 29.4103946685791
+  expected_td_signal: 25.72814178466797
+  drive_hist_count_l3: 22.25420379638672
+  drive_hist_yards_per_drive_l3: 17.68923568725586
+  expected_total_yards: 15.344914436340332
+  drive_hist_total_yards_prev: 12.9301118850708
+  expected_opportunities: 12.768014907836914
+
+Importance stats:
+  count 86
+  min 0
+  max 77.7385025024414
+  mean 5.458549114853837
+  median 2.0938228368759155
+
+thinking
+**Preparing to run pipeline command**
+exec
+/bin/zsh -lc '/Users/jameswest/Desktop/nfl_predict/venv/bin/python /Users/jameswest/Desktop/nfl_predict/main.py' in /Users/jameswest/Desktop/nfl_predict exited 124 in 2m 00s:
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+2025-11-26 05:49:49,825 - WARNING - /Users/jameswest/.matplotlib is not a writable directory
+2025-11-26 05:49:49,827 - WARNING - Matplotlib created a temporary cache directory at /var/folders/06/pn25p08s65114098gsqf5b5w0000gn/T/matplotlib-4vb0e7e_ because there was an issue with the default path (/Users/jameswest/.matplotlib); it is highly recommended to set the MPLCONFIGDIR environment variable to a writable directory, in particular to speed up the import of Matplotlib and to better support multiprocessing.
+INFO: ================================================================================
+2025-11-26 05:49:49,975 - INFO - ================================================================================
+INFO: NFL PLAYER PREDICTION PIPELINE
+2025-11-26 05:49:49,976 - INFO - NFL PLAYER PREDICTION PIPELINE
+INFO: ================================================================================
+2025-11-26 05:49:49,976 - INFO - ================================================================================
+INFO: Pipeline date range: 2021-09-09 → 2025-11-26
+2025-11-26 05:49:49,977 - INFO - Pipeline date range: 2021-09-09 → 2025-11-26
+INFO: 
+================================================================================
+2025-11-26 05:49:49,977 - INFO - 
+================================================================================
+INFO: STEP 1: DATA COLLECTION (INCREMENTAL)
+2025-11-26 05:49:49,977 - INFO - STEP 1: DATA COLLECTION (INCREMENTAL)
+INFO: ================================================================================
+2025-11-26 05:49:49,977 - INFO - ================================================================================
+2025-11-26 05:49:49,978 - INFO - 📥 Incremental update: Loading current season: [2025]
+
+thinking
+**Handling command timeout and rerun**
+exec
+/bin/zsh -lc '/Users/jameswest/Desktop/nfl_predict/venv/bin/python /Users/jameswest/Desktop/nfl_predict/main.py' in /Users/jameswest/Desktop/nfl_predict exited 124 in 30m 00s:
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+2025-11-26 05:51:54,633 - WARNING - /Users/jameswest/.matplotlib is not a writable directory
+2025-11-26 05:51:54,634 - WARNING - Matplotlib created a temporary cache directory at /var/folders/06/pn25p08s65114098gsqf5b5w0000gn/T/matplotlib-mb6qyn2q because there was an issue with the default path (/Users/jameswest/.matplotlib); it is highly recommended to set the MPLCONFIGDIR environment variable to a writable directory, in particular to speed up the import of Matplotlib and to better support multiprocessing.
+INFO: ================================================================================
+2025-11-26 05:51:54,742 - INFO - ================================================================================
+INFO: NFL PLAYER PREDICTION PIPELINE
+2025-11-26 05:51:54,742 - INFO - NFL PLAYER PREDICTION PIPELINE
+INFO: ================================================================================
+2025-11-26 05:51:54,742 - INFO - ================================================================================
+INFO: Pipeline date range: 2021-09-09 → 2025-11-26
+2025-11-26 05:51:54,743 - INFO - Pipeline date range: 2021-09-09 → 2025-11-26
+INFO: 
+================================================================================
+2025-11-26 05:51:54,743 - INFO - 
+================================================================================
+INFO: STEP 1: DATA COLLECTION (INCREMENTAL)
+2025-11-26 05:51:54,743 - INFO - STEP 1: DATA COLLECTION (INCREMENTAL)
+INFO: ================================================================================
+2025-11-26 05:51:54,743 - INFO - ================================================================================
+2025-11-26 05:51:54,744 - INFO - 📥 Incremental update: Loading current season: [2025]
+
+thinking
+**Investigating pipeline timeout and progress**
+
+The pipeline is timing out after 30 minutes, likely stuck due to repeated network-related warnings when fetching weather data. I’m checking logs and output directories to see if partial results exist or if the process is still running despite the timeout. The long runtime might be caused by network retries or subsequent training steps, so I’m considering extending the timeout and verifying progress through output metrics directories.
+exec
+/bin/zsh -lc 'ls -1t /Users/jameswest/Desktop/nfl_predict/output/metrics/anytime_td/xgboost | head' in /Users/jameswest/Desktop/nfl_predict succeeded in 885ms:
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+20251126_001001_ab12e68_cutoff_h090m
+20251125_013653_nogit_cutoff_h090m
+20251124_172142_nogit_cutoff_h090m
+20251124_171031_nogit_cutoff_h090m
+20251123_231806_nogit_cutoff_h090m
+20251123_210240_nogit_snap_zero_stub_cutoff_h090m
+20251123_020935_nogit_cutoff_h12h_bt_cutoff_h12h
+20251123_015013_nogit_cutoff_h06h_bt_cutoff_h06h
+20251123_012823_nogit_cutoff_h090m_smalltune_cutoff_h090m
+20251123_012458_nogit_cutoff_h03h_bt_cutoff_h03h
+
+thinking
+**Diagnosing pipeline timeout causes**
+
+I'm seeing the pipeline stalls due to repeated weather fetch attempts failing over a restricted network, causing long delays before metrics can be produced. To speed things up, I want to explore ways to skip or short-circuit the Visual Crossing weather fetch when offline—probably by using cache or environment flags—so the pipeline can finish training and produce metrics without hanging on network timeouts. I'll look into the relevant code in utils/collect/visual_crossing_weather.py and search for fetch or configuration options to support this.
+exec
+/bin/zsh -lc 'rg "visual_crossing" utils/collect -n' in /Users/jameswest/Desktop/nfl_predict succeeded in 829ms:
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+utils/collect/__init__.py:15:    - visual_crossing_weather: Weather data enrichment
+utils/collect/__init__.py:50:from .visual_crossing_weather import attach_visual_crossing_weather
+utils/collect/__init__.py:84:    'attach_visual_crossing_weather',
+utils/collect/weather_cache.py:142:        # Ensure project root is on sys.path so 'utils.collect.visual_crossing_weather' resolves to our local module
+utils/collect/weather_cache.py:151:        from .visual_crossing_weather import attach_visual_crossing_weather
+utils/collect/weather_cache.py:152:        weather_module = _imp.import_module('.visual_crossing_weather', package=__package__)
+utils/collect/weather_cache.py:186:            result = attach_visual_crossing_weather(weather_df)
+utils/collect/weather_cache.py:198:        logger.info("Skipping weather attachment: visual_crossing_weather module not available.")
+utils/collect/weather_forecasts.py:24:from utils.collect.visual_crossing_weather import (
+utils/collect/weather_forecasts.py:37:    provider: str = "visual_crossing"
+utils/collect/weather_forecasts.py:61:        provider=str(forecast_cfg.get("provider", "visual_crossing")),
+utils/collect/weather_forecasts.py:216:    if cfg.provider.lower() != "visual_crossing":
+utils/collect/visual_crossing_weather.py:10:    from utils.collect.visual_crossing_weather import attach_visual_crossing_weather
+utils/collect/visual_crossing_weather.py:11:    df_with_weather = attach_visual_crossing_weather(df)
+utils/collect/visual_crossing_weather.py:681:def attach_visual_crossing_weather(df: pd.DataFrame) -> pd.DataFrame:
+utils/collect/visual_crossing_weather.py:983:    df_with_weather = attach_visual_crossing_weather(df)
+
+thinking
+**Examining fetch logic in weather attachment**
+exec
+/bin/zsh -lc "sed -n '650,840p' utils/collect/visual_crossing_weather.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 3.08s:
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+            # Combine: fill only the rows that were missing
+            for col in available_weather_cols:
+                merged.loc[missing_mask, col] = merged.loc[missing_mask, col].fillna(
+                    forward_merged.loc[missing_mask, col]
+                )
+            filled_after = merged[sample_col].notna().sum()
+            added = filled_after - (len(merged) - missing_count)
+            logging.info(
+                f"  Forward merge filled {added} additional rows"
+            )
+    
+    # Restore original indices for reliable assignment back to the main df.
+    if '__orig_idx__' in merged.columns:
+        merged.set_index('__orig_idx__', inplace=True)
+        merged.index.name = None  # match df default
+        merged.drop(columns=['__orig_idx__'], inplace=True, errors='ignore')
+    
+    # DEBUG: Show merge results
+    logging.info(f"  Merge result: {len(merged)} rows (original: {len(team_data_merge)})")
+
+thinking
+**Locating fetch_weather_for_team_batch function**
+exec
+/bin/zsh -lc 'rg "fetch_weather_for_team_batch" -n utils/collect/visual_crossing_weather.py' in /Users/jameswest/Desktop/nfl_predict succeeded in 2.15s:
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+420:def fetch_weather_for_team_batch(team: str, buckets, cache: Dict) -> Dict:
+798:                    executor.submit(fetch_weather_for_team_batch, team, buckets, cache): team
+exec
+/bin/zsh -lc "sed -n '360,520p' utils/collect/visual_crossing_weather.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 2.13s:
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+                                if pd.isna(ts):
+                                    logging.warning(f"Team {team}: UTC conversion produced NaT for '{full_datetime_str}'")
+                                    continue
+                                
+                                # Floor to bucket size (already in UTC)
+                                bucket_time = ts.floor(f'{bucket_minutes}min')
+                                
+                                # DEBUG: Log the final bucket time
+                                logging.debug(f"Team {team}: Final bucket time: {bucket_time}")
+                                
+                                # Always include all hourly records (let merge_asof handle matching)
+                                if record.get('winddir') == '':
+                                    record['winddir'] = None
+                                if bucket_time not in weather_by_bucket:
+                                    record = convert_to_imperial(record)
+                                    
+                                    # AGENT FIX: Filter out None values and use windgust fallback for windspeed
+                                    weather_data = {}
+                                    for field in CORE_WEATHER_FIELDS:
+
+thinking
+**Locating network call function**
+exec
+/bin/zsh -lc 'rg "def fetch_weather_batch" -n utils/collect/visual_crossing_weather.py' in /Users/jameswest/Desktop/nfl_predict succeeded in 2.62s:
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+213:def fetch_weather_batch(lat: float, lon: float, start_time, end_time, team: str, tz: str = 'US/Eastern') -> Optional[Dict]:
+exec
+/bin/zsh -lc "sed -n '200,320p' utils/collect/visual_crossing_weather.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 3.71s:
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+        with open(temp_file, 'w') as f:
+            json.dump(cache_serializable, f, indent=2)
+        
+        # Atomic replace
+        temp_file.replace(cache_fp)
+        logging.info(f"Weather cache saved with {len(cache)} entries")
+    except Exception as e:
+        logging.error(f"Error saving weather cache: {e}")
+
+def get_cache_key(team: str, bucket_timestamp: pd.Timestamp) -> str:
+    """Generate cache key for team and bucket timestamp"""
+    return f"{team}_{bucket_timestamp.strftime('%Y-%m-%dT%H:%M:%S')}"
+
+def fetch_weather_batch(lat: float, lon: float, start_time, end_time, team: str, tz: str = 'US/Eastern') -> Optional[Dict]:
+    """
+    Fetch weather data for a time range with retry logic and rate limiting
+    
+    Args:
+        lat: Latitude
+
+thinking
+**Analyzing network failure handling for Visual Crossing**
+exec
+/bin/zsh -lc 'rg "offline" utils/collect/visual_crossing_weather.py' in /Users/jameswest/Desktop/nfl_predict exited 1 in 2.00s:
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+
+thinking
+**Evaluating environment variable for disabling weather fetch**
+
+thinking
+**Considering network restrictions and fallback options**
+
+thinking
+**Planning weather data fetch skip**
+
+thinking
+**Applying patch and adjusting retry settings**
+file update
+M /Users/jameswest/Desktop/nfl_predict/utils/collect/visual_crossing_weather.py
+@@ -434,2 +434,7 @@
+     logging.info(f"Team {team}: Bucket range: {min(buckets)} to {max(buckets)}")
++
++    # Allow offline runs to skip API calls and rely solely on the existing cache.
++    if os.environ.get("VC_SKIP_API") == "1":
++        logging.info("VC_SKIP_API=1 set; skipping Visual Crossing API fetch for this team and using cache only")
++        return {}
+     
+@@ -1022,2 +1027,2 @@
+ if __name__ == "__main__":
+-    test_weather_integration() 
+\ No newline at end of file
++    test_weather_integration() 
+apply_patch(auto_approved=true) exited 0 in 28ms:
+Success. Updated the following files:
+M utils/collect/visual_crossing_weather.py
+file update:
+diff --git a/utils/collect/visual_crossing_weather.py b/utils/collect/visual_crossing_weather.py
+index 33f0284b384909b1a1c59c37da85936e329ecae3..904451f4affe30283d5f06349581228cd38714d9
+--- a/utils/collect/visual_crossing_weather.py
++++ b/utils/collect/visual_crossing_weather.py
+@@ -432,6 +432,11 @@
+     logging.info(f"=== FETCH WEATHER FOR TEAM {team} START ===")
+     logging.info(f"Team {team}: Processing {len(buckets)} buckets")
+     logging.info(f"Team {team}: Bucket range: {min(buckets)} to {max(buckets)}")
++
++    # Allow offline runs to skip API calls and rely solely on the existing cache.
++    if os.environ.get("VC_SKIP_API") == "1":
++        logging.info("VC_SKIP_API=1 set; skipping Visual Crossing API fetch for this team and using cache only")
++        return {}
+     
+     if not buckets:
+         logging.warning(f"Team {team}: No buckets to process")
+@@ -1020,4 +1025,4 @@
+     return record
+ 
+ if __name__ == "__main__":
+-    test_weather_integration() 
+\ No newline at end of file
++    test_weather_integration() 
+
+file update:
+diff --git a/utils/collect/visual_crossing_weather.py b/utils/collect/visual_crossing_weather.py
+index 33f0284b384909b1a1c59c37da85936e329ecae3..904451f4affe30283d5f06349581228cd38714d9
+--- a/utils/collect/visual_crossing_weather.py
++++ b/utils/collect/visual_crossing_weather.py
+@@ -432,6 +432,11 @@
+     logging.info(f"=== FETCH WEATHER FOR TEAM {team} START ===")
+     logging.info(f"Team {team}: Processing {len(buckets)} buckets")
+     logging.info(f"Team {team}: Bucket range: {min(buckets)} to {max(buckets)}")
++
++    # Allow offline runs to skip API calls and rely solely on the existing cache.
++    if os.environ.get("VC_SKIP_API") == "1":
++        logging.info("VC_SKIP_API=1 set; skipping Visual Crossing API fetch for this team and using cache only")
++        return {}
+     
+     if not buckets:
+         logging.warning(f"Team {team}: No buckets to process")
+@@ -1020,4 +1025,4 @@
+     return record
+ 
+ if __name__ == "__main__":
+-    test_weather_integration() 
+\ No newline at end of file
++    test_weather_integration() 
+
+
+thinking
+**Rerunning pipeline with modified environment**
+exec
+/bin/zsh -lc 'VC_SKIP_API=1 /Users/jameswest/Desktop/nfl_predict/venv/bin/python /Users/jameswest/Desktop/nfl_predict/main.py' in /Users/jameswest/Desktop/nfl_predict exited 124 in 30m 00s:
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+2025-11-26 06:23:32,291 - WARNING - /Users/jameswest/.matplotlib is not a writable directory
+2025-11-26 06:23:32,291 - WARNING - Matplotlib created a temporary cache directory at /var/folders/06/pn25p08s65114098gsqf5b5w0000gn/T/matplotlib-ptd_2np_ because there was an issue with the default path (/Users/jameswest/.matplotlib); it is highly recommended to set the MPLCONFIGDIR environment variable to a writable directory, in particular to speed up the import of Matplotlib and to better support multiprocessing.
+INFO: ================================================================================
+2025-11-26 06:23:32,402 - INFO - ================================================================================
+INFO: NFL PLAYER PREDICTION PIPELINE
+2025-11-26 06:23:32,403 - INFO - NFL PLAYER PREDICTION PIPELINE
+INFO: ================================================================================
+2025-11-26 06:23:32,403 - INFO - ================================================================================
+INFO: Pipeline date range: 2021-09-09 → 2025-11-26
+2025-11-26 06:23:32,404 - INFO - Pipeline date range: 2021-09-09 → 2025-11-26
+INFO: 
+================================================================================
+2025-11-26 06:23:32,404 - INFO - 
+================================================================================
+INFO: STEP 1: DATA COLLECTION (INCREMENTAL)
+2025-11-26 06:23:32,404 - INFO - STEP 1: DATA COLLECTION (INCREMENTAL)
+INFO: ================================================================================
+2025-11-26 06:23:32,404 - INFO - ================================================================================
+2025-11-26 06:23:32,405 - INFO - 📥 Incremental update: Loading current season: [2025]
+file update:
+diff --git a/utils/collect/visual_crossing_weather.py b/utils/collect/visual_crossing_weather.py
+index 33f0284b384909b1a1c59c37da85936e329ecae3..904451f4affe30283d5f06349581228cd38714d9
+--- a/utils/collect/visual_crossing_weather.py
++++ b/utils/collect/visual_crossing_weather.py
+@@ -432,6 +432,11 @@
+     logging.info(f"=== FETCH WEATHER FOR TEAM {team} START ===")
+     logging.info(f"Team {team}: Processing {len(buckets)} buckets")
+     logging.info(f"Team {team}: Bucket range: {min(buckets)} to {max(buckets)}")
++
++    # Allow offline runs to skip API calls and rely solely on the existing cache.
++    if os.environ.get("VC_SKIP_API") == "1":
++        logging.info("VC_SKIP_API=1 set; skipping Visual Crossing API fetch for this team and using cache only")
++        return {}
+     
+     if not buckets:
+         logging.warning(f"Team {team}: No buckets to process")
+@@ -1020,4 +1025,4 @@
+     return record
+ 
+ if __name__ == "__main__":
+-    test_weather_integration() 
+\ No newline at end of file
++    test_weather_integration() 
+
+
+thinking
+**Investigating additional weather forecast module**
+exec
+/bin/zsh -lc "sed -n '1,220p' utils/collect/weather_forecasts.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 758ms:
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+from __future__ import annotations
+
+import datetime as dt
+import json
+import logging
+from dataclasses import dataclass
+from pathlib import Path
+from time import sleep
+from typing import Iterable, Optional, Sequence
+
+import pandas as pd
+import polars as pl
+import requests
+import yaml
+from zoneinfo import ZoneInfo
+
+from utils.collect.arrival_log import log_feed_arrivals
+from utils.collect.nfl_schedules import get_schedule
+from utils.general.paths import (
+file update:
+diff --git a/utils/collect/visual_crossing_weather.py b/utils/collect/visual_crossing_weather.py
+index 33f0284b384909b1a1c59c37da85936e329ecae3..904451f4affe30283d5f06349581228cd38714d9
+--- a/utils/collect/visual_crossing_weather.py
++++ b/utils/collect/visual_crossing_weather.py
+@@ -432,6 +432,11 @@
+     logging.info(f"=== FETCH WEATHER FOR TEAM {team} START ===")
+     logging.info(f"Team {team}: Processing {len(buckets)} buckets")
+     logging.info(f"Team {team}: Bucket range: {min(buckets)} to {max(buckets)}")
++
++    # Allow offline runs to skip API calls and rely solely on the existing cache.
++    if os.environ.get("VC_SKIP_API") == "1":
++        logging.info("VC_SKIP_API=1 set; skipping Visual Crossing API fetch for this team and using cache only")
++        return {}
+     
+     if not buckets:
+         logging.warning(f"Team {team}: No buckets to process")
+@@ -1020,4 +1025,4 @@
+     return record
+ 
+ if __name__ == "__main__":
+-    test_weather_integration() 
+\ No newline at end of file
++    test_weather_integration() 
+
+
+thinking
+**Adding environment variable check to skip API calls**
+file update
+M /Users/jameswest/Desktop/nfl_predict/utils/collect/weather_forecasts.py
+@@ -3,2 +3,3 @@
+ import datetime as dt
++import os
+ import json
+@@ -207,2 +208,6 @@
+     """
++    if os.environ.get("VC_SKIP_API") == "1":
++        logger.warning("VC_SKIP_API=1 set; skipping weather forecast collection and using existing snapshots.")
++        return []
++
+     if not seasons:
+@@ -512,2 +517 @@
+ __all__ = ["collect_weather_forecasts"]
+-
+apply_patch(auto_approved=true) exited 0 in 43ms:
+Success. Updated the following files:
+M utils/collect/weather_forecasts.py
+file update:
+diff --git a/utils/collect/visual_crossing_weather.py b/utils/collect/visual_crossing_weather.py
+index 33f0284b384909b1a1c59c37da85936e329ecae3..904451f4affe30283d5f06349581228cd38714d9
+--- a/utils/collect/visual_crossing_weather.py
++++ b/utils/collect/visual_crossing_weather.py
+@@ -432,6 +432,11 @@
+     logging.info(f"=== FETCH WEATHER FOR TEAM {team} START ===")
+     logging.info(f"Team {team}: Processing {len(buckets)} buckets")
+     logging.info(f"Team {team}: Bucket range: {min(buckets)} to {max(buckets)}")
++
++    # Allow offline runs to skip API calls and rely solely on the existing cache.
++    if os.environ.get("VC_SKIP_API") == "1":
++        logging.info("VC_SKIP_API=1 set; skipping Visual Crossing API fetch for this team and using cache only")
++        return {}
+     
+     if not buckets:
+         logging.warning(f"Team {team}: No buckets to process")
+@@ -1020,4 +1025,4 @@
+     return record
+ 
+ if __name__ == "__main__":
+-    test_weather_integration() 
+\ No newline at end of file
++    test_weather_integration() 
+diff --git a/utils/collect/weather_forecasts.py b/utils/collect/weather_forecasts.py
+index f3ec185d3209f6749d6454a6e616ccb42b6c2a79..07f9989c19dc425f6db6020d9e4fe822aa34ef0c
+--- a/utils/collect/weather_forecasts.py
++++ b/utils/collect/weather_forecasts.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import datetime as dt
++import os
+ import json
+ import logging
+ from dataclasses import dataclass
+@@ -205,6 +206,10 @@
+     list[Path]
+         Paths of parquet partitions written or updated.
+     """
++    if os.environ.get("VC_SKIP_API") == "1":
++        logger.warning("VC_SKIP_API=1 set; skipping weather forecast collection and using existing snapshots.")
++        return []
++
+     if not seasons:
+         logger.info("No seasons provided for weather forecast collection.")
+         return []
+@@ -510,4 +515,3 @@
+ 
+ 
+ __all__ = ["collect_weather_forecasts"]
+-
+
+file update:
+diff --git a/utils/collect/visual_crossing_weather.py b/utils/collect/visual_crossing_weather.py
+index 33f0284b384909b1a1c59c37da85936e329ecae3..904451f4affe30283d5f06349581228cd38714d9
+--- a/utils/collect/visual_crossing_weather.py
++++ b/utils/collect/visual_crossing_weather.py
+@@ -432,6 +432,11 @@
+     logging.info(f"=== FETCH WEATHER FOR TEAM {team} START ===")
+     logging.info(f"Team {team}: Processing {len(buckets)} buckets")
+     logging.info(f"Team {team}: Bucket range: {min(buckets)} to {max(buckets)}")
++
++    # Allow offline runs to skip API calls and rely solely on the existing cache.
++    if os.environ.get("VC_SKIP_API") == "1":
++        logging.info("VC_SKIP_API=1 set; skipping Visual Crossing API fetch for this team and using cache only")
++        return {}
+     
+     if not buckets:
+         logging.warning(f"Team {team}: No buckets to process")
+@@ -1020,4 +1025,4 @@
+     return record
+ 
+ if __name__ == "__main__":
+-    test_weather_integration() 
+\ No newline at end of file
++    test_weather_integration() 
+diff --git a/utils/collect/weather_forecasts.py b/utils/collect/weather_forecasts.py
+index f3ec185d3209f6749d6454a6e616ccb42b6c2a79..07f9989c19dc425f6db6020d9e4fe822aa34ef0c
+--- a/utils/collect/weather_forecasts.py
++++ b/utils/collect/weather_forecasts.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import datetime as dt
++import os
+ import json
+ import logging
+ from dataclasses import dataclass
+@@ -205,6 +206,10 @@
+     list[Path]
+         Paths of parquet partitions written or updated.
+     """
++    if os.environ.get("VC_SKIP_API") == "1":
++        logger.warning("VC_SKIP_API=1 set; skipping weather forecast collection and using existing snapshots.")
++        return []
++
+     if not seasons:
+         logger.info("No seasons provided for weather forecast collection.")
+         return []
+@@ -510,4 +515,3 @@
+ 
+ 
+ __all__ = ["collect_weather_forecasts"]
+-
+
+
+thinking
+**Rerunning pipeline with extended timeout**
+
+I'm preparing to rerun the pipeline with an environment variable set, hoping the process finishes faster this time by skipping the weather forecast fetch. The training might still take a long time—possibly over 30 minutes—so I'm considering increasing the timeout to 1 hour to avoid premature termination before completion. I'll run the command again without cleaning previous partial results, relying on caches to speed things up.
+exec
+/bin/zsh -lc 'VC_SKIP_API=1 /Users/jameswest/Desktop/nfl_predict/venv/bin/python /Users/jameswest/Desktop/nfl_predict/main.py' in /Users/jameswest/Desktop/nfl_predict exited 1 in 14m 08s:
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+2025-11-26 06:53:52,667 - WARNING - /Users/jameswest/.matplotlib is not a writable directory
+2025-11-26 06:53:52,667 - WARNING - Matplotlib created a temporary cache directory at /var/folders/06/pn25p08s65114098gsqf5b5w0000gn/T/matplotlib-n3a1rbyg because there was an issue with the default path (/Users/jameswest/.matplotlib); it is highly recommended to set the MPLCONFIGDIR environment variable to a writable directory, in particular to speed up the import of Matplotlib and to better support multiprocessing.
+INFO: ================================================================================
+2025-11-26 06:53:52,793 - INFO - ================================================================================
+INFO: NFL PLAYER PREDICTION PIPELINE
+2025-11-26 06:53:52,794 - INFO - NFL PLAYER PREDICTION PIPELINE
+INFO: ================================================================================
+2025-11-26 06:53:52,797 - INFO - ================================================================================
+INFO: Pipeline date range: 2021-09-09 → 2025-11-26
+2025-11-26 06:53:52,797 - INFO - Pipeline date range: 2021-09-09 → 2025-11-26
+INFO: 
+================================================================================
+2025-11-26 06:53:52,797 - INFO - 
+================================================================================
+INFO: STEP 1: DATA COLLECTION (INCREMENTAL)
+2025-11-26 06:53:52,798 - INFO - STEP 1: DATA COLLECTION (INCREMENTAL)
+INFO: ================================================================================
+2025-11-26 06:53:52,798 - INFO - ================================================================================
+2025-11-26 06:53:52,798 - INFO - 📥 Incremental update: Loading current season: [2025]
+file update:
+diff --git a/utils/collect/visual_crossing_weather.py b/utils/collect/visual_crossing_weather.py
+index 33f0284b384909b1a1c59c37da85936e329ecae3..904451f4affe30283d5f06349581228cd38714d9
+--- a/utils/collect/visual_crossing_weather.py
++++ b/utils/collect/visual_crossing_weather.py
+@@ -432,6 +432,11 @@
+     logging.info(f"=== FETCH WEATHER FOR TEAM {team} START ===")
+     logging.info(f"Team {team}: Processing {len(buckets)} buckets")
+     logging.info(f"Team {team}: Bucket range: {min(buckets)} to {max(buckets)}")
++
++    # Allow offline runs to skip API calls and rely solely on the existing cache.
++    if os.environ.get("VC_SKIP_API") == "1":
++        logging.info("VC_SKIP_API=1 set; skipping Visual Crossing API fetch for this team and using cache only")
++        return {}
+     
+     if not buckets:
+         logging.warning(f"Team {team}: No buckets to process")
+@@ -1020,4 +1025,4 @@
+     return record
+ 
+ if __name__ == "__main__":
+-    test_weather_integration() 
+\ No newline at end of file
++    test_weather_integration() 
+diff --git a/utils/collect/weather_forecasts.py b/utils/collect/weather_forecasts.py
+index f3ec185d3209f6749d6454a6e616ccb42b6c2a79..07f9989c19dc425f6db6020d9e4fe822aa34ef0c
+--- a/utils/collect/weather_forecasts.py
++++ b/utils/collect/weather_forecasts.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import datetime as dt
++import os
+ import json
+ import logging
+ from dataclasses import dataclass
+@@ -205,6 +206,10 @@
+     list[Path]
+         Paths of parquet partitions written or updated.
+     """
++    if os.environ.get("VC_SKIP_API") == "1":
++        logger.warning("VC_SKIP_API=1 set; skipping weather forecast collection and using existing snapshots.")
++        return []
++
+     if not seasons:
+         logger.info("No seasons provided for weather forecast collection.")
+         return []
+@@ -510,4 +515,3 @@
+ 
+ 
+ __all__ = ["collect_weather_forecasts"]
+-
+
+
+thinking
+**Fixing undefined variable error**
+exec
+/bin/zsh -lc "sed -n '2040,2100p' pipeline/train.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 752ms:
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+                        *self.feature_columns,
+                    ]
+                else:
+                    # Regression: use regression-specific logic
+                    analysis_df['true_value'] = y_test
+                    analysis_df['predicted_value'] = y_pred
+                    analysis_df['absolute_error'] = np.abs(y_test - y_pred)
+                    analysis_df['squared_error'] = (y_test - y_pred) ** 2
+                    analysis_df['relative_error'] = np.abs(y_test - y_pred) / (np.abs(y_test) + 1e-8)
+
+                    slim_cols = [
+                        "true_value",
+                        "predicted_value",
+                        "absolute_error",
+                        "squared_error",
+                        "relative_error",
+                        *self.feature_columns,
+                    ]
+
+file update:
+diff --git a/utils/collect/visual_crossing_weather.py b/utils/collect/visual_crossing_weather.py
+index 33f0284b384909b1a1c59c37da85936e329ecae3..904451f4affe30283d5f06349581228cd38714d9
+--- a/utils/collect/visual_crossing_weather.py
++++ b/utils/collect/visual_crossing_weather.py
+@@ -432,6 +432,11 @@
+     logging.info(f"=== FETCH WEATHER FOR TEAM {team} START ===")
+     logging.info(f"Team {team}: Processing {len(buckets)} buckets")
+     logging.info(f"Team {team}: Bucket range: {min(buckets)} to {max(buckets)}")
++
++    # Allow offline runs to skip API calls and rely solely on the existing cache.
++    if os.environ.get("VC_SKIP_API") == "1":
++        logging.info("VC_SKIP_API=1 set; skipping Visual Crossing API fetch for this team and using cache only")
++        return {}
+     
+     if not buckets:
+         logging.warning(f"Team {team}: No buckets to process")
+@@ -1020,4 +1025,4 @@
+     return record
+ 
+ if __name__ == "__main__":
+-    test_weather_integration() 
+\ No newline at end of file
++    test_weather_integration() 
+diff --git a/utils/collect/weather_forecasts.py b/utils/collect/weather_forecasts.py
+index f3ec185d3209f6749d6454a6e616ccb42b6c2a79..07f9989c19dc425f6db6020d9e4fe822aa34ef0c
+--- a/utils/collect/weather_forecasts.py
++++ b/utils/collect/weather_forecasts.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import datetime as dt
++import os
+ import json
+ import logging
+ from dataclasses import dataclass
+@@ -205,6 +206,10 @@
+     list[Path]
+         Paths of parquet partitions written or updated.
+     """
++    if os.environ.get("VC_SKIP_API") == "1":
++        logger.warning("VC_SKIP_API=1 set; skipping weather forecast collection and using existing snapshots.")
++        return []
++
+     if not seasons:
+         logger.info("No seasons provided for weather forecast collection.")
+         return []
+@@ -510,4 +515,3 @@
+ 
+ 
+ __all__ = ["collect_weather_forecasts"]
+-
+
+
+thinking
+**Investigating undefined variable usage**
+exec
+/bin/zsh -lc 'rg "problem_copy" -n pipeline/train.py' in /Users/jameswest/Desktop/nfl_predict succeeded in 741ms:
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+2076:        save_inference_artifacts(self, problem_name, problem_copy)
+2164:            problem_copy = copy.deepcopy(problem)
+2165:            self.target_col = problem_copy['target_col']
+2166:            derived_cfg = problem_copy.get('derived_target')
+2172:                        f"Problem '{problem_copy['name']}' missing source_col for derived target."
+2226:                include_prefixes = tuple(problem_copy.get('feature_prefixes_to_include') or [])
+2227:                other_features = problem_copy.get('other_features_to_include') or []
+2242:            input_preds = problem_copy.get('input_predictions', [])
+2271:            df_problem = self._apply_problem_level_overrides(df_problem, problem_copy)
+2330:            if is_classification(problem_copy):
+2336:                self._fit_feature_artifacts(df_train, problem_copy)
+2337:                save_inference_artifacts(self, problem_name, problem_copy)
+2349:            sample_weight_train = self._compute_sample_weights(df_train, problem_copy)
+2350:            sample_weight_val = self._compute_sample_weights(df_val, problem_copy) if not df_val.empty else pd.Series([], dtype=np.float32)
+2361:                        problem_copy,
+2383:            sample_weight_train_full = self._compute_sample_weights(df_train_full, problem_copy)
+2402:                problem_copy,
+file update:
+diff --git a/utils/collect/visual_crossing_weather.py b/utils/collect/visual_crossing_weather.py
+index 33f0284b384909b1a1c59c37da85936e329ecae3..904451f4affe30283d5f06349581228cd38714d9
+--- a/utils/collect/visual_crossing_weather.py
++++ b/utils/collect/visual_crossing_weather.py
+@@ -432,6 +432,11 @@
+     logging.info(f"=== FETCH WEATHER FOR TEAM {team} START ===")
+     logging.info(f"Team {team}: Processing {len(buckets)} buckets")
+     logging.info(f"Team {team}: Bucket range: {min(buckets)} to {max(buckets)}")
++
++    # Allow offline runs to skip API calls and rely solely on the existing cache.
++    if os.environ.get("VC_SKIP_API") == "1":
++        logging.info("VC_SKIP_API=1 set; skipping Visual Crossing API fetch for this team and using cache only")
++        return {}
+     
+     if not buckets:
+         logging.warning(f"Team {team}: No buckets to process")
+@@ -1020,4 +1025,4 @@
+     return record
+ 
+ if __name__ == "__main__":
+-    test_weather_integration() 
+\ No newline at end of file
++    test_weather_integration() 
+diff --git a/utils/collect/weather_forecasts.py b/utils/collect/weather_forecasts.py
+index f3ec185d3209f6749d6454a6e616ccb42b6c2a79..07f9989c19dc425f6db6020d9e4fe822aa34ef0c
+--- a/utils/collect/weather_forecasts.py
++++ b/utils/collect/weather_forecasts.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import datetime as dt
++import os
+ import json
+ import logging
+ from dataclasses import dataclass
+@@ -205,6 +206,10 @@
+     list[Path]
+         Paths of parquet partitions written or updated.
+     """
++    if os.environ.get("VC_SKIP_API") == "1":
++        logger.warning("VC_SKIP_API=1 set; skipping weather forecast collection and using existing snapshots.")
++        return []
++
+     if not seasons:
+         logger.info("No seasons provided for weather forecast collection.")
+         return []
+@@ -510,4 +515,3 @@
+ 
+ 
+ __all__ = ["collect_weather_forecasts"]
+-
+
+
+thinking
+**Tracing method and variable scope**
+exec
+/bin/zsh -lc "sed -n '1970,2090p' pipeline/train.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 729ms:
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+                        'calibration_method': best_method,
+                        'calibration_ece_oof': round(best_ece, 6) if best_ece is not None else None,
+                    }
+            else:
+                # Regression: generate direct predictions
+                y_pred = final_model.predict(X_test)
+                
+                # Regression metrics
+                rmse = float(np.sqrt(mean_squared_error(y_test, y_pred)))
+                mae = float(mean_absolute_error(y_test, y_pred))
+                r2 = float(r2_score(y_test, y_pred))
+                
+                logger.info(f"Regression metrics — RMSE={rmse:.4f}, MAE={mae:.4f}, R²={r2:.4f}")
+                
+                metrics = {
+                    'rmse': rmse,
+                    'mae': mae,
+                    'r2': r2,
+                }
+file update:
+diff --git a/utils/collect/visual_crossing_weather.py b/utils/collect/visual_crossing_weather.py
+index 33f0284b384909b1a1c59c37da85936e329ecae3..904451f4affe30283d5f06349581228cd38714d9
+--- a/utils/collect/visual_crossing_weather.py
++++ b/utils/collect/visual_crossing_weather.py
+@@ -432,6 +432,11 @@
+     logging.info(f"=== FETCH WEATHER FOR TEAM {team} START ===")
+     logging.info(f"Team {team}: Processing {len(buckets)} buckets")
+     logging.info(f"Team {team}: Bucket range: {min(buckets)} to {max(buckets)}")
++
++    # Allow offline runs to skip API calls and rely solely on the existing cache.
++    if os.environ.get("VC_SKIP_API") == "1":
++        logging.info("VC_SKIP_API=1 set; skipping Visual Crossing API fetch for this team and using cache only")
++        return {}
+     
+     if not buckets:
+         logging.warning(f"Team {team}: No buckets to process")
+@@ -1020,4 +1025,4 @@
+     return record
+ 
+ if __name__ == "__main__":
+-    test_weather_integration() 
+\ No newline at end of file
++    test_weather_integration() 
+diff --git a/utils/collect/weather_forecasts.py b/utils/collect/weather_forecasts.py
+index f3ec185d3209f6749d6454a6e616ccb42b6c2a79..07f9989c19dc425f6db6020d9e4fe822aa34ef0c
+--- a/utils/collect/weather_forecasts.py
++++ b/utils/collect/weather_forecasts.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import datetime as dt
++import os
+ import json
+ import logging
+ from dataclasses import dataclass
+@@ -205,6 +206,10 @@
+     list[Path]
+         Paths of parquet partitions written or updated.
+     """
++    if os.environ.get("VC_SKIP_API") == "1":
++        logger.warning("VC_SKIP_API=1 set; skipping weather forecast collection and using existing snapshots.")
++        return []
++
+     if not seasons:
+         logger.info("No seasons provided for weather forecast collection.")
+         return []
+@@ -510,4 +515,3 @@
+ 
+ 
+ __all__ = ["collect_weather_forecasts"]
+-
+
+
+thinking
+**Inspecting function for variable scope**
+exec
+/bin/zsh -lc "sed -n '1860,1950p' pipeline/train.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 730ms:
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+
+                if is_selective_model:
+                    # Selective model: use argmax decision rule (no thresholds)
+                    logger.info("Generating predictions from selective model...")
+                    y_pred = final_model.predict(X_test)  # Returns {-1, 0, 1}
+                    y_pred_proba = final_model.predict_proba(X_test)  # For metrics only
+                    coverage = np.mean(y_pred != -1)  # Abstain rate
+                else:
+                    # Regular classification: generate probabilities and thresholded predictions
+                    y_pred_proba = predict_proba_batched(final_model, X_test, model_features)
+                    y_pred = (y_pred_proba >= best_thresh).astype(np.int8) if best_thresh is not None else (y_pred_proba >= 0.5).astype(np.int8)
+
+                # Classification metrics
+                if is_selective_model:
+                    # For selective models, compute metrics on accepted examples only
+                    accepted_mask = (y_pred != -1)
+                    y_test_accepted = y_test[accepted_mask]
+                    y_pred_accepted = y_pred[accepted_mask]
+                    # Wrapper returns [p_pos, p_neg, p_abstain] – use column 0 for positive class
+file update:
+diff --git a/utils/collect/visual_crossing_weather.py b/utils/collect/visual_crossing_weather.py
+index 33f0284b384909b1a1c59c37da85936e329ecae3..904451f4affe30283d5f06349581228cd38714d9
+--- a/utils/collect/visual_crossing_weather.py
++++ b/utils/collect/visual_crossing_weather.py
+@@ -432,6 +432,11 @@
+     logging.info(f"=== FETCH WEATHER FOR TEAM {team} START ===")
+     logging.info(f"Team {team}: Processing {len(buckets)} buckets")
+     logging.info(f"Team {team}: Bucket range: {min(buckets)} to {max(buckets)}")
++
++    # Allow offline runs to skip API calls and rely solely on the existing cache.
++    if os.environ.get("VC_SKIP_API") == "1":
++        logging.info("VC_SKIP_API=1 set; skipping Visual Crossing API fetch for this team and using cache only")
++        return {}
+     
+     if not buckets:
+         logging.warning(f"Team {team}: No buckets to process")
+@@ -1020,4 +1025,4 @@
+     return record
+ 
+ if __name__ == "__main__":
+-    test_weather_integration() 
+\ No newline at end of file
++    test_weather_integration() 
+diff --git a/utils/collect/weather_forecasts.py b/utils/collect/weather_forecasts.py
+index f3ec185d3209f6749d6454a6e616ccb42b6c2a79..07f9989c19dc425f6db6020d9e4fe822aa34ef0c
+--- a/utils/collect/weather_forecasts.py
++++ b/utils/collect/weather_forecasts.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import datetime as dt
++import os
+ import json
+ import logging
+ from dataclasses import dataclass
+@@ -205,6 +206,10 @@
+     list[Path]
+         Paths of parquet partitions written or updated.
+     """
++    if os.environ.get("VC_SKIP_API") == "1":
++        logger.warning("VC_SKIP_API=1 set; skipping weather forecast collection and using existing snapshots.")
++        return []
++
+     if not seasons:
+         logger.info("No seasons provided for weather forecast collection.")
+         return []
+@@ -510,4 +515,3 @@
+ 
+ 
+ __all__ = ["collect_weather_forecasts"]
+-
+
+
+thinking
+**Searching for function definition**
+exec
+/bin/zsh -lc 'rg "def train_and_evaluate_models" -n -n pipeline/train.py' in /Users/jameswest/Desktop/nfl_predict succeeded in 747ms:
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+1162:    def train_and_evaluate_models(
+file update:
+diff --git a/utils/collect/visual_crossing_weather.py b/utils/collect/visual_crossing_weather.py
+index 33f0284b384909b1a1c59c37da85936e329ecae3..904451f4affe30283d5f06349581228cd38714d9
+--- a/utils/collect/visual_crossing_weather.py
++++ b/utils/collect/visual_crossing_weather.py
+@@ -432,6 +432,11 @@
+     logging.info(f"=== FETCH WEATHER FOR TEAM {team} START ===")
+     logging.info(f"Team {team}: Processing {len(buckets)} buckets")
+     logging.info(f"Team {team}: Bucket range: {min(buckets)} to {max(buckets)}")
++
++    # Allow offline runs to skip API calls and rely solely on the existing cache.
++    if os.environ.get("VC_SKIP_API") == "1":
++        logging.info("VC_SKIP_API=1 set; skipping Visual Crossing API fetch for this team and using cache only")
++        return {}
+     
+     if not buckets:
+         logging.warning(f"Team {team}: No buckets to process")
+@@ -1020,4 +1025,4 @@
+     return record
+ 
+ if __name__ == "__main__":
+-    test_weather_integration() 
+\ No newline at end of file
++    test_weather_integration() 
+diff --git a/utils/collect/weather_forecasts.py b/utils/collect/weather_forecasts.py
+index f3ec185d3209f6749d6454a6e616ccb42b6c2a79..07f9989c19dc425f6db6020d9e4fe822aa34ef0c
+--- a/utils/collect/weather_forecasts.py
++++ b/utils/collect/weather_forecasts.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import datetime as dt
++import os
+ import json
+ import logging
+ from dataclasses import dataclass
+@@ -205,6 +206,10 @@
+     list[Path]
+         Paths of parquet partitions written or updated.
+     """
++    if os.environ.get("VC_SKIP_API") == "1":
++        logger.warning("VC_SKIP_API=1 set; skipping weather forecast collection and using existing snapshots.")
++        return []
++
+     if not seasons:
+         logger.info("No seasons provided for weather forecast collection.")
+         return []
+@@ -510,4 +515,3 @@
+ 
+ 
+ __all__ = ["collect_weather_forecasts"]
+-
+
+exec
+/bin/zsh -lc "sed -n '1160,1205p' pipeline/train.py" in /Users/jameswest/Desktop/nfl_predict succeeded in 736ms:
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+        return oof_preds
+
+    def train_and_evaluate_models(
+        self,
+        problem_config,
+        X_train_full,
+        y_train_full,
+        X_test,
+        y_test,
+        df_test_full,
+        sample_weight_train_full=None,
+    ):
+        """Train, evaluate, and store each model for the given problem.
+
+        Parameters
+        ----------
+        problem_config : dict
+        X_train_full, y_train_full : pd.DataFrame / pd.Series
+            Training data.
+file update:
+diff --git a/utils/collect/visual_crossing_weather.py b/utils/collect/visual_crossing_weather.py
+index 33f0284b384909b1a1c59c37da85936e329ecae3..904451f4affe30283d5f06349581228cd38714d9
+--- a/utils/collect/visual_crossing_weather.py
++++ b/utils/collect/visual_crossing_weather.py
+@@ -432,6 +432,11 @@
+     logging.info(f"=== FETCH WEATHER FOR TEAM {team} START ===")
+     logging.info(f"Team {team}: Processing {len(buckets)} buckets")
+     logging.info(f"Team {team}: Bucket range: {min(buckets)} to {max(buckets)}")
++
++    # Allow offline runs to skip API calls and rely solely on the existing cache.
++    if os.environ.get("VC_SKIP_API") == "1":
++        logging.info("VC_SKIP_API=1 set; skipping Visual Crossing API fetch for this team and using cache only")
++        return {}
+     
+     if not buckets:
+         logging.warning(f"Team {team}: No buckets to process")
+@@ -1020,4 +1025,4 @@
+     return record
+ 
+ if __name__ == "__main__":
+-    test_weather_integration() 
+\ No newline at end of file
++    test_weather_integration() 
+diff --git a/utils/collect/weather_forecasts.py b/utils/collect/weather_forecasts.py
+index f3ec185d3209f6749d6454a6e616ccb42b6c2a79..07f9989c19dc425f6db6020d9e4fe822aa34ef0c
+--- a/utils/collect/weather_forecasts.py
++++ b/utils/collect/weather_forecasts.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import datetime as dt
++import os
+ import json
+ import logging
+ from dataclasses import dataclass
+@@ -205,6 +206,10 @@
+     list[Path]
+         Paths of parquet partitions written or updated.
+     """
++    if os.environ.get("VC_SKIP_API") == "1":
++        logger.warning("VC_SKIP_API=1 set; skipping weather forecast collection and using existing snapshots.")
++        return []
++
+     if not seasons:
+         logger.info("No seasons provided for weather forecast collection.")
+         return []
+@@ -510,4 +515,3 @@
+ 
+ 
+ __all__ = ["collect_weather_forecasts"]
+-
+
+
+thinking
+**Fixing parameter usage in artifact saving**
+file update
+M /Users/jameswest/Desktop/nfl_predict/pipeline/train.py
+@@ -2075,3 +2075,3 @@
+         # This ensures the state (imputation, categories) is from the pre-tuning/pre-holdout phase.
+-        save_inference_artifacts(self, problem_name, problem_copy)
++        save_inference_artifacts(self, problem_name, problem_config)
+ 
+apply_patch(auto_approved=true) exited 0 in 55ms:
+Success. Updated the following files:
+M pipeline/train.py
+file update:
+diff --git a/pipeline/train.py b/pipeline/train.py
+index 30c70ab8292088cc8aad350882ef2c5e8cc7efa6..265bc29f4861d2d4d26f54fd7f77304de8fe6742
+--- a/pipeline/train.py
++++ b/pipeline/train.py
+@@ -2073,7 +2073,7 @@
+ 
+         # --- Save inference artifacts AFTER all models for the problem are trained ---
+         # This ensures the state (imputation, categories) is from the pre-tuning/pre-holdout phase.
+-        save_inference_artifacts(self, problem_name, problem_copy)
++        save_inference_artifacts(self, problem_name, problem_config)
+ 
+     def _unwrap_base_model(self, model):
+         """Return the true fitted estimator, no matter how it's wrapped."""
+diff --git a/utils/collect/visual_crossing_weather.py b/utils/collect/visual_crossing_weather.py
+index 33f0284b384909b1a1c59c37da85936e329ecae3..904451f4affe30283d5f06349581228cd38714d9
+--- a/utils/collect/visual_crossing_weather.py
++++ b/utils/collect/visual_crossing_weather.py
+@@ -432,6 +432,11 @@
+     logging.info(f"=== FETCH WEATHER FOR TEAM {team} START ===")
+     logging.info(f"Team {team}: Processing {len(buckets)} buckets")
+     logging.info(f"Team {team}: Bucket range: {min(buckets)} to {max(buckets)}")
++
++    # Allow offline runs to skip API calls and rely solely on the existing cache.
++    if os.environ.get("VC_SKIP_API") == "1":
++        logging.info("VC_SKIP_API=1 set; skipping Visual Crossing API fetch for this team and using cache only")
++        return {}
+     
+     if not buckets:
+         logging.warning(f"Team {team}: No buckets to process")
+@@ -1020,4 +1025,4 @@
+     return record
+ 
+ if __name__ == "__main__":
+-    test_weather_integration() 
+\ No newline at end of file
++    test_weather_integration() 
+diff --git a/utils/collect/weather_forecasts.py b/utils/collect/weather_forecasts.py
+index f3ec185d3209f6749d6454a6e616ccb42b6c2a79..07f9989c19dc425f6db6020d9e4fe822aa34ef0c
+--- a/utils/collect/weather_forecasts.py
++++ b/utils/collect/weather_forecasts.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import datetime as dt
++import os
+ import json
+ import logging
+ from dataclasses import dataclass
+@@ -205,6 +206,10 @@
+     list[Path]
+         Paths of parquet partitions written or updated.
+     """
++    if os.environ.get("VC_SKIP_API") == "1":
++        logger.warning("VC_SKIP_API=1 set; skipping weather forecast collection and using existing snapshots.")
++        return []
++
+     if not seasons:
+         logger.info("No seasons provided for weather forecast collection.")
+         return []
+@@ -510,4 +515,3 @@
+ 
+ 
+ __all__ = ["collect_weather_forecasts"]
+-
+
+file update:
+diff --git a/pipeline/train.py b/pipeline/train.py
+index 30c70ab8292088cc8aad350882ef2c5e8cc7efa6..265bc29f4861d2d4d26f54fd7f77304de8fe6742
+--- a/pipeline/train.py
++++ b/pipeline/train.py
+@@ -2073,7 +2073,7 @@
+ 
+         # --- Save inference artifacts AFTER all models for the problem are trained ---
+         # This ensures the state (imputation, categories) is from the pre-tuning/pre-holdout phase.
+-        save_inference_artifacts(self, problem_name, problem_copy)
++        save_inference_artifacts(self, problem_name, problem_config)
+ 
+     def _unwrap_base_model(self, model):
+         """Return the true fitted estimator, no matter how it's wrapped."""
+diff --git a/utils/collect/visual_crossing_weather.py b/utils/collect/visual_crossing_weather.py
+index 33f0284b384909b1a1c59c37da85936e329ecae3..904451f4affe30283d5f06349581228cd38714d9
+--- a/utils/collect/visual_crossing_weather.py
++++ b/utils/collect/visual_crossing_weather.py
+@@ -432,6 +432,11 @@
+     logging.info(f"=== FETCH WEATHER FOR TEAM {team} START ===")
+     logging.info(f"Team {team}: Processing {len(buckets)} buckets")
+     logging.info(f"Team {team}: Bucket range: {min(buckets)} to {max(buckets)}")
++
++    # Allow offline runs to skip API calls and rely solely on the existing cache.
++    if os.environ.get("VC_SKIP_API") == "1":
++        logging.info("VC_SKIP_API=1 set; skipping Visual Crossing API fetch for this team and using cache only")
++        return {}
+     
+     if not buckets:
+         logging.warning(f"Team {team}: No buckets to process")
+@@ -1020,4 +1025,4 @@
+     return record
+ 
+ if __name__ == "__main__":
+-    test_weather_integration() 
+\ No newline at end of file
++    test_weather_integration() 
+diff --git a/utils/collect/weather_forecasts.py b/utils/collect/weather_forecasts.py
+index f3ec185d3209f6749d6454a6e616ccb42b6c2a79..07f9989c19dc425f6db6020d9e4fe822aa34ef0c
+--- a/utils/collect/weather_forecasts.py
++++ b/utils/collect/weather_forecasts.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import datetime as dt
++import os
+ import json
+ import logging
+ from dataclasses import dataclass
+@@ -205,6 +206,10 @@
+     list[Path]
+         Paths of parquet partitions written or updated.
+     """
++    if os.environ.get("VC_SKIP_API") == "1":
++        logger.warning("VC_SKIP_API=1 set; skipping weather forecast collection and using existing snapshots.")
++        return []
++
+     if not seasons:
+         logger.info("No seasons provided for weather forecast collection.")
+         return []
+@@ -510,4 +515,3 @@
+ 
+ 
+ __all__ = ["collect_weather_forecasts"]
+-
+
+
+thinking
+**Preparing to rerun pipeline with environment variable**
+exec
+/bin/zsh -lc 'VC_SKIP_API=1 /Users/jameswest/Desktop/nfl_predict/venv/bin/python /Users/jameswest/Desktop/nfl_predict/main.py' in /Users/jameswest/Desktop/nfl_predict succeeded in 17m 46s:
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+2025-11-26 07:08:43,987 - WARNING - /Users/jameswest/.matplotlib is not a writable directory
+2025-11-26 07:08:43,988 - WARNING - Matplotlib created a temporary cache directory at /var/folders/06/pn25p08s65114098gsqf5b5w0000gn/T/matplotlib-yr6kb2lx because there was an issue with the default path (/Users/jameswest/.matplotlib); it is highly recommended to set the MPLCONFIGDIR environment variable to a writable directory, in particular to speed up the import of Matplotlib and to better support multiprocessing.
+INFO: ================================================================================
+2025-11-26 07:08:44,121 - INFO - ================================================================================
+INFO: NFL PLAYER PREDICTION PIPELINE
+2025-11-26 07:08:44,121 - INFO - NFL PLAYER PREDICTION PIPELINE
+INFO: ================================================================================
+2025-11-26 07:08:44,122 - INFO - ================================================================================
+INFO: Pipeline date range: 2021-09-09 → 2025-11-26
+2025-11-26 07:08:44,122 - INFO - Pipeline date range: 2021-09-09 → 2025-11-26
+INFO: 
+================================================================================
+2025-11-26 07:08:44,122 - INFO - 
+================================================================================
+INFO: STEP 1: DATA COLLECTION (INCREMENTAL)
+2025-11-26 07:08:44,122 - INFO - STEP 1: DATA COLLECTION (INCREMENTAL)
+INFO: ================================================================================
+2025-11-26 07:08:44,123 - INFO - ================================================================================
+2025-11-26 07:08:44,123 - INFO - 📥 Incremental update: Loading current season: [2025]
+file update:
+diff --git a/pipeline/train.py b/pipeline/train.py
+index 30c70ab8292088cc8aad350882ef2c5e8cc7efa6..265bc29f4861d2d4d26f54fd7f77304de8fe6742
+--- a/pipeline/train.py
++++ b/pipeline/train.py
+@@ -2073,7 +2073,7 @@
+ 
+         # --- Save inference artifacts AFTER all models for the problem are trained ---
+         # This ensures the state (imputation, categories) is from the pre-tuning/pre-holdout phase.
+-        save_inference_artifacts(self, problem_name, problem_copy)
++        save_inference_artifacts(self, problem_name, problem_config)
+ 
+     def _unwrap_base_model(self, model):
+         """Return the true fitted estimator, no matter how it's wrapped."""
+diff --git a/utils/collect/visual_crossing_weather.py b/utils/collect/visual_crossing_weather.py
+index 33f0284b384909b1a1c59c37da85936e329ecae3..904451f4affe30283d5f06349581228cd38714d9
+--- a/utils/collect/visual_crossing_weather.py
++++ b/utils/collect/visual_crossing_weather.py
+@@ -432,6 +432,11 @@
+     logging.info(f"=== FETCH WEATHER FOR TEAM {team} START ===")
+     logging.info(f"Team {team}: Processing {len(buckets)} buckets")
+     logging.info(f"Team {team}: Bucket range: {min(buckets)} to {max(buckets)}")
++
++    # Allow offline runs to skip API calls and rely solely on the existing cache.
++    if os.environ.get("VC_SKIP_API") == "1":
++        logging.info("VC_SKIP_API=1 set; skipping Visual Crossing API fetch for this team and using cache only")
++        return {}
+     
+     if not buckets:
+         logging.warning(f"Team {team}: No buckets to process")
+@@ -1020,4 +1025,4 @@
+     return record
+ 
+ if __name__ == "__main__":
+-    test_weather_integration() 
+\ No newline at end of file
++    test_weather_integration() 
+diff --git a/utils/collect/weather_forecasts.py b/utils/collect/weather_forecasts.py
+index f3ec185d3209f6749d6454a6e616ccb42b6c2a79..07f9989c19dc425f6db6020d9e4fe822aa34ef0c
+--- a/utils/collect/weather_forecasts.py
++++ b/utils/collect/weather_forecasts.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import datetime as dt
++import os
+ import json
+ import logging
+ from dataclasses import dataclass
+@@ -205,6 +206,10 @@
+     list[Path]
+         Paths of parquet partitions written or updated.
+     """
++    if os.environ.get("VC_SKIP_API") == "1":
++        logger.warning("VC_SKIP_API=1 set; skipping weather forecast collection and using existing snapshots.")
++        return []
++
+     if not seasons:
+         logger.info("No seasons provided for weather forecast collection.")
+         return []
+@@ -510,4 +515,3 @@
+ 
+ 
+ __all__ = ["collect_weather_forecasts"]
+-
+
+
+thinking
+**Collecting latest metrics and feature importance**
+exec
+/bin/zsh -lc 'ls -1t /Users/jameswest/Desktop/nfl_predict/output/metrics/anytime_td/xgboost | head' in /Users/jameswest/Desktop/nfl_predict succeeded in 776ms:
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+20251126_072200_c4fc638_cutoff_h090m
+20251126_001001_ab12e68_cutoff_h090m
+20251125_013653_nogit_cutoff_h090m
+20251124_172142_nogit_cutoff_h090m
+20251124_171031_nogit_cutoff_h090m
+20251123_231806_nogit_cutoff_h090m
+20251123_210240_nogit_snap_zero_stub_cutoff_h090m
+20251123_020935_nogit_cutoff_h12h_bt_cutoff_h12h
+20251123_015013_nogit_cutoff_h06h_bt_cutoff_h06h
+20251123_012823_nogit_cutoff_h090m_smalltune_cutoff_h090m
+file update:
+diff --git a/pipeline/train.py b/pipeline/train.py
+index 30c70ab8292088cc8aad350882ef2c5e8cc7efa6..265bc29f4861d2d4d26f54fd7f77304de8fe6742
+--- a/pipeline/train.py
++++ b/pipeline/train.py
+@@ -2073,7 +2073,7 @@
+ 
+         # --- Save inference artifacts AFTER all models for the problem are trained ---
+         # This ensures the state (imputation, categories) is from the pre-tuning/pre-holdout phase.
+-        save_inference_artifacts(self, problem_name, problem_copy)
++        save_inference_artifacts(self, problem_name, problem_config)
+ 
+     def _unwrap_base_model(self, model):
+         """Return the true fitted estimator, no matter how it's wrapped."""
+diff --git a/utils/collect/visual_crossing_weather.py b/utils/collect/visual_crossing_weather.py
+index 33f0284b384909b1a1c59c37da85936e329ecae3..904451f4affe30283d5f06349581228cd38714d9
+--- a/utils/collect/visual_crossing_weather.py
++++ b/utils/collect/visual_crossing_weather.py
+@@ -432,6 +432,11 @@
+     logging.info(f"=== FETCH WEATHER FOR TEAM {team} START ===")
+     logging.info(f"Team {team}: Processing {len(buckets)} buckets")
+     logging.info(f"Team {team}: Bucket range: {min(buckets)} to {max(buckets)}")
++
++    # Allow offline runs to skip API calls and rely solely on the existing cache.
++    if os.environ.get("VC_SKIP_API") == "1":
++        logging.info("VC_SKIP_API=1 set; skipping Visual Crossing API fetch for this team and using cache only")
++        return {}
+     
+     if not buckets:
+         logging.warning(f"Team {team}: No buckets to process")
+@@ -1020,4 +1025,4 @@
+     return record
+ 
+ if __name__ == "__main__":
+-    test_weather_integration() 
+\ No newline at end of file
++    test_weather_integration() 
+diff --git a/utils/collect/weather_forecasts.py b/utils/collect/weather_forecasts.py
+index f3ec185d3209f6749d6454a6e616ccb42b6c2a79..07f9989c19dc425f6db6020d9e4fe822aa34ef0c
+--- a/utils/collect/weather_forecasts.py
++++ b/utils/collect/weather_forecasts.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import datetime as dt
++import os
+ import json
+ import logging
+ from dataclasses import dataclass
+@@ -205,6 +206,10 @@
+     list[Path]
+         Paths of parquet partitions written or updated.
+     """
++    if os.environ.get("VC_SKIP_API") == "1":
++        logger.warning("VC_SKIP_API=1 set; skipping weather forecast collection and using existing snapshots.")
++        return []
++
+     if not seasons:
+         logger.info("No seasons provided for weather forecast collection.")
+         return []
+@@ -510,4 +515,3 @@
+ 
+ 
+ __all__ = ["collect_weather_forecasts"]
+-
+
+
+thinking
+**Calculating post-run metrics and comparisons**
+exec
+/bin/zsh -lc "/Users/jameswest/Desktop/nfl_predict/venv/bin/python - <<'PY'
+import json, yaml, pathlib, statistics
+base_dir = pathlib.Path('/Users/jameswest/Desktop/nfl_predict/output/metrics/anytime_td/xgboost/20251126_072200_c4fc638_cutoff_h090m')
+metrics_path = base_dir / 'metrics.yaml'
+feat_path = base_dir / 'feature_importance.json'
+with open(metrics_path) as f:
+    metrics = yaml.safe_load(f)
+print('New metrics:')
+for k in ['auc','pr_auc','brier_score','precision_at_thresh']:
+    print(f\"  {k}: {metrics.get(k)}\")
+with open(feat_path) as f:
+    data = json.load(f)
+features = data.get('features', [])
+importance = data.get('importance', {})
+items = [(feat, importance.get(feat, 0)) for feat in features]
+items.sort(key=lambda x: x[1], reverse=True)
+print('\\nTop 10 features:')
+for feat, imp in items[:10]:
+    print(f\"  {feat}: {imp}\")
+vals = [imp for _, imp in items]
+print('\\nImportance stats:')
+print('  count', len(vals))
+print('  min', min(vals) if vals else None)
+print('  max', max(vals) if vals else None)
+print('  mean', statistics.mean(vals) if vals else None)
+print('  median', statistics.median(vals) if vals else None)
+PY" in /Users/jameswest/Desktop/nfl_predict succeeded in 822ms:
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+New metrics:
+  auc: 0.8432
+  pr_auc: 0.2774
+  brier_score: 0.0849
+  precision_at_thresh: 0.2462
+
+Top 10 features:
+  pred_efficiency_tds: 19.117944717407227
+  drive_hist_count_l3: 5.706023216247559
+  drive_hist_total_yards_l3: 4.4471869468688965
+  drive_hist_td_drives_prev: 3.240994930267334
+  expected_total_yards: 3.2136359214782715
+  season: 2.907687187194824
+  expected_opportunities_raw: 2.8029873371124268
+  expected_td_signal: 2.7937204837799072
+  drive_hist_count_prev: 2.629348039627075
+  pred_efficiency_rush_yards: 2.5797336101531982
+
+Importance stats:
+file update:
+diff --git a/pipeline/train.py b/pipeline/train.py
+index 30c70ab8292088cc8aad350882ef2c5e8cc7efa6..265bc29f4861d2d4d26f54fd7f77304de8fe6742
+--- a/pipeline/train.py
++++ b/pipeline/train.py
+@@ -2073,7 +2073,7 @@
+ 
+         # --- Save inference artifacts AFTER all models for the problem are trained ---
+         # This ensures the state (imputation, categories) is from the pre-tuning/pre-holdout phase.
+-        save_inference_artifacts(self, problem_name, problem_copy)
++        save_inference_artifacts(self, problem_name, problem_config)
+ 
+     def _unwrap_base_model(self, model):
+         """Return the true fitted estimator, no matter how it's wrapped."""
+diff --git a/utils/collect/visual_crossing_weather.py b/utils/collect/visual_crossing_weather.py
+index 33f0284b384909b1a1c59c37da85936e329ecae3..904451f4affe30283d5f06349581228cd38714d9
+--- a/utils/collect/visual_crossing_weather.py
++++ b/utils/collect/visual_crossing_weather.py
+@@ -432,6 +432,11 @@
+     logging.info(f"=== FETCH WEATHER FOR TEAM {team} START ===")
+     logging.info(f"Team {team}: Processing {len(buckets)} buckets")
+     logging.info(f"Team {team}: Bucket range: {min(buckets)} to {max(buckets)}")
++
++    # Allow offline runs to skip API calls and rely solely on the existing cache.
++    if os.environ.get("VC_SKIP_API") == "1":
++        logging.info("VC_SKIP_API=1 set; skipping Visual Crossing API fetch for this team and using cache only")
++        return {}
+     
+     if not buckets:
+         logging.warning(f"Team {team}: No buckets to process")
+@@ -1020,4 +1025,4 @@
+     return record
+ 
+ if __name__ == "__main__":
+-    test_weather_integration() 
+\ No newline at end of file
++    test_weather_integration() 
+diff --git a/utils/collect/weather_forecasts.py b/utils/collect/weather_forecasts.py
+index f3ec185d3209f6749d6454a6e616ccb42b6c2a79..07f9989c19dc425f6db6020d9e4fe822aa34ef0c
+--- a/utils/collect/weather_forecasts.py
++++ b/utils/collect/weather_forecasts.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import datetime as dt
++import os
+ import json
+ import logging
+ from dataclasses import dataclass
+@@ -205,6 +206,10 @@
+     list[Path]
+         Paths of parquet partitions written or updated.
+     """
++    if os.environ.get("VC_SKIP_API") == "1":
++        logger.warning("VC_SKIP_API=1 set; skipping weather forecast collection and using existing snapshots.")
++        return []
++
+     if not seasons:
+         logger.info("No seasons provided for weather forecast collection.")
+         return []
+@@ -510,4 +515,3 @@
+ 
+ 
+ __all__ = ["collect_weather_forecasts"]
+-
+
+
+thinking
+**Analyzing metric improvements and feature importance shifts**
+exec
+/bin/zsh -lc "/Users/jameswest/Desktop/nfl_predict/venv/bin/python - <<'PY'
+import pandas as pd
+path = '/Users/jameswest/Desktop/nfl_predict/output/metrics/cutoff_backtest_summary.csv'
+df = pd.read_csv(path)
+print('Rows:', len(df))
+print(df.tail(5))
+PY" in /Users/jameswest/Desktop/nfl_predict succeeded in 1.08s:
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 18: /bin/ps: Operation not permitted
+Rows: 4
+   cutoff_hours cutoff_label  ... calibration_method calibration_ece_oof
+0           1.5        h090m  ...                raw              0.0416
+1           3.0         h03h  ...            sigmoid              0.0407
+2           6.0         h06h  ...            sigmoid              0.0396
+3          12.0         h12h  ...            sigmoid              0.0386
+
+[4 rows x 16 columns]
+file update:
+diff --git a/pipeline/train.py b/pipeline/train.py
+index 30c70ab8292088cc8aad350882ef2c5e8cc7efa6..265bc29f4861d2d4d26f54fd7f77304de8fe6742
+--- a/pipeline/train.py
++++ b/pipeline/train.py
+@@ -2073,7 +2073,7 @@
+ 
+         # --- Save inference artifacts AFTER all models for the problem are trained ---
+         # This ensures the state (imputation, categories) is from the pre-tuning/pre-holdout phase.
+-        save_inference_artifacts(self, problem_name, problem_copy)
++        save_inference_artifacts(self, problem_name, problem_config)
+ 
+     def _unwrap_base_model(self, model):
+         """Return the true fitted estimator, no matter how it's wrapped."""
+diff --git a/utils/collect/visual_crossing_weather.py b/utils/collect/visual_crossing_weather.py
+index 33f0284b384909b1a1c59c37da85936e329ecae3..904451f4affe30283d5f06349581228cd38714d9
+--- a/utils/collect/visual_crossing_weather.py
++++ b/utils/collect/visual_crossing_weather.py
+@@ -432,6 +432,11 @@
+     logging.info(f"=== FETCH WEATHER FOR TEAM {team} START ===")
+     logging.info(f"Team {team}: Processing {len(buckets)} buckets")
+     logging.info(f"Team {team}: Bucket range: {min(buckets)} to {max(buckets)}")
++
++    # Allow offline runs to skip API calls and rely solely on the existing cache.
++    if os.environ.get("VC_SKIP_API") == "1":
++        logging.info("VC_SKIP_API=1 set; skipping Visual Crossing API fetch for this team and using cache only")
++        return {}
+     
+     if not buckets:
+         logging.warning(f"Team {team}: No buckets to process")
+@@ -1020,4 +1025,4 @@
+     return record
+ 
+ if __name__ == "__main__":
+-    test_weather_integration() 
+\ No newline at end of file
++    test_weather_integration() 
+diff --git a/utils/collect/weather_forecasts.py b/utils/collect/weather_forecasts.py
+index f3ec185d3209f6749d6454a6e616ccb42b6c2a79..07f9989c19dc425f6db6020d9e4fe822aa34ef0c
+--- a/utils/collect/weather_forecasts.py
++++ b/utils/collect/weather_forecasts.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import datetime as dt
++import os
+ import json
+ import logging
+ from dataclasses import dataclass
+@@ -205,6 +206,10 @@
+     list[Path]
+         Paths of parquet partitions written or updated.
+     """
++    if os.environ.get("VC_SKIP_API") == "1":
++        logger.warning("VC_SKIP_API=1 set; skipping weather forecast collection and using existing snapshots.")
++        return []
++
+     if not seasons:
+         logger.info("No seasons provided for weather forecast collection.")
+         return []
+@@ -510,4 +515,3 @@
+ 
+ 
+ __all__ = ["collect_weather_forecasts"]
+-
+
+
+thinking
+**Summarizing pipeline run and updates**
+
+I'm putting together a detailed summary covering the successful pipeline run after fixing the NameError and adding the VC_SKIP_API environment guard for offline weather fetch. I'll highlight code changes, compare baseline and new metrics including the unexpected feature importance shifts, note slight precision drop possibly due to threshold differences, and mention the backtest calibration results. The summary will include explanations about network issues overcome, updated directories, future run instructions, and close with the exact line `PIPELINE VALIDATION COMPLETE`.
+
+thinking
+**Summarizing final report structure**
+
+I'll organize a clear final message with bullet points covering code changes, pipeline success with metrics and progress, feature importance shifts, cutoff summary, and suggested next steps—all formatted concisely and including file paths and metric numbers as requested.
+codex
+**Changes**
+- Added an offline guard (`VC_SKIP_API=1`) to skip Visual Crossing API calls in both `utils/collect/visual_crossing_weather.py` and `utils/collect/weather_forecasts.py` so runs don’t hang in restricted-network environments.
+- Fixed the `NameError` in `pipeline/train.py` by passing the correct `problem_config` into `save_inference_artifacts`.
+
+**Run & Metrics**
+- PROGRESS: Pipeline run succeeded with `VC_SKIP_API=1`; newest artifacts at `output/metrics/anytime_td/xgboost/20251126_072200_c4fc638_cutoff_h090m`.
+- Anytime TD metrics vs baseline (`20251126_001001_ab12e68_cutoff_h090m` → new): AUC 0.8333 → 0.8432, PR AUC 0.2684 → 0.2774, Brier 0.0872 → 0.0849 (all improved); precision_at_thresh dipped 0.2512 → 0.2462.
+- Feature importance shifted: still led by `pred_efficiency_tds`, but prior leaders (`expected_td_prob_*`, `expected_td_signal_raw`) dropped from the top; drive-history and usage signals now carry more weight. Worth a quick sanity check if that rebalancing was expected.
+- `cutoff_backtest_summary.csv` (4 rows) shows h090m calibration raw ECE ~0.0416 with similar or better ECE for longer horizons (≈0.038–0.041), suggesting acceptable calibration across horizons.
+
+**Notes / Next**
+1) If you need fresh weather forecasts, unset `VC_SKIP_API`; otherwise keep it for offline runs. 2) Consider reviewing the new threshold choice since precision_at_thresh slipped slightly despite overall lift.
+
+PIPELINE VALIDATION COMPLETE
+file update:
+diff --git a/pipeline/train.py b/pipeline/train.py
+index 30c70ab8292088cc8aad350882ef2c5e8cc7efa6..265bc29f4861d2d4d26f54fd7f77304de8fe6742
+--- a/pipeline/train.py
++++ b/pipeline/train.py
+@@ -2073,7 +2073,7 @@
+ 
+         # --- Save inference artifacts AFTER all models for the problem are trained ---
+         # This ensures the state (imputation, categories) is from the pre-tuning/pre-holdout phase.
+-        save_inference_artifacts(self, problem_name, problem_copy)
++        save_inference_artifacts(self, problem_name, problem_config)
+ 
+     def _unwrap_base_model(self, model):
+         """Return the true fitted estimator, no matter how it's wrapped."""
+diff --git a/utils/collect/visual_crossing_weather.py b/utils/collect/visual_crossing_weather.py
+index 33f0284b384909b1a1c59c37da85936e329ecae3..904451f4affe30283d5f06349581228cd38714d9
+--- a/utils/collect/visual_crossing_weather.py
++++ b/utils/collect/visual_crossing_weather.py
+@@ -432,6 +432,11 @@
+     logging.info(f"=== FETCH WEATHER FOR TEAM {team} START ===")
+     logging.info(f"Team {team}: Processing {len(buckets)} buckets")
+     logging.info(f"Team {team}: Bucket range: {min(buckets)} to {max(buckets)}")
++
++    # Allow offline runs to skip API calls and rely solely on the existing cache.
++    if os.environ.get("VC_SKIP_API") == "1":
++        logging.info("VC_SKIP_API=1 set; skipping Visual Crossing API fetch for this team and using cache only")
++        return {}
+     
+     if not buckets:
+         logging.warning(f"Team {team}: No buckets to process")
+@@ -1020,4 +1025,4 @@
+     return record
+ 
+ if __name__ == "__main__":
+-    test_weather_integration() 
+\ No newline at end of file
++    test_weather_integration() 
+diff --git a/utils/collect/weather_forecasts.py b/utils/collect/weather_forecasts.py
+index f3ec185d3209f6749d6454a6e616ccb42b6c2a79..07f9989c19dc425f6db6020d9e4fe822aa34ef0c
+--- a/utils/collect/weather_forecasts.py
++++ b/utils/collect/weather_forecasts.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import datetime as dt
++import os
+ import json
+ import logging
+ from dataclasses import dataclass
+@@ -205,6 +206,10 @@
+     list[Path]
+         Paths of parquet partitions written or updated.
+     """
++    if os.environ.get("VC_SKIP_API") == "1":
++        logger.warning("VC_SKIP_API=1 set; skipping weather forecast collection and using existing snapshots.")
++        return []
++
+     if not seasons:
+         logger.info("No seasons provided for weather forecast collection.")
+         return []
+@@ -510,4 +515,3 @@
+ 
+ 
+ __all__ = ["collect_weather_forecasts"]
+-
+
+tokens used
+159,486
+**Changes**
+- Added an offline guard (`VC_SKIP_API=1`) to skip Visual Crossing API calls in both `utils/collect/visual_crossing_weather.py` and `utils/collect/weather_forecasts.py` so runs don’t hang in restricted-network environments.
+- Fixed the `NameError` in `pipeline/train.py` by passing the correct `problem_config` into `save_inference_artifacts`.
+
+**Run & Metrics**
+- PROGRESS: Pipeline run succeeded with `VC_SKIP_API=1`; newest artifacts at `output/metrics/anytime_td/xgboost/20251126_072200_c4fc638_cutoff_h090m`.
+- Anytime TD metrics vs baseline (`20251126_001001_ab12e68_cutoff_h090m` → new): AUC 0.8333 → 0.8432, PR AUC 0.2684 → 0.2774, Brier 0.0872 → 0.0849 (all improved); precision_at_thresh dipped 0.2512 → 0.2462.
+- Feature importance shifted: still led by `pred_efficiency_tds`, but prior leaders (`expected_td_prob_*`, `expected_td_signal_raw`) dropped from the top; drive-history and usage signals now carry more weight. Worth a quick sanity check if that rebalancing was expected.
+- `cutoff_backtest_summary.csv` (4 rows) shows h090m calibration raw ECE ~0.0416 with similar or better ECE for longer horizons (≈0.038–0.041), suggesting acceptable calibration across horizons.
+
+**Notes / Next**
+1) If you need fresh weather forecasts, unset `VC_SKIP_API`; otherwise keep it for offline runs. 2) Consider reviewing the new threshold choice since precision_at_thresh slipped slightly despite overall lift.
+
+PIPELINE VALIDATION COMPLETE

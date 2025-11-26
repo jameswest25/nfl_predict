@@ -432,6 +432,11 @@ def fetch_weather_for_team_batch(team: str, buckets, cache: Dict) -> Dict:
     logging.info(f"=== FETCH WEATHER FOR TEAM {team} START ===")
     logging.info(f"Team {team}: Processing {len(buckets)} buckets")
     logging.info(f"Team {team}: Bucket range: {min(buckets)} to {max(buckets)}")
+
+    # Allow offline runs to skip API calls and rely solely on the existing cache.
+    if os.environ.get("VC_SKIP_API") == "1":
+        logging.info("VC_SKIP_API=1 set; skipping Visual Crossing API fetch for this team and using cache only")
+        return {}
     
     if not buckets:
         logging.warning(f"Team {team}: No buckets to process")

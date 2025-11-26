@@ -4,8 +4,12 @@ Aggregates play-by-play data to player-game level for all skill positions.
 Each player gets one row per game with their total stats.
 
 Target columns created:
-- anytime_td (binary): Did player score a TD (receiving or rushing)?
-- td_count (int): Number of TDs scored (receiving + rushing)
+- anytime_td_offense (binary): Did player score an offensive TD (rush/rec/pass thrown)?
+- anytime_td_all (binary): Did player score any TD (including defensive/special teams if present)?
+- anytime_td_rush / anytime_td_rec / anytime_td_pass_thrown: Type-specific TD flags.
+- anytime_td (binary): Legacy alias → current label version primary.
+- td_count_offense / td_count_all: TD counts aligned to label semantics.
+- td_count (int): Legacy alias for the primary td_count.
 - passing_td (int): Number of passing TDs (for QBs)
 - receiving_yards (float): Total receiving yards
 - rushing_yards (float): Total rushing yards
@@ -33,6 +37,7 @@ from utils.collect.arrival_log import log_feed_arrivals
 from utils.collect.nfl_schedules import get_schedule
 from utils.feature.asof import decision_cutoff_hours_default, fallback_cutoff_hours, get_decision_cutoff_hours, get_fallback_cutoff_hours
 from utils.feature.player_drive_level import _load_play_level_data
+from utils.feature.labels import DEFAULT_LABEL_VERSION, compute_td_labels
 from utils.train.injury_availability import (
     load_latest_artifact,
     predict_probabilities as predict_injury_probabilities,
@@ -141,6 +146,8 @@ SLOT_ROUTE_CUES = {
 PRE_SNAP_BASE_COLUMNS = [
     "ps_route_participation_plays",
     "ps_team_dropbacks",
+    "ps_tracking_team_dropbacks",
+    "ps_tracking_has_game_data",
     "ps_route_participation_pct",
     "ps_targets_total",
     "ps_targets_slot_count",
@@ -157,12 +164,29 @@ PRE_SNAP_BASE_COLUMNS = [
 ]
 PRE_SNAP_ROLLING_TARGETS = [
     "ps_route_participation_pct",
+    "ps_route_participation_plays",
+    "ps_targets_total",
+    "ps_targets_slot_count",
+    "ps_targets_wide_count",
+    "ps_targets_inline_count",
+    "ps_targets_backfield_count",
     "ps_scripted_touch_share",
+    "ps_scripted_touches",
+    "ps_total_touches",
     "ps_targets_slot_share",
     "ps_targets_wide_share",
     "ps_targets_inline_share",
     "ps_targets_backfield_share",
+    "ps_tracking_team_dropbacks",
+    "ps_tracking_has_game_data",
 ]
+
+
+def _ps_game_alias(name: str) -> str:
+    """Return the ps_game_ alias for a ps_* column."""
+    if not name.startswith("ps_"):
+        return name
+    return f"ps_game_{name[len('ps_'):]}"
 def _safe_split(col: pl.Expr) -> pl.Expr:
     return (
         pl.when(col.is_not_null())
@@ -175,6 +199,23 @@ def _compute_pre_snap_usage(df: pl.DataFrame) -> pl.DataFrame:
     if df.is_empty():
         return pl.DataFrame()
 
+    # Ensure critical situational columns exist for scripted-play heuristics.
+    numeric_defaults = {
+        "game_seconds_remaining": pl.Float32,
+        "half_seconds_remaining": pl.Float32,
+        "quarter_seconds_remaining": pl.Float32,
+        "score_differential": pl.Float32,
+    }
+    for col, dtype in numeric_defaults.items():
+        if col not in df.columns:
+            df = df.with_columns(pl.lit(None).cast(dtype).alias(col))
+    if "no_huddle" not in df.columns:
+        df = df.with_columns(pl.lit(0).cast(pl.Int8).alias("no_huddle"))
+    if "qtr" not in df.columns:
+        df = df.with_columns(pl.lit(None).cast(pl.Int8).alias("qtr"))
+    if "down" not in df.columns:
+        df = df.with_columns(pl.lit(None).cast(pl.Int8).alias("down"))
+
     base_cols = [
         "season",
         "week",
@@ -182,6 +223,13 @@ def _compute_pre_snap_usage(df: pl.DataFrame) -> pl.DataFrame:
         "posteam",
         "play_id",
         "order_sequence",
+        "qtr",
+        "down",
+        "game_seconds_remaining",
+        "half_seconds_remaining",
+        "quarter_seconds_remaining",
+        "score_differential",
+        "no_huddle",
         "qb_dropback",
         "target",
         "carry",
@@ -206,6 +254,13 @@ def _compute_pre_snap_usage(df: pl.DataFrame) -> pl.DataFrame:
             pl.col("offense_positions").cast(pl.Utf8),
             pl.col("route").cast(pl.Utf8),
             pl.col("pass_location").cast(pl.Utf8),
+            pl.col("qtr").cast(pl.Int8),
+            pl.col("down").cast(pl.Int8),
+            pl.col("game_seconds_remaining").cast(pl.Float32),
+            pl.col("half_seconds_remaining").cast(pl.Float32),
+            pl.col("quarter_seconds_remaining").cast(pl.Float32),
+            pl.col("score_differential").cast(pl.Float32),
+            pl.col("no_huddle").cast(pl.Int8),
         ]
     )
 
@@ -376,7 +431,7 @@ def _compute_pre_snap_usage(df: pl.DataFrame) -> pl.DataFrame:
     else:
         alignment_stats = pl.DataFrame()
 
-    # Scripted plays (first 15 offensive plays)
+    # Scripted plays (early-drive heuristic)
     scripted_source = (
         df.select(
             [
@@ -385,6 +440,13 @@ def _compute_pre_snap_usage(df: pl.DataFrame) -> pl.DataFrame:
                 pl.col("game_id").cast(pl.Utf8),
                 pl.col("posteam").cast(pl.Utf8).str.to_uppercase().alias("team"),
                 "play_id",
+                "qtr",
+                "down",
+                "game_seconds_remaining",
+                "half_seconds_remaining",
+                "quarter_seconds_remaining",
+                "score_differential",
+                "no_huddle",
                 "target",
                 "carry",
                 "receiver_player_id",
@@ -403,10 +465,40 @@ def _compute_pre_snap_usage(df: pl.DataFrame) -> pl.DataFrame:
             .alias("offense_play_rank")
         )
         .with_columns(
-            (pl.col("offense_play_rank") < 15)
+            [
+                pl.when(pl.col("game_seconds_remaining").is_not_null())
+                .then(3600.0 - pl.col("game_seconds_remaining"))
+                .when(pl.col("half_seconds_remaining").is_not_null())
+                .then(1800.0 - pl.col("half_seconds_remaining"))
+                .otherwise(None)
+                .alias("__game_elapsed"),
+                (
+                    (pl.col("qtr").is_in([2, 4]))
+                    & (pl.col("quarter_seconds_remaining").fill_null(900.0) <= 120.0)
+                ).alias("__two_minute_like"),
+                (
+                    (pl.col("no_huddle").fill_null(0) == 1)
+                    & (pl.col("quarter_seconds_remaining").fill_null(900.0) < 240.0)
+                ).alias("__hurry_up"),
+                pl.col("down").fill_null(1).is_in([1, 2]).alias("__early_down"),
+            ]
+        )
+        .with_columns(
+            (
+                (pl.col("offense_play_rank") < 20)
+                & (
+                    pl.when(pl.col("__game_elapsed").is_not_null())
+                    .then(pl.col("__game_elapsed") <= 1200.0)
+                    .otherwise(True)
+                )
+                & (~pl.col("__two_minute_like"))
+                & (~pl.col("__hurry_up"))
+                & pl.col("__early_down")
+            )
             .cast(pl.Int8)
             .alias("is_scripted_play")
         )
+        .drop(["__game_elapsed", "__two_minute_like", "__hurry_up", "__early_down"])
     )
 
     target_touches = (
@@ -486,6 +578,27 @@ def _compute_pre_snap_usage(df: pl.DataFrame) -> pl.DataFrame:
                     pl.coalesce(pl.col(key), pl.col(suffixed)).alias(key)
                 ).drop(suffixed)
 
+    merged = merged.with_columns(
+        [
+            (
+                pl.col("ps_team_dropbacks").cast(pl.Float32)
+                if "ps_team_dropbacks" in merged.columns
+                else pl.lit(0).cast(pl.Float32)
+            ).alias("ps_tracking_team_dropbacks"),
+            (
+                pl.when(
+                    (
+                        pl.col("ps_team_dropbacks").fill_null(0) > 0
+                    )
+                    | (pl.col("ps_total_touches").fill_null(0) > 0)
+                )
+                .then(1)
+                .otherwise(0)
+                .cast(pl.Float32)
+            ).alias("ps_tracking_has_game_data"),
+        ]
+    )
+
     numeric_cols = [
         col
         for col in merged.columns
@@ -494,6 +607,16 @@ def _compute_pre_snap_usage(df: pl.DataFrame) -> pl.DataFrame:
     merged = merged.with_columns(
         [pl.col(col).fill_null(0).cast(pl.Float32).alias(col) for col in numeric_cols]
     )
+    # Expose realized same-game stats under a clear namespace for downstream label use.
+    game_alias_exprs = []
+    for col in numeric_cols:
+        if not col.startswith("ps_"):
+            continue
+        alias = _ps_game_alias(col)
+        if alias not in merged.columns:
+            game_alias_exprs.append(pl.col(col).alias(alias))
+    if game_alias_exprs:
+        merged = merged.with_columns(game_alias_exprs)
     return merged
 
 
@@ -1464,7 +1587,12 @@ def _load_travel_calendar_features(seasons: list[int]) -> pl.DataFrame:
     if flag_cols:
         df = df.with_columns([pl.col(col).cast(pl.Int8) for col in flag_cols])
     return df
-def build_player_game_level(*, start_date: date, end_date: date) -> None:
+def build_player_game_level(
+    *,
+    start_date: date,
+    end_date: date,
+    label_version: str | None = None,
+) -> None:
     """Aggregate play-level data to player-game level.
     
     Creates one row per (player, game) with accumulated stats.
@@ -1562,7 +1690,7 @@ def build_player_game_level(*, start_date: date, end_date: date) -> None:
     
     # Merge rows where same player had multiple roles in same game
     # (e.g., QB who also rushed, WR who also rushed)
-    df_merged = _merge_multi_role_players(df_all)
+    df_merged = _merge_multi_role_players(df_all, label_version=label_version or DEFAULT_LABEL_VERSION)
 
     df_merged = _append_zero_usage_players(df_merged, seasons_in_window)
     
@@ -1580,6 +1708,13 @@ def build_player_game_level(*, start_date: date, end_date: date) -> None:
             df_merged = df_merged.with_columns(
                 pl.lit(0).cast(pl.Float32).alias(col)
             )
+    ps_game_aliases: list[pl.Expr] = []
+    for col in PRE_SNAP_BASE_COLUMNS:
+        alias = _ps_game_alias(col)
+        if alias not in df_merged.columns and col in df_merged.columns:
+            ps_game_aliases.append(pl.col(col).alias(alias))
+    if ps_game_aliases:
+        df_merged = df_merged.with_columns(ps_game_aliases)
 
     if PRE_SNAP_ROLLING_TARGETS:
         df_merged = df_merged.sort(["player_id", "season", "week"])
@@ -1604,6 +1739,14 @@ def build_player_game_level(*, start_date: date, end_date: date) -> None:
                 for col in PRE_SNAP_ROLLING_TARGETS
             ]
         )
+        hist_aliases: list[pl.Expr] = []
+        for base in PRE_SNAP_ROLLING_TARGETS:
+            for suffix in ("prev", "l3"):
+                name = f"{base}_{suffix}"
+                if name in df_merged.columns:
+                    hist_aliases.append(pl.col(name).alias(f"ps_hist_{name[len('ps_'):]}"))
+        if hist_aliases:
+            df_merged = df_merged.with_columns(hist_aliases)
     
     logger.info("Final player-game rows: %d (after merging multi-role players)", len(df_merged))
     # Enrich with roster metadata (position, depth chart, injury status)
@@ -3235,7 +3378,7 @@ def _aggregate_receivers(df: pl.DataFrame) -> pl.DataFrame:
     )
 
 
-def _merge_multi_role_players(df: pl.DataFrame) -> pl.DataFrame:
+def _merge_multi_role_players(df: pl.DataFrame, *, label_version: str | None = None) -> pl.DataFrame:
     """Merge stats for players who had multiple roles in same game.
     
     Example: QB who passed and rushed, WR who received and rushed.
@@ -3289,8 +3432,6 @@ def _merge_multi_role_players(df: pl.DataFrame) -> pl.DataFrame:
         if col in merged.columns:
             merged = merged.with_columns(pl.col(col).fill_null(0))
 
-    # Fallback touchdown logic: if generic touchdown attribution is missing,
-    # derive it from rushing + receiving touchdowns.
     merged = merged.with_columns([
         pl.col("touchdowns").fill_null(0).alias("touchdowns"),
         pl.col("rushing_td_count").fill_null(0).alias("rushing_td_count"),
@@ -3302,18 +3443,5 @@ def _merge_multi_role_players(df: pl.DataFrame) -> pl.DataFrame:
         pl.col("goal_to_go_carry").fill_null(0).alias("goal_to_go_carry"),
     ])
 
-    merged = merged.with_columns([
-        pl.when(pl.col("touchdowns") > 0)
-        .then(pl.col("touchdowns"))
-        .otherwise(pl.col("rushing_td_count") + pl.col("receiving_td_count"))
-        .cast(pl.Int64)
-        .alias("_total_touchdowns")
-    ])
-
-    merged = merged.with_columns([
-        (pl.col("_total_touchdowns") > 0).cast(pl.Int8).alias("anytime_td"),
-        pl.col("_total_touchdowns").alias("td_count"),
-    ]).drop("_total_touchdowns")
-    
+    merged = compute_td_labels(merged, version=label_version)
     return merged
-

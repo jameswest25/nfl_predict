@@ -1,0 +1,7 @@
+Introduced versioned anytime-TD labels and explicit target wiring. TD semantics now live in `utils/feature/labels.py` with v1 specs, aliases, and helper `compute_td_labels`; player-game aggregation uses it to emit offense/all/type-specific labels and aligned td_count columns (`utils/feature/player_game_level.py`). Feature pipeline now accepts a `label_version`, passes it into aggregation, and logs rates for the primary label while defaulting to `v1_any_offense` (`pipeline/feature.py`). Training now records per-problem `label_version` from config, enforces the configured target exists via `require_target_column`, and raises early if missing (`pipeline/train.py`, `utils/feature/targets.py`). Added config hook for label version under the anytime_td problem (`config/training.yaml`) and a focused label semantics test suite (`tests/labels/test_labels.py`).
+
+Tests: `pytest tests/labels/test_labels.py -q` (pytest not available in environment).
+
+Git: Unable to stage/commit because writing to `.git` is denied in this environment (e.g., `git add` fails creating `.git/index.lock`). Working tree remains dirty.
+
+PROGRESS: Implemented P0 label-version scaffold (specs, generation, target enforcement, config hook) and added unit coverage; remaining plan items (leak guardrails, decision-time odds/injuries, CV, docs, broader evaluation) are still outstanding.

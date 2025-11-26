@@ -14,7 +14,7 @@ write, and returns the final game-level DataFrame for downstream usage.
 
 import logging
 import os
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Sequence
 
 import polars as pl
@@ -26,15 +26,22 @@ from utils.feature.game_level import build_game_level
 from utils.feature.player_drive_level import build_player_drive_level
 from utils.feature.player_game_level import build_player_game_level
 from utils.feature.opponent_splits import build_opponent_splits
+from utils.feature.labels import DEFAULT_LABEL_VERSION, get_label_spec
 from utils.feature.targets import validate_target_columns
 from utils.feature.daily_totals import build_daily_cache_range
 from utils.feature.rolling_window import add_rolling_features
-from utils.feature.stats import NFL_PLAYER_STATS, ROLLING_WINDOWS, ROLLING_CONTEXTS
-from utils.feature.odds import add_nfl_odds_features_to_df, add_player_odds_features_to_df as add_player_props_to_df
+from utils.feature.stats import ROLLING_FEATURE_STATS, ROLLING_WINDOWS, ROLLING_CONTEXTS
+from utils.feature.odds import add_nfl_odds_features_to_df
 from utils.feature.team_context import add_team_context_features, compute_team_context_history
 from utils.feature.offense_context import (
     add_offense_context_features_training,
     _append_offense_context_columns,
+)
+from utils.feature.leak_guard import (
+    DEFAULT_LEAK_POLICY,
+    build_schema_snapshot,
+    enforce_leak_guard,
+    write_schema_snapshot,
 )
 from utils.feature.weather_features import (
     add_weather_forecast_features_training,
@@ -233,6 +240,7 @@ def _build_feature_matrix_internal(
     output_path: Path | None = None,
     primary_output_path: Path | None = None,
     cutoff_label: str | None = None,
+    label_version: str | None = None,
 ) -> pl.DataFrame:
     """Run full feature pipeline up to *inclusive* `end_date` for a single cutoff window.
 
@@ -248,6 +256,7 @@ def _build_feature_matrix_internal(
     primary_output = primary_output_path or target_output_path
     current_cutoff_hours = float(get_decision_cutoff_hours())
     clean_min_date, clean_max_date = (None, None)
+    label_version = label_version or DEFAULT_LABEL_VERSION
     if start_date is None or end_date is None:
         clean_min_date, clean_max_date = _get_clean_date_bounds()
 
@@ -294,7 +303,7 @@ def _build_feature_matrix_internal(
             build_player_drive_level(start_date=cur, end_date=chunk_end)
             
             # 5. Player-game aggregations (for rolling window features)
-            build_player_game_level(start_date=cur, end_date=chunk_end)
+            build_player_game_level(start_date=cur, end_date=chunk_end, label_version=label_version)
 
             # advance to next slice
             cur += timedelta(days=chunk_days)
@@ -766,12 +775,6 @@ def _build_feature_matrix_internal(
         allow_schedule_fallback=False,
         drop_schedule_rows=True,
     )
-    
-    logging.info("Enriching player props (Anytime TD)...")
-    df_player_game_all = add_player_props_to_df(
-        df_player_game_all,
-        player_col="player_name",
-    )
 
     rows_after_odds = df_player_game_all.height
     logging.info(
@@ -784,6 +787,9 @@ def _build_feature_matrix_internal(
         df_player_game_all = df_player_game_all.with_columns(
             pl.lit(0).cast(pl.Int8).alias("odds_schedule_fallback")
         )
+    if "odds_anytime_td_price" in df_player_game_all.columns:
+        df_player_game_all = df_player_game_all.drop("odds_anytime_td_price", strict=False)
+        logging.info("Player prop odds enrichment disabled to avoid live snapshot leakage.")
 
     numeric_casts = []
     if "depth_chart_order" in df_player_game_all.columns:
@@ -822,25 +828,35 @@ def _build_feature_matrix_internal(
     # ------------------------------------------------------------------
     if build_rolling:
         logging.info("🔹 Computing rolling window features...")
+
+        rolling_stats = ROLLING_FEATURE_STATS  # Curated, supported stats only
+        rolling_windows = ROLLING_WINDOWS      # Trimmed windows: 1,3,5,season
+        rolling_contexts = ROLLING_CONTEXTS    # Contexts supported by cache: vs_any
+
+        missing_stats = [s for s in rolling_stats if s not in df_player_game_all.columns]
+        if missing_stats:
+            logging.warning(
+                "Rolling feature stats missing from dataset, will skip: %s",
+                ", ".join(sorted(missing_stats)),
+            )
+            rolling_stats = [s for s in rolling_stats if s not in missing_stats]
+        if not rolling_stats:
+            logging.warning("No rolling stats available; skipping rolling feature computation.")
+            logging.info("✅  Added 0 rolling features")
+        else:
+            df_player_game_all = add_rolling_features(
+                df_player_game_all,
+                level="game",
+                stats=rolling_stats,
+                windows=rolling_windows,
+                contexts=rolling_contexts,
+                date_col="game_date",
+                player_col="player_id",
+                opponent_col="opponent",
+            )
         
-        # Use all NFL player stats for rolling windows
-        rolling_stats = NFL_PLAYER_STATS  # All stats from nfl_stats.py
-        rolling_windows = ROLLING_WINDOWS  # All windows: 1, 2, 3, 4, season, lifetime
-        rolling_contexts = ROLLING_CONTEXTS  # All contexts: vs_any, vs_team
-        
-        df_player_game_all = add_rolling_features(
-            df_player_game_all,
-            level="game",
-            stats=rolling_stats,
-            windows=rolling_windows,
-            contexts=rolling_contexts,
-            date_col="game_date",
-            player_col="player_id",
-            opponent_col="opponent",
-        )
-        
-        rolling_cols = [c for c in df_player_game_all.columns if "g_" in c or "season" in c]
-        logging.info(f"✅  Added {len(rolling_cols)} rolling features")
+            rolling_cols = [c for c in df_player_game_all.columns if "g_" in c or "season" in c]
+            logging.info(f"✅  Added {len(rolling_cols)} rolling features")
     
     logging.info("Deriving historical usage share features...")
     share_exprs: list[pl.Expr] = []
@@ -921,6 +937,32 @@ def _build_feature_matrix_internal(
     if market_exprs:
         df_player_game_all = df_player_game_all.with_columns(market_exprs)
     
+    # Leak guard + schema snapshot before persisting
+    spec = get_label_spec(label_version)
+    allow_exact = {spec.primary, *spec.labels.keys(), *spec.aliases.keys()}
+    df_player_game_all, leak_result = enforce_leak_guard(
+        df_player_game_all,
+        policy=DEFAULT_LEAK_POLICY,
+        allow_exact=allow_exact,
+        drop_banned=True,
+        drop_non_allowlisted=False,
+        raise_on_banned=True,
+    )
+
+    schema = build_schema_snapshot(
+        df_player_game_all,
+        policy=DEFAULT_LEAK_POLICY,
+        metadata={
+            "cutoff_label": cutoff_label,
+            "label_version": spec.name,
+        },
+        banned=leak_result.banned,
+    )
+    schema_dir = FEATURE_AUDIT_DIR / "schema" / "anytime_td"
+    schema_path = schema_dir / f"{cutoff_label}_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.json"
+    write_schema_snapshot(schema_path, schema)
+    logging.info("    Schema snapshot written → %s", schema_path)
+
     # Write final feature matrix
     df_player_game_all = df_player_game_all.with_columns(
         pl.lit(current_cutoff_hours).cast(pl.Float32).alias("decision_horizon_hours")
@@ -941,11 +983,18 @@ def _build_feature_matrix_internal(
                  df_player_game_all["game_date"].min(), 
                  df_player_game_all["game_date"].max())
     
-    # Log target distribution for anytime_td
-    if "anytime_td" in df_player_game_all.columns:
-        td_count = df_player_game_all["anytime_td"].sum()
-        td_rate = td_count / len(df_player_game_all) * 100
-        logging.info("    Anytime TD rate: %.2f%% (%d/%d)", td_rate, td_count, len(df_player_game_all))
+    label_candidates = {spec.primary, "anytime_td"}
+    for label_col in label_candidates:
+        if label_col in df_player_game_all.columns:
+            td_count = df_player_game_all[label_col].sum()
+            td_rate = td_count / len(df_player_game_all) * 100
+            logging.info(
+                "    Label %s rate: %.2f%% (%d/%d)",
+                label_col,
+                td_rate,
+                td_count,
+                len(df_player_game_all),
+            )
     
     return df_player_game_all
 
@@ -958,6 +1007,7 @@ def build_feature_matrix(
     recompute_intermediate: bool = True,
     build_rolling: bool = True,
     cutoff_hours_list: Sequence[float] | None = None,
+    label_version: str | None = None,
 ) -> pl.DataFrame:
     """Build feature matrices for one or more decision cutoff horizons.
 
@@ -985,6 +1035,7 @@ def build_feature_matrix(
                 output_path=output_path,
                 primary_output_path=primary_output,
                 cutoff_label=label,
+                label_version=label_version,
             )
         if idx == 0:
             primary_result = df

@@ -26,7 +26,7 @@ PLAYER_DRIVE_STATS: List[str] = [
     "pass_attempt",
     "completion",
     # Touchdowns
-    "touchdown",
+    "touchdowns",
     "passing_td",
     "rushing_td_count",
     "receiving_td_count",
@@ -81,15 +81,45 @@ NFL_PLAYER_STATS: List[str] = [
 
 # Windows for rolling computations (at game level)
 # Integers = N most recent games, "season" = current season, "lifetime" = all history
-ROLLING_WINDOWS = [1, 2, 3, 4, "season", "lifetime"]
+ROLLING_WINDOWS = [1, 3, 5, "season"]
 
 # Contexts for rolling computations
-# "vs_any" = all opponents, "vs_team" = specific opponent only
-ROLLING_CONTEXTS = ["vs_any", "vs_team", "with_team"]
+# "vs_any" = all opponents; vs_team/with_team disabled until caches exist
+ROLLING_CONTEXTS = ["vs_any"]
 
 # Aggregation levels for rolling windows
-# "game" = per-game rates, "drive" = per-drive rates
-ROLLING_LEVELS = ["game", "drive"]
+# Only per-game rolling is currently supported; drive-level cache not wired
+ROLLING_LEVELS = ["game"]
+
+# Curated rolling feature surface (trimmed to well-populated, high-signal stats)
+ROLLING_FEATURE_STATS: List[str] = [
+    "touchdowns",
+    "target",
+    "carry",
+    "pass_attempt",
+    "red_zone_target",
+    "red_zone_carry",
+    "goal_to_go_target",
+    "goal_to_go_carry",
+    "receiving_yards",
+    "rushing_yards",
+    "passing_yards",
+    # Pre-snap realized stats (for historical projections only)
+    "ps_route_participation_pct",
+    "ps_route_participation_plays",
+    "ps_targets_total",
+    "ps_targets_slot_count",
+    "ps_targets_wide_count",
+    "ps_targets_inline_count",
+    "ps_targets_backfield_count",
+    "ps_targets_slot_share",
+    "ps_targets_wide_share",
+    "ps_targets_inline_share",
+    "ps_targets_backfield_share",
+    "ps_total_touches",
+    "ps_scripted_touches",
+    "ps_scripted_touch_share",
+]
 
 # Columns required for player identification and time-series operations
 PLAYER_ID_COLS = ["player_id", "player_name"]
@@ -102,5 +132,5 @@ TEAM_ID_COLS = ["team", "opponent"]
 # Examples:
 #   - 1g_receiving_yards_per_game          (last 1 game, all opponents)
 #   - 3g_rushing_yards_per_game_vs_team    (last 3 games vs this opponent)
-#   - seasong_touchdown_per_game           (season-to-date)
+#   - seasong_touchdowns_per_game          (season-to-date)
 #   - lifetimeg_passing_yards_per_drive    (career avg per drive)

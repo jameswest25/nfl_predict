@@ -44,18 +44,31 @@ def format_metrics_for_yaml(data: dict) -> dict:
             formatted[k] = v
     return formatted
 
-def save_inference_artifacts(trainer, problem_name: str) -> None:
+def save_inference_artifacts(trainer, problem_name: str, problem_config: dict | None = None) -> None:
     # Versioned artifact copy
     v_dir = _vdir(trainer, problem_name, None, "artifacts") / "inference"
     v_dir.mkdir(parents=True, exist_ok=True)
     v_path = v_dir / f"inference_artifacts_{problem_name}.joblib"
     # Legacy artifact path (loader in train.py reads this)
     legacy = trainer.paths.model_dir / f"inference_artifacts_{problem_name}.joblib"
+    task_type = None
+    output_mode = None
+    if problem_config:
+        task_type = problem_config.get("task_type")
+        output_mode = problem_config.get("output_mode")
+    if output_mode is None and task_type:
+        if str(task_type).lower() in ("classification", "binary", "multiclass"):
+            output_mode = "probability"
+        else:
+            output_mode = "value"
+
     payload = {
         "feature_columns": trainer.feature_columns,
         "imputation_values": trainer.imputation_values.get(problem_name, {}),
         "category_levels": trainer.category_levels.get(problem_name, {}),
         "categorical_features": trainer.categorical_features.get(problem_name, []),
+        "task_type": task_type,
+        "output_mode": output_mode,
     }
     joblib.dump(payload, v_path)
     # keep legacy in sync
