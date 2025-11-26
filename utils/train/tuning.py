@@ -1,15 +1,136 @@
 # utils/train/tuning.py
 from __future__ import annotations
-import os, copy, inspect, logging
+import os, copy, inspect, logging, math
 import numpy as np
 import optuna
 import xgboost as xgb
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Mapping, Tuple
 from sklearn.metrics import roc_auc_score, average_precision_score, mean_squared_error, precision_score
 from sklearn.model_selection import TimeSeriesSplit
 from utils.train.purged_group_time_series_split import PurgedGroupTimeSeriesSplit
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_CENTER_WIDTH = 0.5
+
+
+class TuningConfigError(ValueError):
+    """Raised when hyperparameter tuning config is invalid."""
+
+
+def _coerce_numeric(value: Any, *, param_name: str, model_name: str) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        raise TuningConfigError(
+            f"Hyperparameter '{param_name}' for model '{model_name}' must be numeric. "
+            f"Received value={value!r}"
+        ) from None
+
+
+def _normalize_param_spec(
+    model_name: str,
+    param_name: str,
+    raw_spec: Mapping[str, Any],
+    default_center: float,
+) -> Dict[str, Any]:
+    if not isinstance(raw_spec, Mapping):
+        raise TuningConfigError(
+            f"Hyperparameter '{param_name}' for model '{model_name}' must be a mapping."
+        )
+
+    if "choices" in raw_spec:
+        choices = raw_spec["choices"]
+        if not isinstance(choices, (list, tuple)) or not choices:
+            raise TuningConfigError(
+                f"Hyperparameter '{param_name}' for model '{model_name}' must provide a non-empty "
+                "'choices' list."
+            )
+        return {
+            "kind": "categorical",
+            "choices": list(choices),
+        }
+
+    if "low" not in raw_spec or "high" not in raw_spec:
+        raise TuningConfigError(
+            f"Hyperparameter '{param_name}' for model '{model_name}' must define 'low' and 'high'."
+        )
+
+    low = _coerce_numeric(raw_spec["low"], param_name=param_name, model_name=model_name)
+    high = _coerce_numeric(raw_spec["high"], param_name=param_name, model_name=model_name)
+    if low >= high:
+        raise TuningConfigError(
+            f"Hyperparameter '{param_name}' for model '{model_name}' has invalid range: "
+            f"low={low}, high={high}. Ensure low < high."
+        )
+
+    declared_type = str(raw_spec.get("type", "")).lower().strip()
+    if declared_type in {"int", "integer"}:
+        param_type = "int"
+    elif declared_type in {"float_log", "log_float"}:
+        param_type = "float"
+    elif declared_type in {"float", ""}:
+        param_type = "float"
+    else:
+        raise TuningConfigError(
+            f"Hyperparameter '{param_name}' for model '{model_name}' specifies unsupported type "
+            f"'{declared_type}'. Allowed: int, float, float_log."
+        )
+
+    if param_type == "int":
+        low = math.floor(low)
+        high = math.ceil(high)
+        if low == high:
+            high = low + 1
+
+    center = float(raw_spec.get("center_width_pct", default_center))
+    if not math.isfinite(center) or center <= 0:
+        center = default_center
+    center = min(center, 1.0)
+
+    log_sampling = bool(raw_spec.get("log", False)) or declared_type == "float_log"
+
+    return {
+        "kind": "numeric",
+        "type": param_type,
+        "low": low,
+        "high": high,
+        "log": log_sampling,
+        "center_width_pct": center,
+    }
+
+
+def normalize_param_distributions(
+    tuning_cfg: Mapping[str, Any] | None,
+) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """Normalize/validate hyperparameter distributions from training.yaml."""
+    tuning_cfg = tuning_cfg or {}
+    distributions = tuning_cfg.get("param_distributions") or {}
+    if not isinstance(distributions, Mapping):
+        raise TuningConfigError("'param_distributions' must be a mapping.")
+
+    default_center = float(tuning_cfg.get("center_width_pct", DEFAULT_CENTER_WIDTH))
+    if not math.isfinite(default_center) or default_center <= 0:
+        default_center = DEFAULT_CENTER_WIDTH
+    default_center = min(default_center, 1.0)
+
+    normalized: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for model_name, params in distributions.items():
+        if not isinstance(params, Mapping):
+            raise TuningConfigError(f"Param config for model '{model_name}' must be a mapping.")
+        normalized[model_name] = {}
+        for param_name, raw_spec in params.items():
+            normalized[model_name][param_name] = _normalize_param_spec(
+                model_name, param_name, raw_spec, default_center
+            )
+        if normalized[model_name]:
+            summary = ", ".join(sorted(normalized[model_name].keys()))
+            logger.info(
+                "Hyperparameter tuning configured for model '%s': %s",
+                model_name,
+                summary,
+            )
+    return normalized
 
 # ---- internal helpers (decoupled from ModelTrainer) ----
 def _xgb_supports_callbacks() -> bool:
@@ -44,7 +165,13 @@ def _prepare_splits(X_train, y_train, groups_train):
         cv_fallback = TimeSeriesSplit(n_splits=n_splits)
         return list(cv_fallback.split(X_train, y_train, groups=groups_train))
 
-def _suggest_xgb_params(trial: optuna.Trial, base_params: Dict, param_cfg: Dict, task_type: str, is_rare: bool):
+def _suggest_xgb_params(
+    trial: optuna.Trial,
+    base_params: Dict,
+    param_specs: Dict[str, Dict[str, Any]],
+    task_type: str,
+    is_rare: bool,
+):
     # Match original behavior: create clean_base_params first
     clean_base_params = copy.deepcopy(base_params)
     for k in ['gamma', 'grow_policy', 'max_leaves', 'scale_pos_weight', 'enable_categorical']:
@@ -61,84 +188,61 @@ def _suggest_xgb_params(trial: optuna.Trial, base_params: Dict, param_cfg: Dict,
         "tree_method": "hist",
     }
 
-    # Define parameter configurations with their types and centering factors
-    param_specs = {
-        'n_estimators': ('int', 0.5, 1.5),
-        'learning_rate': ('float_log', 0.5, 2.0),
-        'min_child_weight': ('int', 0.5, 1.5),
-        'subsample': ('float', 0.5, 1.5),
-        'colsample_bytree': ('float', 0.5, 1.5),
-    }
-
-    if not param_cfg:
-        logger.warning("No hyperparameter distributions configured; using base XGBoost parameters.")
+    if not param_specs:
         return params
 
-    for param_name, cfg in param_cfg.items():
-        if "choices" in cfg:
-            params[param_name] = trial.suggest_categorical(param_name, cfg["choices"])
+    def _suggest_numeric_param(name: str, spec: Dict[str, Any]):
+        low = float(spec["low"])
+        high = float(spec["high"])
+        base_value = clean_base_params.get(name)
+        window_low, window_high = low, high
+        if isinstance(base_value, (int, float)) and math.isfinite(base_value) and low <= base_value <= high:
+            range_width = high - low
+            span = max(range_width * spec.get("center_width_pct", DEFAULT_CENTER_WIDTH), 1e-6)
+            half_span = span / 2.0
+            window_low = max(low, base_value - half_span)
+            window_high = min(high, base_value + half_span)
+            if window_low >= window_high:
+                window_low, window_high = low, high
+        if spec["type"] == "int":
+            low_int = int(math.floor(window_low))
+            high_int = int(math.ceil(window_high))
+            if low_int == high_int:
+                high_int = low_int + 1
+            return trial.suggest_int(name, low_int, high_int)
+        log_sampling = bool(spec.get("log", False))
+        return trial.suggest_float(name, float(window_low), float(window_high), log=log_sampling)
+
+    skip_keys = {"grow_policy", "max_depth", "max_leaves"}
+    for param_name, spec in param_specs.items():
+        if param_name in skip_keys:
             continue
-
-        if "low" not in cfg or "high" not in cfg:
-            raise ValueError(
-                f"Hyperparameter '{param_name}' must define 'low' and 'high' in config/training.yaml."
-            )
-
-        cfg_low = cfg["low"]
-        cfg_high = cfg["high"]
-        if cfg_low >= cfg_high:
-            raise ValueError(
-                f"Hyperparameter '{param_name}' has invalid range [{cfg_low}, {cfg_high}]. "
-                "Ensure 'low' < 'high' in config/training.yaml."
-            )
-
-        param_type, center_low_mult, center_high_mult = param_specs.get(
-            param_name, ("float", 0.5, 1.5)
-        )
-
-        base_value = clean_base_params.get(param_name)
-        # Infer type from base value when not explicitly known
-        if param_type == "float" and isinstance(base_value, int) and not isinstance(base_value, bool):
-            param_type = "int"
-
-        if base_value is None or not (cfg_low <= base_value <= cfg_high):
-            # Use full range when base value not provided or outside range
-            if param_type == "int":
-                params[param_name] = trial.suggest_int(param_name, int(cfg_low), int(cfg_high))
-            elif param_type == "float_log" or cfg.get("log"):
-                params[param_name] = trial.suggest_float(param_name, cfg_low, cfg_high, log=True)
-            else:
-                params[param_name] = trial.suggest_float(param_name, cfg_low, cfg_high)
-            continue
-
-        # Center search window around the base value
-        window_low = max(cfg_low, base_value * center_low_mult)
-        window_high = min(cfg_high, base_value * center_high_mult)
-        if window_low >= window_high:
-            window_low, window_high = cfg_low, cfg_high
-
-        if param_type == "int":
-            params[param_name] = trial.suggest_int(param_name, int(window_low), int(window_high))
-        elif param_type == "float_log" or cfg.get("log"):
-            params[param_name] = trial.suggest_float(param_name, window_low, window_high, log=True)
+        if spec["kind"] == "categorical":
+            params[param_name] = trial.suggest_categorical(param_name, spec["choices"])
         else:
-            params[param_name] = trial.suggest_float(param_name, window_low, window_high)
+            params[param_name] = _suggest_numeric_param(param_name, spec)
 
-    # Handle grow_policy - prefer base value if it exists
-    grow_policy_cfg = param_cfg.get("grow_policy", {}).get("choices", ["lossguide", "depthwise"])
-    base_grow_policy = clean_base_params.get('grow_policy', grow_policy_cfg[0])
-    if base_grow_policy in grow_policy_cfg:
-        grow_policy = base_grow_policy
+    if "grow_policy" in param_specs:
+        params["grow_policy"] = trial.suggest_categorical(
+            "grow_policy",
+            param_specs["grow_policy"]["choices"],
+        )
     else:
-        grow_policy = trial.suggest_categorical("grow_policy", grow_policy_cfg)
-    params["grow_policy"] = grow_policy
+        params["grow_policy"] = clean_base_params.get("grow_policy", params.get("grow_policy", "depthwise"))
 
-    # Handle max_leaves/max_depth based on grow_policy
-    if grow_policy == "lossguide":
-        _handle_max_leaves_or_depth(trial, params, param_cfg, clean_base_params, 'max_leaves')
+    def _assign_tree_limit(param_name: str, default_value: int) -> int:
+        if param_name in param_specs:
+            return int(_suggest_numeric_param(param_name, param_specs[param_name]))
+        base = clean_base_params.get(param_name)
+        if isinstance(base, (int, float)):
+            return int(base)
+        return default_value
+
+    if params["grow_policy"] == "lossguide":
+        params["max_leaves"] = _assign_tree_limit("max_leaves", 256)
         params.pop("max_depth", None)
     else:
-        _handle_max_leaves_or_depth(trial, params, param_cfg, clean_base_params, 'max_depth')
+        params["max_depth"] = _assign_tree_limit("max_depth", 6)
         params.pop("max_leaves", None)
 
     # Ensure regularization params exist even if not tuned explicitly
@@ -146,12 +250,6 @@ def _suggest_xgb_params(trial: optuna.Trial, base_params: Dict, param_cfg: Dict,
         params["reg_alpha"] = float(clean_base_params.get("reg_alpha", 0.0))
     if "reg_lambda" not in params:
         params["reg_lambda"] = float(clean_base_params.get("reg_lambda", 1.0))
-
-    # Optional log scaling (kept compatible with your YAML) - CRITICAL FOR PERFORMANCE
-    if param_cfg.get('reg_alpha', {}).get('log', True):
-        params["reg_alpha"] = float(params["reg_alpha"])
-    if param_cfg.get('reg_lambda', {}).get('log', True):
-        params["reg_lambda"] = float(params["reg_lambda"])
 
     return params
 
