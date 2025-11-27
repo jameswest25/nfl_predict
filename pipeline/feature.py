@@ -55,7 +55,7 @@ from utils.feature.asof import (
     drop_missing_snapshots_enabled,
 )
 from utils.feature.asof_metadata import build_asof_metadata, load_asof_metadata
-from utils.general.constants import LEAK_PRONE_COLUMNS, format_cutoff_label
+from utils.general.constants import LEAK_PRONE_COLUMNS, NFL_TARGET_COLUMNS, format_cutoff_label
 from utils.general.paths import (
     PLAY_BY_WEEK_DIR as PLAY_DIR,
     DRIVE_BY_WEEK_DIR as DRIVE_DIR,
@@ -940,6 +940,19 @@ def _build_feature_matrix_internal(
     # Leak guard + schema snapshot before persisting
     spec = get_label_spec(label_version)
     allow_exact = {spec.primary, *spec.labels.keys(), *spec.aliases.keys()}
+    leak_allowlist = allow_exact | set(NFL_TARGET_COLUMNS)
+    drop_before_guard = [
+        col
+        for col in LEAK_PRONE_COLUMNS
+        if col in df_player_game_all.columns and col not in leak_allowlist
+    ]
+    if drop_before_guard:
+        logging.info(
+            "    Dropping %d leak-prone columns prior to schema validation",
+            len(drop_before_guard),
+        )
+        df_player_game_all = df_player_game_all.drop(drop_before_guard, strict=False)
+
     df_player_game_all, leak_result = enforce_leak_guard(
         df_player_game_all,
         policy=DEFAULT_LEAK_POLICY,

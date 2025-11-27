@@ -123,7 +123,7 @@ def compute_td_labels(df: pl.DataFrame, *, version: str | None = None) -> pl.Dat
     reported_total = pl.col("touchdowns").fill_null(0).cast(pl.Int64)
 
     offense_total = _sum_expr([rush, rec, passing]).alias("_td_offense_total")
-    other_total = (reported_total - offense_total).clip_min(0).alias("_td_other_total")
+    other_total = (reported_total - offense_total).clip(lower_bound=0).alias("_td_other_total")
     all_total = (offense_total + other_total).alias("_td_all_total")
 
     totals_exprs = [
@@ -149,12 +149,6 @@ def compute_td_labels(df: pl.DataFrame, *, version: str | None = None) -> pl.Dat
             parts.append(pl.col("_td_other_total"))
         total_expr = _sum_expr(parts)
         label_exprs.append((total_expr > 0).cast(pl.Int8).alias(label_name))
-
-    # Canonical counts for compatibility
-    if "td_count" not in df.columns:
-        # Fill td_count using the alias mapping; default to offense count.
-        target_alias = spec.aliases.get("td_count") or "td_count_offense"
-        label_exprs.append(pl.col(target_alias).alias("td_count"))
 
     df = df.with_columns(totals_exprs).with_columns(label_exprs)
 

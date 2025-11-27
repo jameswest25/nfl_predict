@@ -229,6 +229,8 @@ NFL_TARGET_COLUMNS: Tuple[str, ...] = (
     'carry',
     'reception',
     'offense_pct',
+    'ps_game_route_participation_pct',
+    'ps_game_scripted_touches',
 )
 
 IDENTIFIER_COLUMNS: Tuple[str, ...] = (

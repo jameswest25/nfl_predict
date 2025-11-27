@@ -4,8 +4,14 @@ Target columns are created in utils/feature/player_game_level.py during aggregat
 This module validates that required targets exist and have correct dtypes.
 """
 
-import polars as pl
 import logging
+
+import polars as pl
+
+try:  # pandas is optional when this module is used during feature generation
+    import pandas as pd  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    pd = None
 
 from utils.feature.labels import DEFAULT_LABEL_VERSION, get_label_spec
 
@@ -139,13 +145,23 @@ def require_target_column(
         raise ValueError(f"Target column '{target_col}' not found in feature frame.{alias_hint}")
 
     series = df[target_col]
-    non_null = series.drop_nulls().height
+    non_null: int
+    total_rows = len(series)
+
+    if isinstance(series, pl.Series):
+        non_null = series.drop_nulls().height
+    elif pd is not None and isinstance(series, pd.Series):
+        non_null = int(series.dropna().shape[0])
+    else:
+        # Fallback for plain array-like objects
+        non_null = int(sum(val is not None for val in series))
+
     if non_null < min_non_null:
         raise ValueError(
             f"Target column '{target_col}' has insufficient non-null rows "
-            f"({non_null}/{len(series)})."
+            f"({non_null}/{total_rows})."
         )
-    nulls = len(series) - non_null
+    nulls = total_rows - non_null
     if nulls > 0:
         logger.warning("Target %s contains %d null rows; they will be dropped.", target_col, nulls)
     return df
