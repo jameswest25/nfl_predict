@@ -303,6 +303,19 @@ class ModelTrainer:
         # Format: {problem_name: {"data": DataFrame, "keys": [cols...]}}
         self.problem_predictions: dict[str, dict[str, object]] = {}
 
+        # ==========================================================================
+        # MoE (Mixture of Experts) Configuration
+        # ==========================================================================
+        # model_architecture: "global", "moe", or "both"
+        self.model_architecture = self.config.get('training', {}).get('model_architecture', 'global')
+        self.moe_position_groups = self.config.get('training', {}).get('moe_position_groups', ['RB', 'WR', 'TE', 'QB'])
+        self.moe_models: dict[str, dict[str, object]] = {}  # {problem_name: {position: model}}
+        self.moe_comparison_results: dict[str, dict] = {}  # Store comparison metrics
+        
+        logger.info(f"Model architecture mode: {self.model_architecture}")
+        if self.model_architecture in ("moe", "both"):
+            logger.info(f"MoE position groups: {self.moe_position_groups}")
+
         self._ensure_injury_cache()
 
     def load_data(self, columns=None):
@@ -474,7 +487,341 @@ class ModelTrainer:
         except Exception as exc:
             logger.warning("Failed to refresh ESPN injury cache: %s", exc)
 
-
+    # ==========================================================================
+    # MoE (Mixture of Experts) Helper Methods
+    # ==========================================================================
+    
+    @staticmethod
+    def _normalize_position_group(position: str) -> str:
+        """Normalize a position string to a position group (RB, WR, TE, QB)."""
+        pos = str(position).upper() if position else ""
+        if pos in {"RB", "HB", "FB"}:
+            return "RB"
+        if pos == "WR":
+            return "WR"
+        if pos == "TE":
+            return "TE"
+        if pos == "QB":
+            return "QB"
+        # Default fallback - treat unknown as WR (most common skill position)
+        return "WR"
+    
+    def _add_position_group(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Add position_group column to DataFrame if not present."""
+        if "position_group" not in df.columns:
+            if "position" in df.columns:
+                df = df.copy()
+                df["position_group"] = df["position"].apply(self._normalize_position_group)
+            else:
+                logger.warning("Cannot add position_group: 'position' column not found")
+        return df
+    
+    def _train_moe_models(
+        self,
+        problem_config: dict,
+        X_train: pd.DataFrame,
+        y_train: pd.Series,
+        X_test: pd.DataFrame,
+        y_test: pd.Series,
+        df_train: pd.DataFrame,
+        df_test: pd.DataFrame,
+        sample_weight: pd.Series | None,
+    ) -> dict[str, object]:
+        """
+        Train per-position MoE models for a single problem.
+        
+        Returns dict mapping position -> trained model.
+        """
+        problem_name = problem_config["name"]
+        task_type = problem_config.get("task_type", "classification")
+        
+        logger.info(f"[MoE] Training per-position models for {problem_name}")
+        
+        # Ensure position_group is available
+        df_train = self._add_position_group(df_train)
+        df_test = self._add_position_group(df_test)
+        
+        position_models = {}
+        position_metrics = {}
+        
+        for pos in self.moe_position_groups:
+            # Create masks for this position
+            train_mask = (df_train["position_group"] == pos).values
+            test_mask = (df_test["position_group"] == pos).values
+            
+            n_train = train_mask.sum()
+            n_test = test_mask.sum()
+            
+            if n_train < 50:
+                logger.warning(f"[MoE] Skipping {pos} for {problem_name}: only {n_train} training samples")
+                continue
+            
+            logger.info(f"[MoE] Training {problem_name}.{pos}: {n_train} train, {n_test} test samples")
+            
+            # Subset data
+            X_train_pos = X_train.loc[train_mask].copy()
+            y_train_pos = y_train.loc[train_mask].copy()
+            sw_pos = sample_weight.loc[train_mask] if sample_weight is not None else None
+            
+            # Convert categorical columns to numeric for XGBoost
+            for col in X_train_pos.columns:
+                if X_train_pos[col].dtype.name == 'category':
+                    X_train_pos[col] = X_train_pos[col].cat.codes
+                elif X_train_pos[col].dtype == 'object':
+                    X_train_pos[col] = pd.to_numeric(X_train_pos[col], errors='coerce')
+            X_train_pos = X_train_pos.fillna(0)
+            
+            # Get model parameters from config
+            xgb_params = self.config.get("xgboost", {}).copy()
+            
+            # Adjust objective based on task type
+            if task_type == "regression":
+                xgb_params["objective"] = "reg:squarederror"
+                xgb_params.pop("eval_metric", None)
+            else:
+                xgb_params["objective"] = "binary:logistic"
+                xgb_params["eval_metric"] = "auc"
+            
+            # Create and train model
+            if task_type == "regression":
+                model = xgb.XGBRegressor(
+                    **{k: v for k, v in xgb_params.items() if k not in ("objective", "eval_metric")},
+                    objective=xgb_params.get("objective", "reg:squarederror"),
+                    random_state=self.base_seed,
+                    n_jobs=-1,
+                )
+            else:
+                model = xgb.XGBClassifier(
+                    **{k: v for k, v in xgb_params.items() if k not in ("objective", "eval_metric")},
+                    objective=xgb_params.get("objective", "binary:logistic"),
+                    eval_metric=xgb_params.get("eval_metric", "auc"),
+                    random_state=self.base_seed,
+                    n_jobs=-1,
+                    use_label_encoder=False,
+                )
+            
+            # Fit model
+            fit_kwargs = {"sample_weight": sw_pos} if sw_pos is not None else {}
+            model.fit(X_train_pos, y_train_pos, **fit_kwargs)
+            
+            position_models[pos] = model
+            
+            # Compute test metrics for this position
+            if n_test >= 10:
+                X_test_pos = X_test.loc[test_mask].copy()
+                y_test_pos = y_test.loc[test_mask].copy()
+                
+                # Convert categorical columns to numeric for XGBoost
+                for col in X_test_pos.columns:
+                    if X_test_pos[col].dtype.name == 'category':
+                        X_test_pos[col] = X_test_pos[col].cat.codes
+                    elif X_test_pos[col].dtype == 'object':
+                        X_test_pos[col] = pd.to_numeric(X_test_pos[col], errors='coerce')
+                X_test_pos = X_test_pos.fillna(0)
+                
+                if task_type == "regression":
+                    preds_pos = model.predict(X_test_pos)
+                    from sklearn.metrics import mean_absolute_error, r2_score
+                    mae = mean_absolute_error(y_test_pos, preds_pos)
+                    r2 = r2_score(y_test_pos, preds_pos) if len(np.unique(y_test_pos)) > 1 else 0
+                    position_metrics[pos] = {"mae": mae, "r2": r2, "n_train": n_train, "n_test": n_test}
+                    logger.info(f"[MoE] {problem_name}.{pos}: MAE={mae:.4f}, R²={r2:.4f}")
+                else:
+                    preds_pos = model.predict_proba(X_test_pos)[:, 1]
+                    from sklearn.metrics import roc_auc_score, average_precision_score
+                    try:
+                        auc = roc_auc_score(y_test_pos, preds_pos)
+                        pr_auc = average_precision_score(y_test_pos, preds_pos)
+                    except Exception:
+                        auc = 0.5
+                        pr_auc = y_test_pos.mean()
+                    position_metrics[pos] = {"auc": auc, "pr_auc": pr_auc, "n_train": n_train, "n_test": n_test}
+                    logger.info(f"[MoE] {problem_name}.{pos}: AUC={auc:.4f}, PR-AUC={pr_auc:.4f}")
+        
+        # Store MoE models
+        self.moe_models[problem_name] = position_models
+        
+        # Save MoE models to disk
+        self._save_moe_models(problem_name, position_models)
+        
+        # Store comparison metrics
+        self.moe_comparison_results[problem_name] = {
+            "position_metrics": position_metrics,
+            "positions_trained": list(position_models.keys()),
+        }
+        
+        return position_models
+    
+    def _save_moe_models(self, problem_name: str, position_models: dict[str, object]) -> None:
+        """Save MoE models to disk with position-specific filenames."""
+        problem_dir = self.model_dir / problem_name / "xgboost"
+        problem_dir.mkdir(parents=True, exist_ok=True)
+        
+        for pos, model in position_models.items():
+            model_path = problem_dir / f"model.{pos}.joblib"
+            joblib.dump(model, model_path)
+            logger.info(f"[MoE] Saved {problem_name}.{pos} model to {model_path}")
+        
+        # Also save MoE inference artifacts
+        moe_artifacts = {
+            "feature_columns": list(self.feature_columns) if self.feature_columns else [],
+            "positions": list(position_models.keys()),
+            "fallback_position": "WR",  # Default fallback
+        }
+        artifacts_path = self.model_dir / f"inference_artifacts_{problem_name}_moe.joblib"
+        joblib.dump(moe_artifacts, artifacts_path)
+        logger.info(f"[MoE] Saved inference artifacts to {artifacts_path}")
+    
+    def _predict_with_moe(
+        self,
+        X: pd.DataFrame,
+        df: pd.DataFrame,
+        problem_name: str,
+    ) -> np.ndarray:
+        """
+        Generate predictions using MoE models, routing by position group.
+        
+        Args:
+            X: Feature matrix (already transformed)
+            df: Original DataFrame with position column
+            problem_name: Name of the problem
+            
+        Returns:
+            Array of predictions
+        """
+        if problem_name not in self.moe_models:
+            raise ValueError(f"No MoE models found for problem {problem_name}")
+        
+        position_models = self.moe_models[problem_name]
+        df = self._add_position_group(df)
+        
+        preds = np.zeros(len(X), dtype=np.float64)
+        position_groups = df["position_group"]
+        
+        # Route predictions by position
+        for pos, model in position_models.items():
+            mask = (position_groups == pos).values
+            if mask.sum() == 0:
+                continue
+            
+            X_pos = X.loc[mask].copy()
+            # Convert categorical columns to numeric for XGBoost
+            for col in X_pos.columns:
+                if X_pos[col].dtype.name == 'category':
+                    X_pos[col] = X_pos[col].cat.codes
+                elif X_pos[col].dtype == 'object':
+                    X_pos[col] = pd.to_numeric(X_pos[col], errors='coerce')
+            X_pos = X_pos.fillna(0)
+            
+            if hasattr(model, "predict_proba"):
+                pos_preds = model.predict_proba(X_pos)
+                if pos_preds.ndim > 1:
+                    pos_preds = pos_preds[:, 1]
+            else:
+                pos_preds = model.predict(X_pos)
+            
+            preds[mask] = pos_preds
+        
+        # Handle positions not covered by trained models (use fallback)
+        known_positions = set(position_models.keys())
+        fallback_mask = ~position_groups.isin(known_positions).values
+        if fallback_mask.sum() > 0:
+            fallback_pos = "WR" if "WR" in position_models else list(position_models.keys())[0]
+            fallback_model = position_models[fallback_pos]
+            X_fallback = X.loc[fallback_mask].copy()
+            
+            # Convert categorical columns to numeric for XGBoost
+            for col in X_fallback.columns:
+                if X_fallback[col].dtype.name == 'category':
+                    X_fallback[col] = X_fallback[col].cat.codes
+                elif X_fallback[col].dtype == 'object':
+                    X_fallback[col] = pd.to_numeric(X_fallback[col], errors='coerce')
+            X_fallback = X_fallback.fillna(0)
+            
+            if hasattr(fallback_model, "predict_proba"):
+                fallback_preds = fallback_model.predict_proba(X_fallback)
+                if fallback_preds.ndim > 1:
+                    fallback_preds = fallback_preds[:, 1]
+            else:
+                fallback_preds = fallback_model.predict(X_fallback)
+            
+            preds[fallback_mask] = fallback_preds
+            logger.info(f"[MoE] Used {fallback_pos} model as fallback for {fallback_mask.sum()} rows")
+        
+        return preds
+    
+    def _compare_global_vs_moe(
+        self,
+        problem_name: str,
+        X_test: pd.DataFrame,
+        y_test: pd.Series,
+        df_test: pd.DataFrame,
+        global_preds: np.ndarray,
+        task_type: str,
+    ) -> dict:
+        """
+        Compare global model vs MoE predictions and return comparison metrics.
+        """
+        if problem_name not in self.moe_models:
+            return {}
+        
+        # Get MoE predictions
+        moe_preds = self._predict_with_moe(X_test, df_test, problem_name)
+        df_test = self._add_position_group(df_test)
+        position_groups = df_test["position_group"]
+        
+        comparison = {"global": {}, "moe": {}, "by_position": {}}
+        
+        if task_type == "regression":
+            from sklearn.metrics import mean_absolute_error, r2_score
+            
+            # Overall metrics
+            comparison["global"]["mae"] = mean_absolute_error(y_test, global_preds)
+            comparison["global"]["r2"] = r2_score(y_test, global_preds) if len(np.unique(y_test)) > 1 else 0
+            comparison["moe"]["mae"] = mean_absolute_error(y_test, moe_preds)
+            comparison["moe"]["r2"] = r2_score(y_test, moe_preds) if len(np.unique(y_test)) > 1 else 0
+            
+            # By position
+            for pos in self.moe_position_groups:
+                mask = (position_groups == pos).values
+                if mask.sum() < 10:
+                    continue
+                y_pos = y_test.loc[mask]
+                g_pos = global_preds[mask]
+                m_pos = moe_preds[mask]
+                
+                comparison["by_position"][pos] = {
+                    "n": int(mask.sum()),
+                    "global_mae": mean_absolute_error(y_pos, g_pos),
+                    "moe_mae": mean_absolute_error(y_pos, m_pos),
+                    "global_r2": r2_score(y_pos, g_pos) if len(np.unique(y_pos)) > 1 else 0,
+                    "moe_r2": r2_score(y_pos, m_pos) if len(np.unique(y_pos)) > 1 else 0,
+                }
+        else:
+            from sklearn.metrics import roc_auc_score, average_precision_score
+            
+            # Overall metrics
+            try:
+                comparison["global"]["auc"] = roc_auc_score(y_test, global_preds)
+                comparison["global"]["pr_auc"] = average_precision_score(y_test, global_preds)
+                comparison["moe"]["auc"] = roc_auc_score(y_test, moe_preds)
+                comparison["moe"]["pr_auc"] = average_precision_score(y_test, moe_preds)
+            except Exception:
+                pass
+        
+        # Log comparison
+        logger.info(f"[MoE] Comparison for {problem_name}:")
+        if task_type == "regression":
+            g_mae = comparison["global"].get("mae", 0)
+            m_mae = comparison["moe"].get("mae", 0)
+            delta = m_mae - g_mae
+            logger.info(f"  Overall: Global MAE={g_mae:.4f}, MoE MAE={m_mae:.4f}, Δ={delta:+.4f}")
+            for pos, metrics in comparison["by_position"].items():
+                delta_pos = metrics["moe_mae"] - metrics["global_mae"]
+                better = "✓" if delta_pos < 0 else ""
+                logger.info(f"  {pos}: Global={metrics['global_mae']:.4f}, MoE={metrics['moe_mae']:.4f}, Δ={delta_pos:+.4f} {better}")
+        
+        return comparison
 
     
 
@@ -563,33 +910,148 @@ class ModelTrainer:
                     return name
             return None
 
-        # Availability x usage → expected opportunities
-        _safe_mul("pred_availability", "pred_usage_targets", "expected_targets")
-        _safe_mul("pred_availability_raw", "pred_usage_targets", "expected_targets_raw")
-        _safe_mul("pred_availability", "pred_usage_carries", "expected_carries")
-        _safe_mul("pred_availability_raw", "pred_usage_carries", "expected_carries_raw")
-
-        if "pred_team_pace" in df.columns and "expected_team_plays" not in df.columns:
-            team_pace = pd.to_numeric(df["pred_team_pace"], errors="coerce").clip(lower=0.0)
-            df["expected_team_plays"] = team_pace
-            pass_rate_col = _select_column(
-                [
+        # Team pass/rush rate proxies reused across expectations
+        pass_rate_candidates = [
                     "team_ctx_pass_rate_prev",
                     "team_ctx_pass_rate_l3",
                     "team_ctx_pass_rate_l5",
+            "team_pass_rate_prev",
+            "team_pass_rate_l3",
                 ]
-            )
+        pass_rate_col = _select_column(pass_rate_candidates)
+        default_pass_rate = 0.55
+        if len(df):
             if pass_rate_col:
-                pass_rate = (
+                pass_rate_series = (
                     pd.to_numeric(df[pass_rate_col], errors="coerce")
-                    .fillna(0.5)
-                    .clip(lower=0.0, upper=1.0)
+                    .fillna(default_pass_rate)
+                    .clip(0.0, 1.0)
                 )
-                df["expected_team_pass_plays"] = team_pace * pass_rate
-                df["expected_team_rush_plays"] = team_pace * (1.0 - pass_rate)
+            else:
+                pass_rate_series = pd.Series(default_pass_rate, index=df.index, dtype=np.float32)
+        else:
+            pass_rate_series = pd.Series([], dtype=np.float32)
+        rush_rate_series = (1.0 - pass_rate_series).clip(0.0, 1.0)
+
+        # Team-level expected plays from pace model
+        if "pred_team_pace" in df.columns:
+            team_pace = pd.to_numeric(df["pred_team_pace"], errors="coerce").clip(lower=0.0)
+            df["expected_team_plays"] = team_pace
+            if len(team_pace) and len(pass_rate_series) == len(team_pace):
+                df["expected_team_pass_plays"] = (team_pace * pass_rate_series).astype(np.float32)
+                df["expected_team_rush_plays"] = (team_pace * rush_rate_series).astype(np.float32)
+            else:
+                df["expected_team_pass_plays"] = (
+                    team_pace * default_pass_rate
+                ).astype(np.float32)
+                df["expected_team_rush_plays"] = (
+                    team_pace * (1.0 - default_pass_rate)
+                ).astype(np.float32)
+
+        # Explicit snaps expectation from stage-1 model or availability fallback
+        expected_snaps_series: pd.Series | None = None
+        if "pred_snaps" in df.columns:
+            expected_snaps_series = (
+                pd.to_numeric(df["pred_snaps"], errors="coerce")
+                .fillna(0.0)
+                .clip(lower=0.0)
+            )
+            df["expected_snaps"] = expected_snaps_series.astype(np.float32)
+        elif (
+            "pred_availability" in df.columns
+            and "pred_availability_snapshare" in df.columns
+            and "expected_team_plays" in df.columns
+        ):
+            avail = pd.to_numeric(df["pred_availability"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
+            snapshare = pd.to_numeric(df["pred_availability_snapshare"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
+            team_plays = pd.to_numeric(df["expected_team_plays"], errors="coerce").fillna(0.0).clip(lower=0.0)
+            expected_snaps_series = (avail * snapshare * team_plays).astype(np.float32)
+            df["expected_snaps"] = expected_snaps_series
+
+        # Raw snaps proxy (used for diagnostics/guard rails)
+        expected_snaps_raw_series: pd.Series | None = None
+        if (
+            "pred_availability_raw" in df.columns
+            and "pred_availability_snapshare" in df.columns
+            and "expected_team_plays" in df.columns
+        ):
+            avail_raw = pd.to_numeric(df["pred_availability_raw"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
+            snapshare = pd.to_numeric(df["pred_availability_snapshare"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
+            team_plays = pd.to_numeric(df["expected_team_plays"], errors="coerce").fillna(0.0).clip(lower=0.0)
+            expected_snaps_raw_series = (avail_raw * snapshare * team_plays).astype(np.float32)
+            df["expected_snaps_raw"] = expected_snaps_raw_series
+
+        if expected_snaps_series is None and "expected_snaps" in df.columns:
+            expected_snaps_series = (
+                pd.to_numeric(df["expected_snaps"], errors="coerce")
+                .fillna(0.0)
+                .clip(lower=0.0)
+            )
+        if expected_snaps_series is not None:
+            expected_snaps_series = expected_snaps_series.astype(np.float32)
+
+        # Uncertainty-weighted snaps and opportunities for fragile volume handling
+        if expected_snaps_series is not None and "availability_uncertainty" in df.columns:
+            unc = pd.to_numeric(df["availability_uncertainty"], errors="coerce").fillna(0.0).clip(0.0, 0.25)
+            df["expected_snaps_stable"] = (expected_snaps_series * (1.0 - unc)).astype(np.float32)
+
+        # Usage share × expected snaps × team rates = expected counts
+        if expected_snaps_series is not None and "pred_usage_targets" in df.columns:
+            share_tgt = pd.to_numeric(df["pred_usage_targets"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
+            df["expected_targets"] = (
+                share_tgt.astype(np.float32) * expected_snaps_series * pass_rate_series.reindex(df.index, fill_value=default_pass_rate)
+            ).astype(np.float32)
+
+        if expected_snaps_raw_series is not None and "pred_usage_targets" in df.columns:
+            share_tgt = pd.to_numeric(df["pred_usage_targets"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
+            df["expected_targets_raw"] = (
+                share_tgt.astype(np.float32) * expected_snaps_raw_series * pass_rate_series.reindex(df.index, fill_value=default_pass_rate)
+            ).astype(np.float32)
+
+        if expected_snaps_series is not None and "pred_usage_carries" in df.columns:
+            share_car = pd.to_numeric(df["pred_usage_carries"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
+            df["expected_carries"] = (
+                share_car.astype(np.float32) * expected_snaps_series * rush_rate_series.reindex(df.index, fill_value=1.0 - default_pass_rate)
+            ).astype(np.float32)
+
+        if expected_snaps_raw_series is not None and "pred_usage_carries" in df.columns:
+            share_car = pd.to_numeric(df["pred_usage_carries"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
+            df["expected_carries_raw"] = (
+                share_car.astype(np.float32) * expected_snaps_raw_series * rush_rate_series.reindex(df.index, fill_value=1.0 - default_pass_rate)
+            ).astype(np.float32)
+
+        if "expected_targets" in df.columns and "expected_targets_raw" not in df.columns:
+            df["expected_targets_raw"] = df["expected_targets"]
+        if "expected_carries" in df.columns and "expected_carries_raw" not in df.columns:
+            df["expected_carries_raw"] = df["expected_carries"]
 
         if "expected_targets" in df.columns and "expected_carries" in df.columns:
+            # Optional: enforce per-team consistency between expected targets/carries
+            # and team-level play expectations by rescaling within (season, week, team, game_id).
+            group_keys = [k for k in ("season", "week", "team", "game_id") if k in df.columns]
+            if group_keys and {"expected_team_pass_plays", "expected_team_rush_plays"} <= set(df.columns):
+                grouped = df.groupby(group_keys, dropna=False, sort=False)
+                sum_targets = grouped["expected_targets"].transform("sum")
+                sum_carries = grouped["expected_carries"].transform("sum")
+                team_pass = df["expected_team_pass_plays"]
+                team_rush = df["expected_team_rush_plays"]
+                eps = 1e-6
+                # Only rescale where team expectations are positive to avoid
+                # blowing up very small totals.
+                tgt_mask = (team_pass > 0.0) & (sum_targets > 0.0)
+                car_mask = (team_rush > 0.0) & (sum_carries > 0.0)
+                scale_tgt = np.ones_like(team_pass, dtype=np.float32)
+                scale_car = np.ones_like(team_rush, dtype=np.float32)
+                scale_tgt[tgt_mask] = (team_pass[tgt_mask] / (sum_targets[tgt_mask] + eps)).clip(0.25, 4.0)
+                scale_car[car_mask] = (team_rush[car_mask] / (sum_carries[car_mask] + eps)).clip(0.25, 4.0)
+                df["expected_targets"] = df["expected_targets"] * scale_tgt
+                df["expected_carries"] = df["expected_carries"] * scale_car
             df["expected_opportunities"] = df["expected_targets"] + df["expected_carries"]
+            if "availability_uncertainty" in df.columns:
+                unc = pd.to_numeric(df["availability_uncertainty"], errors="coerce").fillna(0.0).clip(0.0, 0.25)
+                df["expected_opportunities_stable"] = (
+                    df["expected_opportunities"] * (1.0 - unc)
+                ).astype(np.float32)
         if "expected_targets_raw" in df.columns and "expected_carries_raw" in df.columns:
             df["expected_opportunities_raw"] = df["expected_targets_raw"] + df["expected_carries_raw"]
 
@@ -597,6 +1059,56 @@ class ModelTrainer:
             df["expected_td_signal"] = df["pred_efficiency_tds"] * df["expected_opportunities"]
         if "pred_efficiency_tds" in df.columns and "expected_opportunities_raw" in df.columns:
             df["expected_td_signal_raw"] = df["pred_efficiency_tds"] * df["expected_opportunities_raw"]
+        if (
+            "pred_efficiency_rec_success" in df.columns
+            and "expected_targets" in df.columns
+        ):
+            rec_success = pd.to_numeric(df["pred_efficiency_rec_success"], errors="coerce").clip(0.0, 1.0)
+            targets = pd.to_numeric(df["expected_targets"], errors="coerce").fillna(0.0).clip(lower=0.0)
+            df["expected_rec_success"] = (rec_success * targets).astype(np.float32)
+        if (
+            "pred_efficiency_rush_success" in df.columns
+            and "expected_carries" in df.columns
+        ):
+            rush_success = pd.to_numeric(df["pred_efficiency_rush_success"], errors="coerce").clip(0.0, 1.0)
+            carries = pd.to_numeric(df["expected_carries"], errors="coerce").fillna(0.0).clip(lower=0.0)
+            df["expected_rush_success"] = (rush_success * carries).astype(np.float32)
+        td_rate_rec = None
+        if "pred_td_conv_rec" in df.columns:
+            td_rate_rec = pd.to_numeric(df["pred_td_conv_rec"], errors="coerce").clip(0.0, 1.0)
+            df["expected_td_rate_per_target"] = td_rate_rec.astype(np.float32)
+        td_rate_rush = None
+        if "pred_td_conv_rush" in df.columns:
+            td_rate_rush = pd.to_numeric(df["pred_td_conv_rush"], errors="coerce").clip(0.0, 1.0)
+            df["expected_td_rate_per_carry"] = td_rate_rush.astype(np.float32)
+        if td_rate_rec is not None and "expected_targets" in df.columns:
+            expected_targets = pd.to_numeric(df["expected_targets"], errors="coerce").fillna(0.0).clip(lower=0.0)
+            df["expected_td_from_targets"] = (td_rate_rec * expected_targets).astype(np.float32)
+        if td_rate_rush is not None and "expected_carries" in df.columns:
+            expected_carries = pd.to_numeric(df["expected_carries"], errors="coerce").fillna(0.0).clip(lower=0.0)
+            df["expected_td_from_carries"] = (td_rate_rush * expected_carries).astype(np.float32)
+        if td_rate_rec is not None and "expected_rz_targets" in df.columns:
+            rz_targets = pd.to_numeric(df["expected_rz_targets"], errors="coerce").fillna(0.0).clip(lower=0.0)
+            df["expected_rz_td_from_targets"] = (td_rate_rec * rz_targets).astype(np.float32)
+        if td_rate_rush is not None and "expected_rz_carries" in df.columns:
+            rz_carries = pd.to_numeric(df["expected_rz_carries"], errors="coerce").fillna(0.0).clip(lower=0.0)
+            df["expected_rz_td_from_carries"] = (td_rate_rush * rz_carries).astype(np.float32)
+        td_components: list[pd.Series] = []
+        for col in ("expected_td_from_targets", "expected_td_from_carries"):
+            if col in df.columns:
+                td_components.append(pd.to_numeric(df[col], errors="coerce").fillna(0.0))
+        if td_components:
+            total_td = td_components[0]
+            for comp in td_components[1:]:
+                total_td = total_td.add(comp, fill_value=0.0)
+            total_td = total_td.clip(lower=0.0)
+            df["expected_td_count_structural"] = total_td.astype(np.float32)
+            df["expected_td_prob_structural"] = (1.0 - np.exp(-total_td)).astype(np.float32)
+            df["anytime_td_structural"] = df["expected_td_prob_structural"]
+            if "expected_opportunities" in df.columns:
+                opp = pd.to_numeric(df["expected_opportunities"], errors="coerce").fillna(0.0)
+                opp_safe = opp.replace(0, np.nan)
+                df["expected_td_rate_per_opportunity"] = (total_td / opp_safe).astype(np.float32)
 
         def _expected_red_zone(base_col: str, share_col: str | None, out_col: str) -> None:
             if base_col in df.columns and share_col:
@@ -667,17 +1179,26 @@ class ModelTrainer:
             df["expected_rz_td_signal_raw"] = df["pred_efficiency_tds"] * df["expected_rz_opportunities_raw"]
 
         if "pred_efficiency_rec_yards" in df.columns:
-            df["expected_receiving_yards"] = (
-                pd.to_numeric(df["pred_efficiency_rec_yards"], errors="coerce")
-                .clip(lower=0.0)
-            )
+            rec_rate = pd.to_numeric(df["pred_efficiency_rec_yards"], errors="coerce").clip(lower=0.0)
+            if "expected_targets" in df.columns:
+                targets = pd.to_numeric(df["expected_targets"], errors="coerce").fillna(0.0).clip(lower=0.0)
+                df["expected_receiving_yards"] = (rec_rate * targets).astype(np.float32)
+            else:
+                df["expected_receiving_yards"] = rec_rate.astype(np.float32)
         if "pred_efficiency_rush_yards" in df.columns:
-            df["expected_rushing_yards"] = (
-                pd.to_numeric(df["pred_efficiency_rush_yards"], errors="coerce")
-                .clip(lower=0.0)
-            )
+            rush_rate = pd.to_numeric(df["pred_efficiency_rush_yards"], errors="coerce").clip(lower=0.0)
+            if "expected_carries" in df.columns:
+                carries = pd.to_numeric(df["expected_carries"], errors="coerce").fillna(0.0).clip(lower=0.0)
+                df["expected_rushing_yards"] = (rush_rate * carries).astype(np.float32)
+            else:
+                df["expected_rushing_yards"] = rush_rate.astype(np.float32)
         if "expected_receiving_yards" in df.columns and "expected_rushing_yards" in df.columns:
-            df["expected_total_yards"] = df["expected_receiving_yards"] + df["expected_rushing_yards"]
+            total_yards = df["expected_receiving_yards"] + df["expected_rushing_yards"]
+            df["expected_total_yards"] = total_yards
+            if "expected_opportunities" in df.columns:
+                opp = pd.to_numeric(df["expected_opportunities"], errors="coerce").fillna(0.0)
+                opp_safe = opp.replace(0, np.nan)
+                df["expected_yards_per_opportunity"] = (total_yards / opp_safe).astype(np.float32)
 
         if "expected_td_signal" in df.columns and "expected_td_prob_poisson" not in df.columns:
             df["expected_td_prob_poisson"] = 1.0 - np.exp(-df["expected_td_signal"].clip(lower=0.0))
@@ -689,6 +1210,388 @@ class ModelTrainer:
             df["expected_rz_td_prob_poisson_raw"] = 1.0 - np.exp(-df["expected_rz_td_signal_raw"].clip(lower=0.0))
 
         return df
+
+    def _persist_usage_expected_metrics(self, problem_name: str, df_problem: pd.DataFrame, preds: np.ndarray) -> None:
+        usage_meta = {
+            "usage_targets": {
+                "share_col": "target_share_label",
+                "total_col": "team_targets_total",
+                "actual_col": "target",
+                "expected_col": "expected_targets",
+            },
+            "usage_carries": {
+                "share_col": "carry_share_label",
+                "total_col": "team_carries_total",
+                "actual_col": "carry",
+                "expected_col": "expected_carries",
+            },
+        }
+        meta = usage_meta.get(problem_name)
+        if not meta or df_problem is None or preds is None:
+            return
+
+        try:
+            work = df_problem.copy()
+            pred_col = f"pred_{problem_name}"
+            work[pred_col] = preds
+            work = self._inject_composed_features(work)
+            if meta["expected_col"] not in work.columns:
+                logger.warning("Usage diagnostics skipped for %s (missing %s).", problem_name, meta["expected_col"])
+                return
+            expected_series = pd.to_numeric(work[meta["expected_col"]], errors="coerce")
+            actual_series = None
+
+            if meta["share_col"] in work.columns and meta["total_col"] in work.columns:
+                share = pd.to_numeric(work[meta["share_col"]], errors="coerce")
+                totals = pd.to_numeric(work[meta["total_col"]], errors="coerce")
+                actual_series = share * totals
+            if actual_series is None or actual_series.isna().all():
+                if meta["actual_col"] in work.columns:
+                    actual_series = pd.to_numeric(work[meta["actual_col"]], errors="coerce")
+
+            if actual_series is None:
+                logger.warning("Usage diagnostics skipped for %s (missing actual counts).", problem_name)
+                return
+
+            mask = expected_series.notna() & actual_series.notna()
+            if not mask.any():
+                logger.warning("Usage diagnostics skipped for %s (no overlapping rows).", problem_name)
+                return
+
+            expected = expected_series[mask]
+            actual = actual_series[mask]
+            diff = expected - actual
+
+            try:
+                r2 = r2_score(actual, expected)
+            except Exception:
+                r2 = float("nan")
+            std_expected = float(expected.std(ddof=0))
+            std_actual = float(actual.std(ddof=0))
+            corr = float(actual.corr(expected)) if std_expected > 0 and std_actual > 0 else float("nan")
+
+            metrics = {
+                "samples": int(mask.sum()),
+                "actual_mean": float(actual.mean()),
+                "expected_mean": float(expected.mean()),
+                "mae": float(np.mean(np.abs(diff))),
+                "rmse": float(np.sqrt(np.mean(np.square(diff)))),
+                "r2": float(r2) if not math.isnan(r2) else None,
+                "corr": corr if not math.isnan(corr) else None,
+            }
+
+            if "position" in work.columns:
+                pos_df = pd.DataFrame(
+                    {
+                        "position": work.loc[mask, "position"],
+                        "actual": actual,
+                        "expected": expected,
+                    }
+                )
+                pos_stats: dict[str, dict[str, float]] = {}
+                for pos, grp in pos_df.groupby("position"):
+                    if grp.empty:
+                        continue
+                    delta = grp["expected"] - grp["actual"]
+                    pos_stats[str(pos)] = {
+                        "samples": int(len(grp)),
+                        "actual_mean": float(grp["actual"].mean()),
+                        "expected_mean": float(grp["expected"].mean()),
+                        "mae": float(np.mean(np.abs(delta))),
+                    }
+                metrics["position_breakdown"] = pos_stats
+
+            out_dir = _vdir(self, problem_name, "xgboost", "metrics")
+            diag_path = out_dir / "expected_counts.yaml"
+            with diag_path.open("w") as fh:
+                yaml.safe_dump(metrics, fh, sort_keys=False)
+            logger.info(
+                "Wrote usage expected-count diagnostics for %s → %s (samples=%d)",
+                problem_name,
+                diag_path,
+                metrics["samples"],
+            )
+        except Exception as exc:
+            logger.warning("Failed to persist usage diagnostics for %s: %s", problem_name, exc)
+
+    def _persist_efficiency_metrics(self, problem_name: str, df_problem: pd.DataFrame, preds: np.ndarray) -> None:
+        target_map = {
+            "efficiency_rec_success": "rec_success_rate_label",
+            "efficiency_rush_success": "rush_success_rate_label",
+            "efficiency_rec_yards": "yards_per_target_label",
+            "efficiency_rush_yards": "yards_per_carry_label",
+        }
+        target_col = target_map.get(problem_name)
+        if not target_col or target_col not in df_problem.columns or preds is None:
+            return
+
+        try:
+            actual = pd.to_numeric(df_problem[target_col], errors="coerce")
+            predicted = pd.Series(preds, index=df_problem.index)
+            mask = actual.notna() & predicted.notna()
+            if not mask.any():
+                logger.warning("Efficiency diagnostics skipped for %s (no overlapping rows).", problem_name)
+                return
+
+            actual = actual[mask]
+            predicted = predicted[mask]
+            diff = predicted - actual
+
+            try:
+                r2 = r2_score(actual, predicted)
+            except Exception:
+                r2 = float("nan")
+            std_pred = float(predicted.std(ddof=0))
+            std_actual = float(actual.std(ddof=0))
+            corr = float(actual.corr(predicted)) if std_pred > 0 and std_actual > 0 else float("nan")
+
+            metrics = {
+                "samples": int(mask.sum()),
+                "actual_mean": float(actual.mean()),
+                "pred_mean": float(predicted.mean()),
+                "mae": float(np.mean(np.abs(diff))),
+                "rmse": float(np.sqrt(np.mean(np.square(diff)))),
+                "r2": float(r2) if not math.isnan(r2) else None,
+                "corr": corr if not math.isnan(corr) else None,
+            }
+
+            if "position" in df_problem.columns:
+                pos_stats: dict[str, dict[str, float]] = {}
+                pos_series = df_problem.loc[mask, "position"]
+                for pos, grp in pd.DataFrame(
+                    {
+                        "position": pos_series,
+                        "actual": actual,
+                        "pred": predicted,
+                    }
+                ).groupby("position"):
+                    if grp.empty:
+                        continue
+                    delta = grp["pred"] - grp["actual"]
+                    pos_stats[str(pos)] = {
+                        "samples": int(len(grp)),
+                        "actual_mean": float(grp["actual"].mean()),
+                        "pred_mean": float(grp["pred"].mean()),
+                        "mae": float(np.mean(np.abs(delta))),
+                    }
+                metrics["position_breakdown"] = pos_stats
+
+            out_dir = _vdir(self, problem_name, "xgboost", "metrics")
+            diag_path = out_dir / "efficiency_metrics.yaml"
+            with diag_path.open("w") as fh:
+                yaml.safe_dump(metrics, fh, sort_keys=False)
+            logger.info(
+                "Wrote efficiency diagnostics for %s → %s (samples=%d)",
+                problem_name,
+                diag_path,
+                metrics["samples"],
+            )
+        except Exception as exc:
+            logger.warning("Failed to persist efficiency diagnostics for %s: %s", problem_name, exc)
+
+    def _persist_td_conversion_metrics(self, problem_name: str, df_problem: pd.DataFrame, preds: np.ndarray) -> None:
+        target_map = {
+            "td_conv_rec": "td_per_target_label",
+            "td_conv_rush": "td_per_carry_label",
+        }
+        target_col = target_map.get(problem_name)
+        if not target_col or target_col not in df_problem.columns or preds is None:
+            return
+
+        try:
+            actual = pd.to_numeric(df_problem[target_col], errors="coerce")
+            predicted = pd.Series(preds, index=df_problem.index)
+            mask = actual.notna() & predicted.notna()
+            if not mask.any():
+                logger.warning("TD conversion diagnostics skipped for %s (no overlapping rows).", problem_name)
+                return
+
+            actual = actual[mask]
+            predicted = predicted[mask]
+            diff = predicted - actual
+
+            try:
+                r2 = r2_score(actual, predicted)
+            except Exception:
+                r2 = float("nan")
+            std_pred = float(predicted.std(ddof=0))
+            std_actual = float(actual.std(ddof=0))
+            corr = float(actual.corr(predicted)) if std_pred > 0 and std_actual > 0 else float("nan")
+
+            metrics = {
+                "samples": int(mask.sum()),
+                "actual_mean": float(actual.mean()),
+                "pred_mean": float(predicted.mean()),
+                "mae": float(np.mean(np.abs(diff))),
+                "rmse": float(np.sqrt(np.mean(np.square(diff)))),
+                "r2": float(r2) if not math.isnan(r2) else None,
+                "corr": corr if not math.isnan(corr) else None,
+            }
+
+            if "position" in df_problem.columns:
+                pos_stats: dict[str, dict[str, float]] = {}
+                pos_series = df_problem.loc[mask, "position"]
+                pos_df = pd.DataFrame(
+                    {
+                        "position": pos_series,
+                        "actual": actual,
+                        "pred": predicted,
+                    }
+                )
+                for pos, grp in pos_df.groupby("position"):
+                    if grp.empty:
+                        continue
+                    delta = grp["pred"] - grp["actual"]
+                    pos_stats[str(pos)] = {
+                        "samples": int(len(grp)),
+                        "actual_mean": float(grp["actual"].mean()),
+                        "pred_mean": float(grp["pred"].mean()),
+                        "mae": float(np.mean(np.abs(delta))),
+                    }
+                metrics["position_breakdown"] = pos_stats
+
+            out_dir = _vdir(self, problem_name, "xgboost", "metrics")
+            diag_path = out_dir / "td_conversion_metrics.yaml"
+            with diag_path.open("w") as fh:
+                yaml.safe_dump(metrics, fh, sort_keys=False)
+            logger.info(
+                "Wrote TD conversion diagnostics for %s → %s (samples=%d)",
+                problem_name,
+                diag_path,
+                metrics["samples"],
+            )
+        except Exception as exc:
+            logger.warning("Failed to persist TD conversion diagnostics for %s: %s", problem_name, exc)
+
+    def _persist_snaps_metrics(self, df_problem: pd.DataFrame, preds: np.ndarray) -> None:
+        target_col = "snaps_label"
+        if target_col not in df_problem.columns or preds is None:
+            return
+        try:
+            actual = pd.to_numeric(df_problem[target_col], errors="coerce")
+            predicted = pd.Series(preds, index=df_problem.index)
+            mask = actual.notna() & predicted.notna()
+            if not mask.any():
+                logger.warning("Snaps diagnostics skipped (no overlapping rows).")
+                return
+            actual = actual[mask]
+            predicted = predicted[mask]
+            diff = predicted - actual
+            try:
+                r2 = r2_score(actual, predicted)
+            except Exception:
+                r2 = float("nan")
+            metrics = {
+                "samples": int(mask.sum()),
+                "actual_mean": float(actual.mean()),
+                "pred_mean": float(predicted.mean()),
+                "mae": float(np.mean(np.abs(diff))),
+                "rmse": float(np.sqrt(np.mean(np.square(diff)))),
+                "r2": float(r2) if not math.isnan(r2) else None,
+            }
+            if "position" in df_problem.columns:
+                pos_stats: dict[str, dict[str, float]] = {}
+                pos_series = df_problem.loc[mask, "position"]
+                pos_df = pd.DataFrame({"position": pos_series, "actual": actual, "pred": predicted})
+                for pos, grp in pos_df.groupby("position"):
+                    if grp.empty:
+                        continue
+                    delta = grp["pred"] - grp["actual"]
+                    pos_stats[str(pos)] = {
+                        "samples": int(len(grp)),
+                        "actual_mean": float(grp["actual"].mean()),
+                        "pred_mean": float(grp["pred"].mean()),
+                        "mae": float(np.mean(np.abs(delta))),
+                    }
+                metrics["position_breakdown"] = pos_stats
+            out_dir = _vdir(self, "snaps", "xgboost", "metrics")
+            diag_path = out_dir / "snaps_metrics.yaml"
+            with diag_path.open("w") as fh:
+                yaml.safe_dump(metrics, fh, sort_keys=False)
+            logger.info("Wrote snaps diagnostics → %s (samples=%d)", diag_path, metrics["samples"])
+        except Exception as exc:
+            logger.warning("Failed to persist snaps diagnostics: %s", exc)
+
+    def _persist_anytime_td_structured_metrics(self, df_problem: pd.DataFrame, preds: np.ndarray) -> None:
+        if "anytime_td_structural" not in df_problem.columns or preds is None:
+            logger.warning("Structured diagnostics skipped (missing structural column or preds).")
+            return
+        try:
+            actual = pd.to_numeric(df_problem.get("anytime_td_skill", df_problem.get("anytime_td")), errors="coerce")
+            structural = pd.to_numeric(df_problem["anytime_td_structural"], errors="coerce")
+            calibrated = pd.Series(preds, index=df_problem.index)
+            mask_struct = actual.notna() & structural.notna()
+            mask_cal = actual.notna() & calibrated.notna()
+            metrics = {}
+
+            def _class_metrics(y_true, y_pred) -> dict[str, float | None]:
+                out: dict[str, float | None] = {}
+                try:
+                    out["auc"] = roc_auc_score(y_true, y_pred)
+                except Exception:
+                    out["auc"] = None
+                try:
+                    out["pr_auc"] = average_precision_score(y_true, y_pred)
+                except Exception:
+                    out["pr_auc"] = None
+                try:
+                    eps = np.clip(y_pred, 1e-6, 1 - 1e-6)
+                    out["log_loss"] = log_loss(y_true, eps)
+                except Exception:
+                    out["log_loss"] = None
+                try:
+                    out["brier"] = brier_score_loss(y_true, y_pred)
+                except Exception:
+                    out["brier"] = None
+                return out
+
+            def _calibration_table(y_true, y_pred, bins: int = 10) -> list[dict[str, float]]:
+                df = pd.DataFrame({"y": y_true, "p": y_pred})
+                df = df.sort_values("p").reset_index(drop=True)
+                df["bin"] = pd.qcut(df["p"], q=bins, duplicates="drop")
+                table: list[dict[str, float]] = []
+                for interval, grp in df.groupby("bin"):
+                    if grp.empty:
+                        continue
+                    start = float(interval.left) if interval is not None else float(grp["p"].min())
+                    end = float(interval.right) if interval is not None else float(grp["p"].max())
+                    table.append(
+                        {
+                            "bin_start": start,
+                            "bin_end": end,
+                            "avg_pred": float(grp["p"].mean()),
+                            "actual_rate": float(grp["y"].mean()),
+                            "count": int(len(grp)),
+                        }
+                    )
+                return table
+
+            diagnostics: dict[str, dict[str, object]] = {}
+            if mask_struct.any():
+                diagnostics["structural"] = {
+                    **_class_metrics(actual[mask_struct], structural[mask_struct]),
+                    "calibration": _calibration_table(actual[mask_struct], structural[mask_struct]),
+                    "samples": int(mask_struct.sum()),
+                }
+            if mask_cal.any():
+                diagnostics["structured_model"] = {
+                    **_class_metrics(actual[mask_cal], calibrated[mask_cal]),
+                    "calibration": _calibration_table(actual[mask_cal], calibrated[mask_cal]),
+                    "samples": int(mask_cal.sum()),
+                }
+
+            out_dir = _vdir(self, "anytime_td_structured", "xgboost", "metrics")
+            diag_path = out_dir / "structured_vs_structural.yaml"
+            with diag_path.open("w") as fh:
+                yaml.safe_dump(diagnostics, fh, sort_keys=False)
+            logger.info(
+                "Wrote structured vs structural diagnostics → %s (struct samples=%s, model samples=%s)",
+                diag_path,
+                diagnostics.get("structural", {}).get("samples"),
+                diagnostics.get("structured_model", {}).get("samples"),
+            )
+        except Exception as exc:
+            logger.warning("Failed to persist structured diagnostics: %s", exc)
 
     def _apply_problem_level_overrides(self, df: pd.DataFrame, problem_config: dict) -> pd.DataFrame:
         derived_cfg = problem_config.get("derived_target")
@@ -954,6 +1857,252 @@ class ModelTrainer:
         np.clip(adjusted, 0.0, 1.0, out=adjusted)
         return adjusted
 
+    def _apply_snaps_ceiling_cap(
+        self,
+        df_slice: pd.DataFrame | None,
+        preds: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Apply post-processing cap for snaps predictions.
+        
+        For low-usage players (max_snap_pct_l5 < 0.25), cap predictions at
+        snap_ceiling_l5 * 1.5 to prevent absurd overpredictions for specialists.
+        
+        Analysis showed:
+        - Low snaps (1-15): MAE improved from 15.06 to 11.85 (-3.21)
+        - Zero snaps: MAE improved from 6.01 to 4.01 (-2.00)
+        - Fullbacks: MAE improved from 9.88 to 8.73 (-1.15)
+        - High usage (>25% max): Completely unaffected (0.00 change)
+        - Starters (>40): Minimal impact (+0.22 MAE)
+        """
+        if df_slice is None or preds.size == 0:
+            return preds
+        
+        adjusted = preds.copy()
+        
+        # Get ceiling and max snap % columns
+        ceiling = None
+        max_snap_pct = None
+        
+        if "snap_ceiling_l5" in df_slice.columns:
+            ceiling = pd.to_numeric(df_slice["snap_ceiling_l5"], errors="coerce").to_numpy()
+        if "max_snap_pct_l5" in df_slice.columns:
+            max_snap_pct = pd.to_numeric(df_slice["max_snap_pct_l5"], errors="coerce").to_numpy()
+        
+        if ceiling is None or max_snap_pct is None:
+            logger.debug("Snaps ceiling cap skipped: missing snap_ceiling_l5 or max_snap_pct_l5")
+            return adjusted
+        
+        # Only cap low-usage players (max_snap_pct < 0.25)
+        threshold = 0.25
+        multiplier = 1.5
+        
+        should_cap = (~np.isnan(ceiling)) & (~np.isnan(max_snap_pct)) & (max_snap_pct < threshold)
+        cap_values = ceiling * multiplier
+        
+        # Apply cap where conditions are met and prediction exceeds cap
+        capped_mask = should_cap & (adjusted > cap_values)
+        adjusted[capped_mask] = cap_values[capped_mask]
+        
+        n_capped = capped_mask.sum()
+        if n_capped > 0:
+            logger.info(f"Snaps ceiling cap applied to {n_capped} predictions (max_snap_pct < {threshold}, cap = ceiling × {multiplier})")
+        
+        return adjusted
+
+    def _apply_usage_targets_position_cap(
+        self,
+        df_slice: pd.DataFrame | None,
+        preds: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Apply post-processing for usage_targets predictions.
+        
+        - QBs: Set target_share to 0 (99.2% have 0 targets in reality)
+        - FBs: Cap at 0.10 (max realistic is ~15%, most have 0)
+        
+        Analysis showed:
+        - QB predictions were ~11% when actual is ~0.03%
+        - FB predictions were overpredicted but some FBs (Juszczyk) do get targets
+        """
+        if df_slice is None or preds.size == 0:
+            return preds
+        
+        adjusted = preds.copy()
+        n_zeroed = 0
+        n_capped = 0
+        
+        # Zero out QBs
+        if "position" in df_slice.columns:
+            is_qb = (df_slice["position"] == "QB").to_numpy()
+            n_zeroed = is_qb.sum()
+            adjusted[is_qb] = 0.0
+        
+        # Cap FBs at 0.10
+        if "is_fullback" in df_slice.columns:
+            is_fb = (df_slice["is_fullback"] == 1).to_numpy()
+            fb_cap = 0.10
+            exceeds_cap = is_fb & (adjusted > fb_cap)
+            n_capped = exceeds_cap.sum()
+            adjusted[exceeds_cap] = fb_cap
+        
+        # Cap RBs based on historical target tier
+        # Analysis shows RBs are overpredicted by 73-386% depending on tier
+        if "position" in df_slice.columns and "hist_target_share_l3" in df_slice.columns:
+            is_rb = (df_slice["position"] == "RB").to_numpy()
+            hist_ts = pd.to_numeric(df_slice["hist_target_share_l3"], errors="coerce").fillna(0).to_numpy()
+            
+            # Cap RB predictions at historical target share + 50% buffer, minimum 0.03
+            rb_cap = np.maximum(hist_ts * 1.5, 0.03)
+            rb_exceeds = is_rb & (adjusted > rb_cap)
+            n_rb_capped = rb_exceeds.sum()
+            adjusted[rb_exceeds] = rb_cap[rb_exceeds]
+            
+            if n_rb_capped > 0:
+                logger.info(f"Usage targets: capped {n_rb_capped} RB predictions at hist_target_share × 1.5")
+        
+        if n_zeroed > 0 or n_capped > 0:
+            logger.info(f"Usage targets post-processing: zeroed {n_zeroed} QBs, capped {n_capped} FBs at 0.10")
+        
+        return adjusted
+
+    def _apply_usage_carries_position_cap(
+        self,
+        df_slice: pd.DataFrame | None,
+        preds: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Apply post-processing for usage_carries predictions.
+        
+        Data analysis shows:
+        - WRs: 90.1% have 0 carries, mean 0.005 → Cap at 0.05
+        - TEs: 98.0% have 0 carries, mean 0.001 → Cap at 0.02
+        - QBs: 58.8% have 0 carries, mean 0.06, but rushing QBs can have 25%+ → Cap at 0.30
+        - FBs: 85.2% have 0 carries, mean 0.007 → Cap at 0.10
+        - RBs: Keep as-is (primary ball carriers)
+        """
+        if df_slice is None or preds.size == 0:
+            return preds
+        
+        adjusted = preds.copy()
+        n_capped = 0
+        
+        if "position" in df_slice.columns:
+            position = df_slice["position"].to_numpy()
+            
+            # Cap WRs at 0.05
+            is_wr = position == "WR"
+            wr_exceeds = is_wr & (adjusted > 0.05)
+            adjusted[wr_exceeds] = 0.05
+            n_capped += wr_exceeds.sum()
+            
+            # Cap TEs at 0.02
+            is_te = position == "TE"
+            te_exceeds = is_te & (adjusted > 0.02)
+            adjusted[te_exceeds] = 0.02
+            n_capped += te_exceeds.sum()
+            
+            # Cap QBs at 0.30 (rushing QBs like Lamar, Hurts can have ~25%)
+            is_qb = position == "QB"
+            qb_exceeds = is_qb & (adjusted > 0.30)
+            adjusted[qb_exceeds] = 0.30
+            n_capped += qb_exceeds.sum()
+        
+        # Cap FBs at 0.10
+        if "is_fullback" in df_slice.columns:
+            is_fb = (df_slice["is_fullback"] == 1).to_numpy()
+            fb_exceeds = is_fb & (adjusted > 0.10)
+            adjusted[fb_exceeds] = 0.10
+            n_capped += fb_exceeds.sum()
+        
+        if n_capped > 0:
+            logger.info(f"Usage carries post-processing: capped {n_capped} non-RB predictions")
+        
+        return adjusted
+
+    def _apply_usage_target_yards_position_cap(
+        self,
+        df_slice: pd.DataFrame | None,
+        preds: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Apply post-processing for usage_target_yards predictions.
+        
+        Based on data analysis:
+        - RBs: Mean 0.0, median 0.0 - cap at 2.0 yards (tightened from 6.0)
+        - FBs: Rarely targeted, always short - set to 0
+        - QBs: Only 37 games with 43 total targets in entire dataset - set to 0
+        - TEs: No cap (range from -1 to 16)
+        - WRs: No cap (natural deep targets)
+        """
+        if df_slice is None or preds.size == 0:
+            return preds
+        
+        adjusted = preds.copy()
+        n_zeroed = 0
+        n_capped = 0
+        
+        if "position" in df_slice.columns:
+            position = df_slice["position"].to_numpy()
+            
+            # QBs: Set to 0 (extremely rare, trick plays only)
+            is_qb = position == "QB"
+            n_zeroed = is_qb.sum()
+            adjusted[is_qb] = 0.0
+            
+            # RBs: Cap between 0 and 2 yards (median is 0, most are screens/checkdowns)
+            is_rb = position == "RB"
+            adjusted[is_rb] = np.clip(adjusted[is_rb], 0.0, 2.0)
+            n_capped += (is_rb & (preds > 2.0)).sum()
+        
+        # FBs: Set to 0 (almost never targeted)
+        if "is_fullback" in df_slice.columns:
+            is_fb = (df_slice["is_fullback"] == 1).to_numpy()
+            adjusted[is_fb] = 0.0
+        
+        if n_zeroed > 0 or n_capped > 0:
+            logger.info(f"Usage target yards post-processing: zeroed {n_zeroed} QBs, capped {n_capped} RBs")
+        
+        return adjusted
+
+    def _apply_efficiency_rec_yards_air_cap(
+        self,
+        df_slice: pd.DataFrame | None,
+        preds: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Apply post-processing for efficiency_rec_yards_air predictions.
+        
+        Based on data analysis:
+        - RBs: Mean -0.6 (checkdowns behind line) - cap at 0
+        - TEs: Mean 5.5 - no cap
+        - WRs: Mean 8.9 - no cap
+        """
+        if df_slice is None or preds.size == 0:
+            return preds
+        
+        adjusted = preds.copy()
+        n_capped = 0
+        
+        if "position" in df_slice.columns:
+            position = df_slice["position"].to_numpy()
+            
+            # RBs: Cap at 0 (they get checkdowns, often behind line of scrimmage)
+            is_rb = position == "RB"
+            exceeds = is_rb & (adjusted > 0)
+            adjusted[exceeds] = 0.0
+            n_capped = exceeds.sum()
+        
+        # FBs: Also cap at 0
+        if "is_fullback" in df_slice.columns:
+            is_fb = (df_slice["is_fullback"] == 1).to_numpy()
+            adjusted[is_fb] = 0.0
+        
+        if n_capped > 0:
+            logger.info(f"Efficiency rec yards air post-processing: capped {n_capped} RBs at 0")
+        
+        return adjusted
+
     def _apply_feature_artifacts(self, df, problem_name):
         """
         Applies pre-fitted feature engineering artifacts to a new DataFrame.
@@ -1083,6 +2232,22 @@ class ModelTrainer:
             global_scale = float(actual_total / expected_total)
         global_scale = float(np.clip(global_scale, 0.25, 3.0))
 
+        # Columns that express role and usage concentration; used to weight intra-team scaling.
+        weight_features = [
+            # Historical share features
+            "hist_target_share_prev",
+            "hist_target_share_l3",
+            "hist_carry_share_prev",
+            "hist_carry_share_l3",
+            # Offense context role shares (red zone / goal line)
+            "off_ctx_player_red_zone_share",
+            "off_ctx_player_goal_to_go_share",
+            # Expected opportunity signal
+            "expected_opportunities",
+        ]
+        # Filter to columns actually present in the training frame
+        weight_features = [c for c in weight_features if c in df_train.columns]
+
         config = TeamTotalConfig(
             divisor=divisor,
             global_scale=global_scale,
@@ -1090,6 +2255,8 @@ class ModelTrainer:
             group_cols=group_cols,
             min_scale=0.25,
             max_scale=3.0,
+            weight_features=weight_features,
+            role_intensity=float(self.config.get("team_total_role_intensity", 0.5)),
         )
         self._team_total_config[problem_name] = config
         logger.info(
@@ -2039,6 +3206,112 @@ class ModelTrainer:
                         'calibration_method': best_method,
                         'calibration_ece_oof': round(best_ece, 6) if best_ece is not None else None,
                     }
+
+                    # Segmented PR-AUC and Brier score diagnostics for anytime TD.
+                    if problem_name == "anytime_td":
+                        try:
+                            eval_df = df_test_full.loc[X_test.index].copy()
+                            eval_df["_y_true"] = y_test
+                            eval_df["_y_prob"] = y_pred_proba
+
+                            segment_metrics: dict[str, dict] = {}
+
+                            # By horizon
+                            if "decision_horizon_hours" in eval_df.columns:
+                                by_horizon: dict[str, dict] = {}
+                                for h_val, g in eval_df.groupby("decision_horizon_hours"):
+                                    g = g.dropna(subset=["_y_true", "_y_prob"])
+                                    if g.empty:
+                                        continue
+                                    y_seg = g["_y_true"].to_numpy()
+                                    p_seg = g["_y_prob"].to_numpy()
+                                    # Require both classes for stable PR-AUC / Brier
+                                    if np.unique(y_seg).size < 2:
+                                        continue
+                                    try:
+                                        pr_seg = average_precision_score(y_seg, p_seg)
+                                    except Exception:
+                                        pr_seg = float("nan")
+                                    try:
+                                        brier_seg = brier_score_loss(y_seg, p_seg)
+                                    except Exception:
+                                        brier_seg = float("nan")
+                                    by_horizon[str(h_val)] = {
+                                        "pr_auc": float(pr_seg),
+                                        "brier_score": float(brier_seg),
+                                        "n": int(len(g)),
+                                    }
+                                if by_horizon:
+                                    segment_metrics["by_horizon"] = by_horizon
+
+                            # By position group (fallback to position if needed)
+                            pos_col = None
+                            for candidate in ("position_group", "position"):
+                                if candidate in eval_df.columns:
+                                    pos_col = candidate
+                                    break
+                            if pos_col is not None:
+                                by_pos: dict[str, dict] = {}
+                                for pos_val, g in eval_df.groupby(pos_col):
+                                    g = g.dropna(subset=["_y_true", "_y_prob"])
+                                    if g.empty:
+                                        continue
+                                    y_seg = g["_y_true"].to_numpy()
+                                    p_seg = g["_y_prob"].to_numpy()
+                                    if np.unique(y_seg).size < 2:
+                                        continue
+                                    try:
+                                        pr_seg = average_precision_score(y_seg, p_seg)
+                                    except Exception:
+                                        pr_seg = float("nan")
+                                    try:
+                                        brier_seg = brier_score_loss(y_seg, p_seg)
+                                    except Exception:
+                                        brier_seg = float("nan")
+                                    by_pos[str(pos_val)] = {
+                                        "pr_auc": float(pr_seg),
+                                        "brier_score": float(brier_seg),
+                                        "n": int(len(g)),
+                                    }
+                                if by_pos:
+                                    segment_metrics["by_position"] = by_pos
+
+                            # Cross: position × horizon
+                            if (
+                                "decision_horizon_hours" in eval_df.columns
+                                and pos_col is not None
+                            ):
+                                by_pos_h: dict[str, dict] = {}
+                                grouped = eval_df.groupby([pos_col, "decision_horizon_hours"])
+                                for (pos_val, h_val), g in grouped:
+                                    g = g.dropna(subset=["_y_true", "_y_prob"])
+                                    if g.empty:
+                                        continue
+                                    y_seg = g["_y_true"].to_numpy()
+                                    p_seg = g["_y_prob"].to_numpy()
+                                    if np.unique(y_seg).size < 2:
+                                        continue
+                                    try:
+                                        pr_seg = average_precision_score(y_seg, p_seg)
+                                    except Exception:
+                                        pr_seg = float("nan")
+                                    try:
+                                        brier_seg = brier_score_loss(y_seg, p_seg)
+                                    except Exception:
+                                        brier_seg = float("nan")
+                                    key = f"{pos_val}|{h_val}"
+                                    by_pos_h[key] = {
+                                        "pr_auc": float(pr_seg),
+                                        "brier_score": float(brier_seg),
+                                        "n": int(len(g)),
+                                    }
+                                if by_pos_h:
+                                    segment_metrics["by_position_horizon"] = by_pos_h
+
+                            if segment_metrics:
+                                metrics["segment_pr_auc_brier"] = segment_metrics
+                        except Exception as seg_exc:
+                            logger.warning("Failed to compute segmented PR-AUC/Brier metrics: %s", seg_exc)
             else:
                 # Regression: generate direct predictions
                 y_pred = final_model.predict(X_test)
@@ -2502,6 +3775,16 @@ class ModelTrainer:
             except Exception:
                 self._groups_index_map[problem_name] = None
             
+            # ==========================================================================
+            # MODEL ARCHITECTURE: Train Global and/or MoE models based on config
+            # ==========================================================================
+            use_moe = problem_copy.get("per_position_training", False)
+            train_global = self.model_architecture in ("global", "both")
+            train_moe = self.model_architecture in ("moe", "both") and use_moe
+            
+            # Train global model (traditional single model)
+            if train_global:
+                logger.info(f"[Global] Training global model for {problem_name}")
             self.train_and_evaluate_models(
                 problem_copy,
                 X_train_full,
@@ -2511,17 +3794,56 @@ class ModelTrainer:
                 df_test,
                 sample_weight_train_full,
             )
+            
+            # Train MoE models (per-position models)
+            if train_moe:
+                logger.info(f"[MoE] Training per-position models for {problem_name}")
+                self._train_moe_models(
+                    problem_copy,
+                    X_train_full,
+                    y_train_full,
+                    X_test,
+                    y_test,
+                    df_train_full,
+                    df_test,
+                    sample_weight_train_full,
+                )
+                
+                # If both trained, run comparison
+                if train_global and problem_name in self.moe_models:
+                    task_type = problem_copy.get("task_type", "classification")
+                    model_key = f"{problem_name}_xgboost"
+                    if model_key in self.models:
+                        global_model = self.models[model_key]
+                        if hasattr(global_model, "predict_proba"):
+                            global_preds = global_model.predict_proba(X_test)
+                            if global_preds.ndim > 1:
+                                global_preds = global_preds[:, 1]
+                        else:
+                            global_preds = global_model.predict(X_test)
+                        
+                        comparison = self._compare_global_vs_moe(
+                            problem_name, X_test, y_test, df_test, global_preds, task_type
+                        )
+                        self.moe_comparison_results[problem_name]["comparison"] = comparison
         
         # --- NEW: build composite & team conformal sum artifacts after all problems trained ---
             # Generate and store predictions for downstream models
-            # We use the primary model (e.g. xgboost)
+            # Determine which model to use: MoE (if enabled and available) or global
             primary_model_name = 'xgboost'
             model_key = f"{problem_name}_{primary_model_name}"
-            if model_key in self.models:
-                model = self.models[model_key]
-                # Check if this problem is used as input by others
-                # (Optimization: only generate if needed? No, just generate for all to be safe/simple)
-                logger.info(f"Generating full predictions for {problem_name} using {primary_model_name} for downstream consumption...")
+            
+            # Decide whether to use MoE or global model for predictions
+            use_moe_for_preds = (
+                self.model_architecture in ("moe", "both") 
+                and problem_name in self.moe_models
+                and len(self.moe_models.get(problem_name, {})) > 0
+            )
+            has_global_model = model_key in self.models
+            
+            if use_moe_for_preds or has_global_model:
+                pred_source = "MoE" if use_moe_for_preds else "Global"
+                logger.info(f"Generating full predictions for {problem_name} using {pred_source} model for downstream consumption...")
                 
                 # We need to apply artifacts to the FULL df_problem to get X_full
                 # Note: df_problem was modified in place (merged with inputs), so it has all cols.
@@ -2534,10 +3856,17 @@ class ModelTrainer:
                     X_full, _ = self._apply_feature_artifacts(df_problem, problem_name)
                     logger.info(f"X_full shape after artifacts: {X_full.shape}")
                     
-                    # Handle model types
+                    preds = None
+                    
+                    if use_moe_for_preds:
+                        # Use MoE (per-position) models
+                        preds = self._predict_with_moe(X_full, df_problem, problem_name)
+                        logger.info(f"[MoE] Generated {len(preds)} predictions for {problem_name}")
+                    else:
+                        # Use global model
+                        model = self.models[model_key]
                     base_model = self._unwrap_base_model(model)
                     
-                    preds = None
                     # If it's a pipeline/calibrated classifier, it usually has predict_proba
                     if hasattr(model, "predict_proba"):
                          # Passing self.feature_columns to ensure correct column alignment/selection in batching
@@ -2561,6 +3890,26 @@ class ModelTrainer:
                         raw_preds = preds.copy()
                         if problem_name == "availability":
                             preds = self._apply_availability_guards(df_problem, preds)
+                        # Apply post-processing cap for snaps predictions
+                        # Cap low-usage players (max_snap_pct < 0.25) to ceiling * 1.5
+                        if problem_name == "snaps":
+                            preds = self._apply_snaps_ceiling_cap(df_problem, preds)
+                        # Apply position-based zeroing/capping for usage_targets
+                        # Zero QBs (99.2% have 0 targets), cap FBs at 0.10
+                        if problem_name == "usage_targets":
+                            preds = self._apply_usage_targets_position_cap(df_problem, preds)
+                        # Apply position-based capping for usage_carries
+                        # Cap WRs at 0.05, TEs at 0.02, QBs at 0.30, FBs at 0.10
+                        if problem_name == "usage_carries":
+                            preds = self._apply_usage_carries_position_cap(df_problem, preds)
+                        # Apply position-based capping for usage_target_yards
+                        # Cap RBs/FBs/QBs at their realistic target depth (short targets)
+                        if problem_name == "usage_target_yards":
+                            preds = self._apply_usage_target_yards_position_cap(df_problem, preds)
+                        # Apply position-based capping for efficiency_rec_yards_air
+                        # RBs get checkdowns (often negative air yards), cap at 0
+                        if problem_name == "efficiency_rec_yards_air":
+                            preds = self._apply_efficiency_rec_yards_air_cap(df_problem, preds)
                         # Store
                         pred_col = f"pred_{problem_name}"
                         # Ensure we have the keys
@@ -2587,6 +3936,22 @@ class ModelTrainer:
                                 "keys": key_cols,
                             }
                             logger.info(f"Stored {len(out_df)} predictions for {problem_name} with keys {key_cols}")
+
+                            if problem_name == "snaps":
+                                self._persist_snaps_metrics(df_problem, preds)
+                            if problem_name in {"usage_targets", "usage_carries"}:
+                                self._persist_usage_expected_metrics(problem_name, df_problem, preds)
+                            if problem_name in {
+                                "efficiency_rec_success",
+                                "efficiency_rush_success",
+                                "efficiency_rec_yards",
+                                "efficiency_rush_yards",
+                            }:
+                                self._persist_efficiency_metrics(problem_name, df_problem, preds)
+                            if problem_name in {"td_conv_rec", "td_conv_rush"}:
+                                self._persist_td_conversion_metrics(problem_name, df_problem, preds)
+                            if problem_name == "anytime_td_structured":
+                                self._persist_anytime_td_structured_metrics(df_problem, preds)
                     else:
                          logger.warning(f"Could not generate predictions for {problem_name}: Model has no predict method")
                 except Exception as e:
@@ -2595,6 +3960,66 @@ class ModelTrainer:
         fit_composite_conformal_sums(self)
         fit_team_conformal_sums(self)
         # --- END NEW ---
+
+        # ==========================================================================
+        # Print MoE Comparison Summary (if "both" mode was used)
+        # ==========================================================================
+        if self.model_architecture == "both" and self.moe_comparison_results:
+            logger.info("\n" + "="*80)
+            logger.info("MoE vs GLOBAL MODEL COMPARISON SUMMARY")
+            logger.info("="*80)
+            
+            for problem_name, results in self.moe_comparison_results.items():
+                comparison = results.get("comparison", {})
+                if not comparison:
+                    continue
+                
+                logger.info(f"\n{problem_name}:")
+                
+                # Overall metrics
+                global_metrics = comparison.get("global", {})
+                moe_metrics = comparison.get("moe", {})
+                
+                if "mae" in global_metrics:
+                    g_mae = global_metrics.get("mae", 0)
+                    m_mae = moe_metrics.get("mae", 0)
+                    g_r2 = global_metrics.get("r2", 0)
+                    m_r2 = moe_metrics.get("r2", 0)
+                    delta_mae = m_mae - g_mae
+                    delta_r2 = m_r2 - g_r2
+                    winner = "MoE ✓" if delta_mae < 0 else "Global"
+                    logger.info(f"  Overall: Global MAE={g_mae:.4f}, MoE MAE={m_mae:.4f}, Δ={delta_mae:+.4f} ({winner})")
+                    logger.info(f"           Global R²={g_r2:.4f}, MoE R²={m_r2:.4f}, Δ={delta_r2:+.4f}")
+                elif "auc" in global_metrics:
+                    g_auc = global_metrics.get("auc", 0.5)
+                    m_auc = moe_metrics.get("auc", 0.5)
+                    delta_auc = m_auc - g_auc
+                    winner = "MoE ✓" if delta_auc > 0 else "Global"
+                    logger.info(f"  Overall: Global AUC={g_auc:.4f}, MoE AUC={m_auc:.4f}, Δ={delta_auc:+.4f} ({winner})")
+                
+                # By position
+                by_position = comparison.get("by_position", {})
+                if by_position:
+                    logger.info("  By Position:")
+                    for pos, metrics in by_position.items():
+                        if "global_mae" in metrics:
+                            g_mae = metrics["global_mae"]
+                            m_mae = metrics["moe_mae"]
+                            delta = m_mae - g_mae
+                            better = "✓" if delta < 0 else ""
+                            logger.info(f"    {pos}: n={metrics['n']}, Global MAE={g_mae:.4f}, MoE MAE={m_mae:.4f}, Δ={delta:+.4f} {better}")
+            
+            logger.info("\n" + "="*80)
+            
+            # Save comparison to file
+            try:
+                import json
+                comparison_path = self.metric_dir / "moe_comparison.json"
+                with open(comparison_path, "w") as f:
+                    json.dump(self.moe_comparison_results, f, indent=2, default=str)
+                logger.info(f"Saved MoE comparison results to {comparison_path}")
+            except Exception as e:
+                logger.warning(f"Failed to save MoE comparison: {e}")
 
         # Manifest (end)
         if self.cfg.write_run_manifest:
@@ -2607,6 +4032,9 @@ class ModelTrainer:
                     for m in self.cfg.models_to_train:
                         k = f"{pname}_{m}"
                         results[pname][m] = bool(self.models.get(k) is not None)
+                    # Add MoE model info
+                    if pname in self.moe_models:
+                        results[pname]["moe_positions"] = list(self.moe_models[pname].keys())
                 write_manifest(self, stage="end", extra=results)
             except Exception:
                 pass

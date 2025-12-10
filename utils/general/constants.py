@@ -176,6 +176,11 @@ LEAK_PRONE_COLUMNS: Tuple[str, ...] = (
     "ps_game_total_touches",
     "ps_game_scripted_touches",
     "ps_game_scripted_touch_share",
+    # Usage share labels (same-game; used as targets for usage models only)
+    "target_share_label",
+    "carry_share_label",
+    # Scripted TD target (same-game; label only)
+    "pre_snap_scripted_td",
 )
 
 
@@ -213,12 +218,15 @@ NFL_TARGET_COLUMNS: Tuple[str, ...] = (
     'anytime_td',
     'anytime_td_offense',
     'anytime_td_all',
+    'anytime_td_skill',
     'anytime_td_rush',
     'anytime_td_rec',
     'anytime_td_pass_thrown',
     'td_count',
     'td_count_offense',
     'td_count_all',
+    'td_count_skill',
+    'pre_snap_scripted_td',
     'passing_td',
     'rushing_td_count',
     'receiving_td_count',
@@ -231,6 +239,18 @@ NFL_TARGET_COLUMNS: Tuple[str, ...] = (
     'offense_pct',
     'ps_game_route_participation_pct',
     'ps_game_scripted_touches',
+    # Usage-share regression targets for usage models
+    'target_share_label',
+    'carry_share_label',
+    'snaps_label',
+    'rec_success_rate_label',
+    'rush_success_rate_label',
+    'yards_per_target_label',
+    'yards_per_carry_label',
+    'td_per_target_label',
+    'td_per_carry_label',
+    'td_per_rz_carry_label',
+    'td_per_gl_carry_label',
 )
 
 IDENTIFIER_COLUMNS: Tuple[str, ...] = (

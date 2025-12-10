@@ -591,8 +591,11 @@ def tune_hyperparameters(
                 if supports_callbacks:
                     model = Model(**params, callbacks=[], )
                     try:
+                        # Ensure a valid base_score for logistic losses and set class weighting.
                         if task_type == 'classification':
-                            model.set_params(scale_pos_weight=spw)
+                            model.set_params(base_score=0.5, scale_pos_weight=spw)
+                        else:
+                            model.set_params(base_score=0.5)
                     except Exception:
                         pass
                     fit_kwargs = {
@@ -607,7 +610,9 @@ def tune_hyperparameters(
                     model = Model(**params, early_stopping_rounds=patience)
                     try:
                         if task_type == 'classification':
-                            model.set_params(scale_pos_weight=spw)
+                            model.set_params(base_score=0.5, scale_pos_weight=spw)
+                        else:
+                            model.set_params(base_score=0.5)
                     except Exception:
                         pass
                     fit_kwargs = {

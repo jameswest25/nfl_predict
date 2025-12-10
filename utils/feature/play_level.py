@@ -8,6 +8,7 @@ Reads cleaned daily Parquets and writes weekly play-level Parquets at
 
 from pathlib import Path
 from datetime import date
+import logging
 import polars as pl
 
 CLEAN_DIR   = Path("data/cleaned")
@@ -90,6 +91,8 @@ PLAY_COLS = [
     "rushing_yards",
     "passing_yards",
     "receiving_yards",
+    "air_yards",           # Air yards on pass attempts (depth of target)
+    "yards_after_catch",   # YAC on completions
     "epa",
     
     # TD outcomes
@@ -112,18 +115,35 @@ PLAY_COLS = [
     "rush_attempt",
     "pass_attempt",  # QB pass attempt
     "completion",    # Completed pass (for QBs)
+    "complete_pass", # Whether the pass was completed (used for air_yards aggregation)
     "red_zone_target",   # Red-zone targets (<= 20 yard line)
     "red_zone_carry",    # Red-zone rushing attempts
     "goal_to_go_target", # Goal-to-go targets
     "goal_to_go_carry",  # Goal-to-go carries
 ]
 
+logger = logging.getLogger(__name__)
+
 def build_play_level(*, start_date: date, end_date: date) -> None:
     PLAY_OUTDIR.mkdir(parents=True, exist_ok=True)
 
+    # Build a list of valid cleaned Parquet files and skip any corrupted/truncated ones.
+    all_paths = sorted(CLEAN_DIR.glob("date=*/part.parquet"))
+    valid_paths: list[str] = []
+    for path in all_paths:
+        try:
+            # Read a single row to validate the footer/magic bytes.
+            pl.read_parquet(path, n_rows=1)
+            valid_paths.append(str(path))
+        except Exception as exc:
+            logger.warning("Skipping corrupt or unreadable cleaned file %s: %s", path, exc)
+
+    if not valid_paths:
+        logger.warning("No valid cleaned Parquet files found under %s", CLEAN_DIR)
+        return
+
     scan = pl.scan_parquet(
-        str(CLEAN_DIR / "date=*/part.parquet"),
-        glob=True,
+        valid_paths,
         hive_partitioning=True,
         missing_columns="insert",
         extra_columns="ignore",

@@ -224,6 +224,14 @@ def _terminate_process_group(proc: subprocess.Popen) -> None:
 
 # ---------------- METRICS UTILS ----------------
 
+def _assert_no_usage_limit(text: str, context: str) -> None:
+    """Abort the meta-loop immediately if Codex reports a usage limit hit."""
+    if "you've hit your usage limit" in text.lower():
+        raise SystemExit(
+            f"Codex usage limit encountered during {context}. "
+            "Wait for quota reset or adjust your plan before rerunning."
+        )
+
 def _latest_metric_run_dir(target: str = PRIMARY_TARGET, family: str = PRIMARY_FAMILY) -> Optional[Path]:
     base = METRICS_ROOT / target / family
     if not base.exists():
@@ -523,6 +531,7 @@ def run_codex_chat_readonly(prompt: str, label: str) -> str:
     )
     if res.returncode != 0:
         raise RuntimeError(f"'codex exec' exited with {res.returncode}. Last message:\n{res.last_message}")
+    _assert_no_usage_limit(f"{res.last_message}\n{res.stdout_text}", context=label)
     print("\n================ ASSISTANT FINAL MESSAGE ================\n")
     print(res.last_message)
     print("\n=========================================================\n")
@@ -538,6 +547,7 @@ def run_codex_exec_write(prompt: str, label: str, sandbox: str = "workspace-writ
     )
     if res.returncode != 0:
         raise RuntimeError(f"'codex exec' exited with {res.returncode}. Last message:\n{res.last_message}")
+    _assert_no_usage_limit(f"{res.last_message}\n{res.stdout_text}", context=label)
     print("\n================ ASSISTANT FINAL MESSAGE ================\n")
     print(res.last_message)
     print("\n=========================================================\n")

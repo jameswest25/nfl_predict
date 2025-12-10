@@ -26,22 +26,72 @@ def compute_pace_metrics(seasons: list[int] | None = None) -> pl.DataFrame:
         "extra_columns": "ignore"
     }
     
-    scan = pl.scan_parquet(str(PLAY_DIR / "season=*/week=*/part.parquet"), **scan_kwargs)
-    
-    # Handle potential schema mismatch by casting early
-    scan = scan.with_columns([
+    # Scan with relaxed casting (e.g. Categorical → String), then normalize dtypes
+    # in a second step to avoid cross-partition schema conflicts.
+    # Build a list of LazyFrames, one per parquet file, to avoid cross-partition
+    # dtype conflicts (e.g. Categorical vs Utf8) that can arise when scanning
+    # all files in a single glob.
+    paths = sorted(PLAY_DIR.glob("season=*/week=*/part.parquet"))
+    lazy_frames: list[pl.LazyFrame] = []
+    for path in paths:
+        # Restrict to requested seasons early based on path to avoid scanning
+        # historical files that may lack advanced columns.
+        if seasons is not None:
+            try:
+                season_str = path.parent.parent.name.split("=", 1)[1]
+                season_val = int(season_str)
+            except Exception:
+                season_val = None
+            if season_val is None or season_val not in seasons:
+                continue
+        # Skip postseason weeks where play_by_week schema may be truncated
+        try:
+            week_str = path.parent.name.split("=", 1)[1]
+            week_val = int(week_str)
+        except Exception:
+            week_val = None
+        if week_val is not None and week_val > 18:
+            continue
+        lf = pl.scan_parquet(
+            str(path),
+            cast_options=pl.ScanCastOptions(categorical_to_string="allow"),
+            **scan_kwargs,
+        )
+        lf = lf.with_columns(
+            [
         pl.col("season").cast(pl.Int32),
         pl.col("week").cast(pl.Int32),
-    ])
-
-    if seasons is not None:
-        scan = scan.filter(pl.col("season").is_in(seasons))
-
-    # Continue with casting other columns
-    scan = scan.with_columns([
         pl.col("game_id").cast(pl.Utf8),
+                pl.col("game_date").cast(pl.Date),
         pl.col("posteam").cast(pl.Utf8),
-    ])
+                pl.col("qtr").cast(pl.Int32),
+                pl.col("qb_spike").cast(pl.Int32),
+                pl.col("qb_kneel").cast(pl.Int32),
+                pl.col("score_differential").cast(pl.Int32),
+                pl.col("half_seconds_remaining").cast(pl.Float32),
+                pl.col("no_huddle").cast(pl.Int32),
+                pl.col("pass_oe").cast(pl.Float32),
+                pl.col("pass").cast(pl.Int32),
+            ]
+        )
+        if seasons is not None:
+            lf = lf.filter(pl.col("season").is_in(seasons))
+        lazy_frames.append(lf)
+
+    if not lazy_frames:
+        return pl.DataFrame(
+            {
+                "season": pl.Series([], dtype=pl.Int32),
+                "week": pl.Series([], dtype=pl.Int32),
+                "team": pl.Series([], dtype=pl.Utf8),
+                "game_date": pl.Series([], dtype=pl.Date),
+                "team_pace_no_huddle_rate": pl.Series([], dtype=pl.Float32),
+                "team_pace_proe": pl.Series([], dtype=pl.Float32),
+                "team_pace_neutral_pass_rate": pl.Series([], dtype=pl.Float32),
+            }
+        )
+
+    scan = pl.concat(lazy_frames)
 
     # 1. Filter valid plays for pace calculation
     # Exclude spikes, kneels

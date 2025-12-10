@@ -17,6 +17,12 @@ class TeamTotalConfig:
     group_cols: List[str]
     min_scale: float = 0.25
     max_scale: float = 3.0
+    # Optional: columns used to compute intra-team weighting for TD allocation.
+    # When empty or None, scaling is uniform within each group.
+    weight_features: List[str] | None = None
+    # Strength of role-aware adjustment within each group.
+    # 0.0 => uniform; higher values put more mass on high-weight players.
+    role_intensity: float = 0.5
 
 
 def adjust_probabilities(X: pd.DataFrame, probs: np.ndarray, config: TeamTotalConfig) -> np.ndarray:
@@ -61,8 +67,52 @@ def adjust_probabilities(X: pd.DataFrame, probs: np.ndarray, config: TeamTotalCo
     df = df.join(scale.rename("scale"), on=group_cols)
     df["scale"] = df["scale"].fillna(config.global_scale)
 
-    adjusted = np.clip(df["_prob"] * df["scale"], 0.0, 1.0)
-    return adjusted.to_numpy(dtype=np.float64)
+    # Start with uniform team-total scaling
+    adjusted = df["_prob"] * df["scale"]
+
+    # Optional role-aware reweighting within each group
+    weight_cols = (config.weight_features or []).copy()
+    role_intensity = float(config.role_intensity or 0.0)
+    if weight_cols and role_intensity > 0.0:
+        # Build a non-negative aggregate weight per row
+        w = np.zeros_like(adjusted, dtype=np.float64)
+        for col in weight_cols:
+            if col in X.columns:
+                col_vals = pd.to_numeric(X[col], errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
+                col_vals[col_vals < 0.0] = 0.0
+                w += col_vals
+        # Fallback to uniform if all-zero within a group
+        df["_weight_raw"] = w
+        grouped_w = df.groupby(group_cols, dropna=False, sort=False)["_weight_raw"]
+        sum_w = grouped_w.transform("sum")
+        # Normalised weights within each group, defaulting to 1/N when sum_w == 0
+        with np.errstate(divide="ignore", invalid="ignore"):
+            w_norm = np.where(sum_w.to_numpy(dtype=np.float64) > 0.0, w / sum_w.to_numpy(dtype=np.float64), 0.0)
+        df["_weight_norm"] = w_norm
+        # Compute mean weight per group to centre the adjustment
+        mean_w = grouped_w.transform("mean").replace({0.0: 1.0})
+        mean_w = pd.to_numeric(mean_w, errors="coerce").fillna(1.0).to_numpy(dtype=np.float64)
+        w_centered = np.where(mean_w > 0.0, w / mean_w, 1.0)
+        # Apply intra-team adjustment
+        role_factor = 1.0 + role_intensity * (w_centered - 1.0)
+        role_factor = np.clip(role_factor, 0.25, 4.0)
+        adjusted = adjusted.to_numpy(dtype=np.float64) * role_factor
+        # Re-normalise within each group to preserve expected TD totals
+        df["_adjusted_role"] = adjusted
+        grouped_adj = df.groupby(group_cols, dropna=False, sort=False)["_adjusted_role"]
+        sum_adj = grouped_adj.transform("sum").to_numpy(dtype=np.float64)
+        group_index = pd.MultiIndex.from_frame(df[group_cols])
+        fallback_expected = float(config.mean_total) / float(config.divisor)
+        expected_vec = (
+            expected_td.reindex(group_index, fill_value=fallback_expected)
+            .to_numpy(dtype=np.float64)
+        )
+        with np.errstate(divide="ignore", invalid="ignore"):
+            renorm = np.where(sum_adj > 0.0, expected_vec / sum_adj, 1.0)
+        adjusted = adjusted * renorm
+
+    adjusted = np.clip(adjusted, 0.0, 1.0)
+    return adjusted.astype(np.float64)
 
 
 class TeamTotalAdjustedClassifier:

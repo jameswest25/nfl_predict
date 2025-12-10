@@ -27,6 +27,9 @@ def test_compute_td_labels_offense_and_all_variants():
     assert rush["anytime_td_rush"] == 1
     assert rush["anytime_td_rec"] == 0
     assert rush["anytime_td_pass_thrown"] == 0
+    # Skill-only labels treat rush-only TD as a hit
+    assert rush["anytime_td_skill"] == 1
+    assert rush["td_count_skill"] == 1
     assert rush["td_count_offense"] == 1
     assert rush["td_count_all"] == 1
     assert rush["anytime_td"] == rush["anytime_td_offense"]
@@ -35,16 +38,23 @@ def test_compute_td_labels_offense_and_all_variants():
     assert rec["anytime_td_offense"] == 1
     assert rec["anytime_td_rec"] == 1
     assert rec["anytime_td_rush"] == 0
+    # Receiving TD also triggers skill-only label
+    assert rec["anytime_td_skill"] == 1
 
     passer = _lookup(result, "pass")
     assert passer["anytime_td_pass_thrown"] == 1
     assert passer["anytime_td_offense"] == 1
     assert passer["anytime_td_all"] == 1  # includes offensive TDs
+    # Passing TDs alone should NOT count as a skill TD
+    assert passer["anytime_td_skill"] == 0
+    assert passer["td_count_skill"] == 0
 
     defensive = _lookup(result, "def")
     assert defensive["anytime_td_offense"] == 0  # no offensive scoring events
     assert defensive["anytime_td_all"] == 1  # credited via generic touchdown
     assert defensive["anytime_td"] == defensive["anytime_td_offense"]
+    # Defensive-only TD also excluded from skill-only label
+    assert defensive["anytime_td_skill"] == 0
 
 
 def test_label_version_any_all_aliases_anytime_td():

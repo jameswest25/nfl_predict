@@ -52,17 +52,26 @@ from utils.general.paths import (
     OPPONENT_SPLIT_DIR,
     WEATHER_FORECAST_DIR,
     ODDS_SNAPSHOT_DIR,
+    PLAYER_DRIVE_BY_WEEK_DIR as PLAYER_DRIVE_DIR,
+    PLAYER_GAME_BY_WEEK_DIR as PLAYER_GAME_DIR,
 )
 from utils.collect.weather_forecasts import collect_weather_forecasts
 from utils.feature.odds import collect_odds_snapshots
-from utils.feature.stats import ROLLING_FEATURE_STATS, ROLLING_WINDOWS, ROLLING_CONTEXTS
+from utils.feature.stats import ROLLING_FEATURE_STATS, ROLLING_WINDOWS, ROLLING_CONTEXTS, NFL_PLAYER_STATS
 from utils.feature.odds import (
     add_nfl_odds_features_to_df,
     NFL_ODDS_COLUMNS,
     ODDS_FLAG_COLUMNS,
 )
-from utils.feature.team_context import add_team_context_features
-from utils.feature.offense_context import add_offense_context_features_inference
+from utils.feature.team_context import (
+    add_team_context_features,
+    compute_team_context_history,
+    attach_team_context,
+)
+from utils.feature.offense_context import (
+    add_offense_context_features_inference,
+    _build_is_unavailable_expr,
+)
 from utils.feature.opponent_splits import load_rolling_opponent_splits
 from utils.feature.weather_features import (
     add_weather_forecast_features_inference,
@@ -86,6 +95,12 @@ from utils.train.injury_availability import (
     PROB_HIGH_COL,
 )
 from utils.feature.player_game_level import _compute_injury_history_rates
+from utils.feature.daily_totals import build_daily_cache_range, DAILY_CACHE_ROOT
+from utils.feature.shared import (
+    finalize_drive_history_features,
+    compute_drive_level_aggregates,
+    attach_td_rate_history_features,
+)
 
 MODEL_DIR = Path("output/models")
 METRICS_DIR = Path("output/metrics")
@@ -259,22 +274,23 @@ PS_L3_FALLBACK_MAP = {
     "ps_targets_wide_count_l3": "ps_targets_wide_count",
     "ps_targets_inline_count_l3": "ps_targets_inline_count",
     "ps_targets_backfield_count_l3": "ps_targets_backfield_count",
-    "ps_hist_route_participation_plays_l3": "ps_hist_route_participation_plays_prev",
-    "ps_hist_targets_total_l3": "ps_hist_targets_total_prev",
-    "ps_hist_targets_slot_count_l3": "ps_hist_targets_slot_count_prev",
-    "ps_hist_targets_wide_count_l3": "ps_hist_targets_wide_count_prev",
-    "ps_hist_targets_inline_count_l3": "ps_hist_targets_inline_count_prev",
-    "ps_hist_targets_backfield_count_l3": "ps_hist_targets_backfield_count_prev",
-    "ps_hist_total_touches_l3": "ps_hist_total_touches_prev",
-    "ps_hist_scripted_touches_l3": "ps_hist_scripted_touches_prev",
-    "ps_hist_route_participation_pct_l3": "ps_hist_route_participation_pct_prev",
-    "ps_hist_scripted_touch_share_l3": "ps_hist_scripted_touch_share_prev",
-    "ps_hist_targets_slot_share_l3": "ps_hist_targets_slot_share_prev",
-    "ps_hist_targets_wide_share_l3": "ps_hist_targets_wide_share_prev",
-    "ps_hist_targets_inline_share_l3": "ps_hist_targets_inline_share_prev",
-    "ps_hist_targets_backfield_share_l3": "ps_hist_targets_backfield_share_prev",
-    "ps_hist_tracking_team_dropbacks_l3": "ps_hist_tracking_team_dropbacks_prev",
-    "ps_hist_tracking_has_game_data_l3": "ps_hist_tracking_has_game_data_prev",
+    # Use rolling names (1g/3g) to match feature pipeline output
+    "3g_ps_route_participation_plays_per_game": "1g_ps_route_participation_plays_per_game",
+    "3g_ps_targets_total_per_game": "1g_ps_targets_total_per_game",
+    "3g_ps_targets_slot_count_per_game": "1g_ps_targets_slot_count_per_game",
+    "3g_ps_targets_wide_count_per_game": "1g_ps_targets_wide_count_per_game",
+    "3g_ps_targets_inline_count_per_game": "1g_ps_targets_inline_count_per_game",
+    "3g_ps_targets_backfield_count_per_game": "1g_ps_targets_backfield_count_per_game",
+    "3g_ps_total_touches_per_game": "1g_ps_total_touches_per_game",
+    "3g_ps_scripted_touches_per_game": "1g_ps_scripted_touches_per_game",
+    "3g_ps_route_participation_pct_per_game": "1g_ps_route_participation_pct_per_game",
+    "3g_ps_scripted_touch_share_per_game": "1g_ps_scripted_touch_share_per_game",
+    "3g_ps_targets_slot_share_per_game": "1g_ps_targets_slot_share_per_game",
+    "3g_ps_targets_wide_share_per_game": "1g_ps_targets_wide_share_per_game",
+    "3g_ps_targets_inline_share_per_game": "1g_ps_targets_inline_share_per_game",
+    "3g_ps_targets_backfield_share_per_game": "1g_ps_targets_backfield_share_per_game",
+    # Note: ps_tracking_* rolling stats not explicitly in NFL_PLAYER_STATS unless I missed them,
+    # but if they are, they'd be 1g/3g prefixed.
 }
 
 OUTPUT_COLUMN_PREFIXES = (
@@ -657,21 +673,21 @@ def _apply_ps_fallback(enriched: pl.DataFrame, *, season_hint: int | None) -> pl
     for col in (
         "ps_team_dropbacks",
         "ps_route_participation_plays",
-        "ps_hist_route_participation_pct_prev",
-        "ps_hist_total_touches_prev",
-        "ps_hist_scripted_touches_prev",
+        "1g_ps_route_participation_pct_per_game",
+        "1g_ps_total_touches_per_game",
+        "1g_ps_scripted_touches_per_game",
         "ps_tracking_has_game_data",
-        "ps_hist_tracking_has_game_data_prev",
+        # "ps_hist_tracking_has_game_data_prev", # Replaced by rolling name if available or dropped check
     ):
         if col in existing_cols:
             has_actual_signals.append(pl.col(col).fill_null(0) > 0)
     for col in (
-        "ps_hist_route_participation_pct_prev",
-        "ps_hist_route_participation_pct_l3",
-        "ps_hist_scripted_touch_share_prev",
-        "ps_hist_scripted_touch_share_l3",
-        "ps_hist_tracking_has_game_data_prev",
-        "ps_hist_tracking_has_game_data_l3",
+        "1g_ps_route_participation_pct_per_game",
+        "3g_ps_route_participation_pct_per_game",
+        "1g_ps_scripted_touch_share_per_game",
+        "3g_ps_scripted_touch_share_per_game",
+        # "ps_hist_tracking_has_game_data_prev",
+        # "ps_hist_tracking_has_game_data_l3",
     ):
         if col in existing_cols:
             recent_hist_signals.append(pl.col(col).is_not_null())
@@ -724,29 +740,39 @@ def _apply_ps_fallback(enriched: pl.DataFrame, *, season_hint: int | None) -> pl
                     drop_cols.append(base_col)
             if fill_exprs:
                 enriched = enriched.with_columns(fill_exprs)
+            
+            # Compute baseline usage signal BEFORE dropping the base columns
+            enriched = enriched.with_columns(
+                _safe_any(baseline_used_signals, alias="__ps_used_baseline", default=False)
+            )
+            
             if drop_cols:
                 enriched = enriched.drop(drop_cols)
+        else:
+             enriched = enriched.with_columns(pl.lit(False).alias("__ps_used_baseline"))
+    else:
+        enriched = enriched.with_columns(pl.lit(False).alias("__ps_used_baseline"))
 
-            l3_exprs: list[pl.Expr] = []
-            for l3_col, src_col in PS_L3_FALLBACK_MAP.items():
-                if l3_col in enriched.columns and src_col in enriched.columns:
-                    l3_exprs.append(
-                        pl.when(
-                            pl.col(src_col).is_not_null()
-                            & (pl.col(src_col).fill_null(0) > 0)
-                            & (pl.col(l3_col).fill_null(0) == 0)
-                        )
-                        .then(pl.col(src_col))
-                        .otherwise(pl.col(l3_col))
-                        .alias(l3_col)
-                    )
-            if l3_exprs:
-                enriched = enriched.with_columns(l3_exprs)
+    # Apply L3 fallbacks using 1g stats where appropriate. This runs for all rows,
+    # regardless of whether a PS baseline was applied, and mirrors the behavior
+    # in the feature pipeline.
+    l3_exprs: list[pl.Expr] = []
+    for l3_col, src_col in PS_L3_FALLBACK_MAP.items():
+        if l3_col in enriched.columns and src_col in enriched.columns:
+            l3_exprs.append(
+                pl.when(
+                    pl.col(src_col).is_not_null()
+                    & (pl.col(src_col).fill_null(0) > 0)
+                    & (pl.col(l3_col).fill_null(0) == 0)
+                )
+                .then(pl.col(src_col))
+                .otherwise(pl.col(l3_col))
+                .alias(l3_col)
+            )
+    if l3_exprs:
+        enriched = enriched.with_columns(l3_exprs)
 
-    enriched = enriched.with_columns(
-        _safe_any(baseline_used_signals, alias="__ps_used_baseline", default=False)
-    )
-
+    # (No second call to _safe_any needed here as it is handled above)
     enriched = enriched.with_columns(
         [
             pl.col("__ps_has_actual").cast(pl.Int8).alias("ps_tracking_has_actual"),
@@ -979,60 +1005,18 @@ def _attach_additional_context_features(enriched: pl.DataFrame) -> pl.DataFrame:
         enriched = enriched.sort("__row_order").drop("__row_order")
         if "game_date_right" in enriched.columns:
             enriched = enriched.drop("game_date_right")
+    # Attach QB profile and travel/rest features using the same keys as in the
+    # training pipeline (season, week, team) to ensure parity.
     qb_pl = _load_qb_profile_features(seasons)
-    if not qb_pl.is_empty() and {"team", "game_date"} <= set(enriched.columns):
-        # Use as-of join for QB profiles to handle missing weeks
-        # First, we need a date column in qb_pl for the as-of join
-        if "qb_profile_data_as_of" in qb_pl.columns:
-            qb_join = (
-                qb_pl.drop_nulls("qb_profile_data_as_of")
-                .drop(["season", "week"], strict=False)
-                .with_columns(pl.col("qb_profile_data_as_of").cast(pl.Datetime("ms")).alias("__qb_join_date"))
-                .sort(["team", "__qb_join_date"])
-            )
-            enriched = enriched.with_columns(
-                pl.arange(0, enriched.height).alias("__qb_row_order")
-            )
-            enriched = enriched.sort(["team", "game_date"])
-            enriched = enriched.join_asof(
-                qb_join,
-                left_on="game_date",
-                right_on="__qb_join_date",
-                by="team",
-                strategy="backward",
-            )
-            enriched = enriched.sort("__qb_row_order").drop(["__qb_row_order", "__qb_join_date"], strict=False)
-        else:
-            # Fallback to exact week join if no date column available
+    if not qb_pl.is_empty() and {"season", "week", "team"} <= set(enriched.columns):
             enriched = enriched.join(
                 qb_pl,
                 on=["season", "week", "team"],
                 how="left",
             )
+
     travel_pl = _load_travel_calendar_features(seasons)
-    if not travel_pl.is_empty() and {"team"} <= set(enriched.columns):
-        # Try as-of join first if we have game_date columns
-        if "game_date" in enriched.columns and "game_date" in travel_pl.columns:
-            travel_join = (
-                travel_pl.drop_nulls("game_date")
-                .drop(["season", "week"], strict=False)
-                .with_columns(pl.col("game_date").cast(pl.Datetime("ms")).alias("__travel_join_date"))
-                .sort(["team", "__travel_join_date"])
-            )
-            enriched = enriched.with_columns(
-                pl.arange(0, enriched.height).alias("__travel_row_order")
-            )
-            enriched = enriched.sort(["team", "game_date"])
-            enriched = enriched.join_asof(
-                travel_join,
-                left_on="game_date",
-                right_on="__travel_join_date",
-                by="team",
-                strategy="backward",
-            )
-            enriched = enriched.sort("__travel_row_order").drop(["__travel_row_order", "__travel_join_date"], strict=False)
-        else:
-            # Fallback to exact week join
+    if not travel_pl.is_empty() and {"season", "week", "team"} <= set(enriched.columns):
             enriched = enriched.join(
                 travel_pl,
                 on=["season", "week", "team"],
@@ -1394,26 +1378,61 @@ def _compute_features(scaffold: pd.DataFrame) -> pd.DataFrame:
                 pl.col("forecast_snapshot_ts").cast(pl.Datetime("ms", "UTC")),
             ]
         )
+        asof_meta = asof_meta.with_columns(
+            pl.col("injury_snapshot_ts").is_null().cast(pl.Int8).alias("injury_snapshot_ts_missing")
+        )
         pl_df = pl_df.join(asof_meta, on="game_id", how="left")
 
-    rolling_stats = [s for s in ROLLING_FEATURE_STATS if s in pl_df.columns]
-    missing_stats = sorted(set(ROLLING_FEATURE_STATS) - set(rolling_stats))
-    if missing_stats:
-        logger.warning("Prediction rolling features skipping missing stats: %s", ", ".join(missing_stats))
+    # Ensure rolling stats columns exist (even if zero) for the current game placeholder
+    # so that add_rolling_features detects them and computes history.
+    enriched = pl_df
+    for col in ROLLING_FEATURE_STATS:
+        if col not in enriched.columns:
+            enriched = enriched.with_columns(pl.lit(0.0).cast(pl.Float32).alias(col))
+            
+    # Also ensure other NFL_PLAYER_STATS exist if they are used downstream
+    for col in NFL_PLAYER_STATS:
+        if col not in enriched.columns:
+             enriched = enriched.with_columns(pl.lit(0.0).cast(pl.Float32).alias(col))
 
-    if rolling_stats:
-        enriched = add_rolling_features(
-            pl_df,
-            level="game",
-            stats=rolling_stats,
-            windows=ROLLING_WINDOWS,
-            contexts=ROLLING_CONTEXTS,
-            date_col="game_date",
-            player_col="player_id",
-            opponent_col="opponent",
-        )
-    else:
-        enriched = pl_df
+    logger.info("🔹 Computing rolling window features...")
+    
+    # Ensure daily cache exists for the current season context
+    if not enriched.is_empty() and "game_date" in enriched.columns:
+        dates = enriched.get_column("game_date").cast(pl.Date)
+        max_date = dates.max()
+        if max_date is not None:
+            # Determine season start (approximate or strictly Sept 1)
+            season_year = max_date.year if max_date.month >= 9 else max_date.year - 1
+            season_start = date(season_year, 9, 1)
+            
+            # Check if DAILY_CACHE_ROOT exists or is populated
+            # We err on the side of caution and trigger build if the directory seems empty or we suspect gaps
+            # Ideally we'd check specific files, but for now, if the user reported empty cache, 
+            # we rely on build_daily_cache_range's ability to fill gaps (or overwrite if needed).
+            if not DAILY_CACHE_ROOT.exists() or not any(DAILY_CACHE_ROOT.iterdir()):
+                logger.info(f"Daily totals cache missing. Rebuilding from {season_start} to {max_date}...")
+                build_daily_cache_range(season_start, max_date, level="game")
+            else:
+                # If cache exists, we might still need to ensure it covers the current date
+                # Especially if running inference for a new week.
+                # Since build_daily_cache_range is relatively efficient (checks partitions),
+                # we can call it to ensure coverage.
+                logger.info(f"Verifying daily totals cache coverage from {season_start} to {max_date}...")
+                build_daily_cache_range(season_start, max_date, level="game")
+
+    rolling_stats = ROLLING_FEATURE_STATS
+
+    enriched = add_rolling_features(
+        enriched,
+        level="game",
+        stats=rolling_stats,
+        windows=ROLLING_WINDOWS,
+        contexts=ROLLING_CONTEXTS,
+        date_col="game_date",
+        player_col="player_id",
+        opponent_col="opponent",
+    )
 
     # Rename rolling features to match model expectations (snap counts)
     # The model was trained on features named like 'snap_offense_pct_prev'
@@ -1430,34 +1449,35 @@ def _compute_features(scaffold: pd.DataFrame) -> pd.DataFrame:
         "1g_st_snaps_per_game": "snap_st_snaps_prev",
 
         # Pre-snap participation/target splits (historical projections)
-        "1g_ps_route_participation_pct_per_game": "ps_hist_route_participation_pct_prev",
-        "3g_ps_route_participation_pct_per_game": "ps_hist_route_participation_pct_l3",
-        "1g_ps_route_participation_plays_per_game": "ps_hist_route_participation_plays_prev",
-        "3g_ps_route_participation_plays_per_game": "ps_hist_route_participation_plays_l3",
-        "1g_ps_targets_total_per_game": "ps_hist_targets_total_prev",
-        "3g_ps_targets_total_per_game": "ps_hist_targets_total_l3",
-        "1g_ps_targets_slot_count_per_game": "ps_hist_targets_slot_count_prev",
-        "3g_ps_targets_slot_count_per_game": "ps_hist_targets_slot_count_l3",
-        "1g_ps_targets_wide_count_per_game": "ps_hist_targets_wide_count_prev",
-        "3g_ps_targets_wide_count_per_game": "ps_hist_targets_wide_count_l3",
-        "1g_ps_targets_inline_count_per_game": "ps_hist_targets_inline_count_prev",
-        "3g_ps_targets_inline_count_per_game": "ps_hist_targets_inline_count_l3",
-        "1g_ps_targets_backfield_count_per_game": "ps_hist_targets_backfield_count_prev",
-        "3g_ps_targets_backfield_count_per_game": "ps_hist_targets_backfield_count_l3",
-        "1g_ps_targets_slot_share_per_game": "ps_hist_targets_slot_share_prev",
-        "3g_ps_targets_slot_share_per_game": "ps_hist_targets_slot_share_l3",
-        "1g_ps_targets_wide_share_per_game": "ps_hist_targets_wide_share_prev",
-        "3g_ps_targets_wide_share_per_game": "ps_hist_targets_wide_share_l3",
-        "1g_ps_targets_inline_share_per_game": "ps_hist_targets_inline_share_prev",
-        "3g_ps_targets_inline_share_per_game": "ps_hist_targets_inline_share_l3",
-        "1g_ps_targets_backfield_share_per_game": "ps_hist_targets_backfield_share_prev",
-        "3g_ps_targets_backfield_share_per_game": "ps_hist_targets_backfield_share_l3",
-        "1g_ps_total_touches_per_game": "ps_hist_total_touches_prev",
-        "3g_ps_total_touches_per_game": "ps_hist_total_touches_l3",
-        "1g_ps_scripted_touches_per_game": "ps_hist_scripted_touches_prev",
-        "3g_ps_scripted_touches_per_game": "ps_hist_scripted_touches_l3",
-        "1g_ps_scripted_touch_share_per_game": "ps_hist_scripted_touch_share_prev",
-        "3g_ps_scripted_touch_share_per_game": "ps_hist_scripted_touch_share_l3",
+        # Commented out to match feature pipeline output (1g_... / 3g_...)
+        # "1g_ps_route_participation_pct_per_game": "ps_hist_route_participation_pct_prev",
+        # "3g_ps_route_participation_pct_per_game": "ps_hist_route_participation_pct_l3",
+        # "1g_ps_route_participation_plays_per_game": "ps_hist_route_participation_plays_prev",
+        # "3g_ps_route_participation_plays_per_game": "ps_hist_route_participation_plays_l3",
+        # "1g_ps_targets_total_per_game": "ps_hist_targets_total_prev",
+        # "3g_ps_targets_total_per_game": "ps_hist_targets_total_l3",
+        # "1g_ps_targets_slot_count_per_game": "ps_hist_targets_slot_count_prev",
+        # "3g_ps_targets_slot_count_per_game": "ps_hist_targets_slot_count_l3",
+        # "1g_ps_targets_wide_count_per_game": "ps_hist_targets_wide_count_prev",
+        # "3g_ps_targets_wide_count_per_game": "ps_hist_targets_wide_count_l3",
+        # "1g_ps_targets_inline_count_per_game": "ps_hist_targets_inline_count_prev",
+        # "3g_ps_targets_inline_count_per_game": "ps_hist_targets_inline_count_l3",
+        # "1g_ps_targets_backfield_count_per_game": "ps_hist_targets_backfield_count_prev",
+        # "3g_ps_targets_backfield_count_per_game": "ps_hist_targets_backfield_count_l3",
+        # "1g_ps_targets_slot_share_per_game": "ps_hist_targets_slot_share_prev",
+        # "3g_ps_targets_slot_share_per_game": "ps_hist_targets_slot_share_l3",
+        # "1g_ps_targets_wide_share_per_game": "ps_hist_targets_wide_share_prev",
+        # "3g_ps_targets_wide_share_per_game": "ps_hist_targets_wide_share_l3",
+        # "1g_ps_targets_inline_share_per_game": "ps_hist_targets_inline_share_prev",
+        # "3g_ps_targets_inline_share_per_game": "ps_hist_targets_inline_share_l3",
+        # "1g_ps_targets_backfield_share_per_game": "ps_hist_targets_backfield_share_prev",
+        # "3g_ps_targets_backfield_share_per_game": "ps_hist_targets_backfield_share_l3",
+        # "1g_ps_total_touches_per_game": "ps_hist_total_touches_prev",
+        # "3g_ps_total_touches_per_game": "ps_hist_total_touches_l3",
+        # "1g_ps_scripted_touches_per_game": "ps_hist_scripted_touches_prev",
+        # "3g_ps_scripted_touches_per_game": "ps_hist_scripted_touches_l3",
+        # "1g_ps_scripted_touch_share_per_game": "ps_hist_scripted_touch_share_prev",
+        # "3g_ps_scripted_touch_share_per_game": "ps_hist_scripted_touch_share_l3",
     }
     existing = set(enriched.columns)
     valid_renames = {k: v for k, v in rename_map.items() if k in existing}
@@ -1505,6 +1525,9 @@ def _compute_features(scaffold: pd.DataFrame) -> pd.DataFrame:
             )
             .alias("decision_cutoff_ts")
         )
+    # Attach team & opponent context from the same precomputed history that
+    # training uses. This avoids subtle drift from re-computing context with
+    # slightly different inputs or placeholder rows at inference time.
     team_history = None
     if TEAM_CONTEXT_HISTORY_PATH.exists():
         team_history = pl.read_parquet(str(TEAM_CONTEXT_HISTORY_PATH))
@@ -1519,14 +1542,14 @@ def _compute_features(scaffold: pd.DataFrame) -> pd.DataFrame:
         )
     enriched = add_team_context_features(
         enriched,
-        join_on_date=True,
+        join_on_date=False,
         history=team_history,
-        cutoff_column="decision_cutoff_ts",
+        cutoff_column=None,
     )
 
     available_cols = set(enriched.columns)
     share_specs = [
-        ("hist_target_share", "target", "team_ctx_pass_attempts"),
+        ("hist_target_share", "target", "team_ctx_targets"),
         ("hist_carry_share", "carry", "team_ctx_carries"),
         ("hist_pass_attempt_share", "pass_attempt", "team_ctx_pass_attempts"),
         ("hist_red_zone_target_share", "red_zone_target", "team_ctx_red_zone_targets"),
@@ -1537,8 +1560,8 @@ def _compute_features(scaffold: pd.DataFrame) -> pd.DataFrame:
     share_exprs: list[pl.Expr] = []
     for base_name, numer_prefix, denom_prefix in share_specs:
         combos = [
-            ("prev", f"{numer_prefix}_prev", f"{denom_prefix}_prev"),
-            ("l3", f"{numer_prefix}_l3", f"{denom_prefix}_l3"),
+            ("prev", f"1g_{numer_prefix}_per_game", f"{denom_prefix}_prev"),
+            ("l3", f"3g_{numer_prefix}_per_game", f"{denom_prefix}_l3"),
         ]
         for suffix, numer_col, denom_col in combos:
             if {numer_col, denom_col} <= available_cols:
@@ -1621,7 +1644,7 @@ def _compute_features(scaffold: pd.DataFrame) -> pd.DataFrame:
     enriched = add_offense_context_features_inference(
         enriched,
         history_path=OFFENSE_CONTEXT_HISTORY_PATH,
-        cutoff_column="decision_cutoff_ts",
+        cutoff_column=None,
     )
     if ENABLE_WEATHER_FEATURES:
         enriched = add_weather_forecast_features_inference(
@@ -1638,28 +1661,56 @@ def _compute_features(scaffold: pd.DataFrame) -> pd.DataFrame:
     enriched = _attach_drive_history_features(enriched)
     enriched = _attach_injury_features(enriched)
     enriched = _compute_vacancy_features(enriched)
-    enriched = _compute_history_dependent_features(enriched)
+    enriched = _attach_history_features(enriched)
     enriched = add_nfl_odds_features_to_df(
         enriched,
         player_col="player_name",
         allow_schedule_fallback=True,
         drop_schedule_rows=False,
     )
+
+    # Normalize spread column and derive team / opponent implied totals from
+    # total_line + spread_line for each player row, mirroring training.
     if "spread_line" not in enriched.columns:
-        enriched = enriched.with_columns(pl.lit(0.0).cast(pl.Float32).alias("spread_line"))
+        enriched = enriched.with_columns(
+            pl.lit(0.0).cast(pl.Float32).alias("spread_line")
+        )
     else:
         enriched = enriched.with_columns(pl.col("spread_line").fill_null(0.0))
         
-    if "team_implied_total" not in enriched.columns:
-        enriched = enriched.with_columns(pl.lit(22.5).cast(pl.Float32).alias("team_implied_total"))
-    else:
-        enriched = enriched.with_columns(pl.col("team_implied_total").fill_null(22.5))
+    odds_cols = set(enriched.columns)
+    required_for_totals = {"total_line", "spread_line", "team", "home_team", "away_team"}
+    if required_for_totals <= odds_cols:
+        total = pl.col("total_line").cast(pl.Float32)
+        spread = pl.col("spread_line").cast(pl.Float32)
+        home_total = (total - spread) / 2.0
+        away_total = total - home_total
+
+        enriched = enriched.with_columns(
+            [
+                pl.when(pl.col("team") == pl.col("home_team"))
+                .then(home_total)
+                .when(pl.col("team") == pl.col("away_team"))
+                .then(away_total)
+                .otherwise(None)
+                .cast(pl.Float32)
+                .alias("team_implied_total"),
+                pl.when(pl.col("team") == pl.col("home_team"))
+                .then(away_total)
+                .when(pl.col("team") == pl.col("away_team"))
+                .then(home_total)
+                .otherwise(None)
+                .cast(pl.Float32)
+                .alias("opp_implied_total"),
+            ]
+        )
 
     df = enriched.to_pandas()
 
     def _apply_historical_shares(frame: pd.DataFrame) -> None:
         share_specs = [
-            ("hist_target_share", "target", "team_ctx_pass_attempts"),
+            # Match training-time share definitions in pipeline/feature.py
+            ("hist_target_share", "target", "team_ctx_targets"),
             ("hist_carry_share", "carry", "team_ctx_carries"),
             ("hist_pass_attempt_share", "pass_attempt", "team_ctx_pass_attempts"),
             ("hist_red_zone_target_share", "red_zone_target", "team_ctx_red_zone_targets"),
@@ -1675,13 +1726,19 @@ def _compute_features(scaffold: pd.DataFrame) -> pd.DataFrame:
                 ("l3", f"{numer_prefix}_l3", f"{denom_prefix}_l3"),
             ]
             for suffix, numer_col, denom_col in combos:
+                out_col = f"{base_name}_{suffix}"
+                # Do NOT override if the column already exists; training has
+                # already defined these via the Polars pipeline. This pandas
+                # helper is a fallback for cases where they are missing.
+                if out_col in cols:
+                    continue
                 if numer_col in cols and denom_col in cols:
                     numer = pd.to_numeric(frame[numer_col], errors="coerce")
                     denom = (
                         pd.to_numeric(frame[denom_col], errors="coerce")
                         .replace(0, np.nan)
                     )
-                    frame[f"{base_name}_{suffix}"] = (
+                    frame[out_col] = (
                         numer / denom
                     ).fillna(0.0).astype("float32")
 
@@ -1720,67 +1777,171 @@ def _load_raw_injuries_for_predictions(seasons: Iterable[int]) -> pl.DataFrame |
     return out
 
 
+
 def _attach_drive_history_features(enriched: pl.DataFrame) -> pl.DataFrame:
     if "game_date" not in enriched.columns or "player_id" not in enriched.columns:
         return enriched
 
-    if not PLAYER_DRIVE_HISTORY_PATH.exists():
+    if not PLAYER_DRIVE_DIR.exists():
         logger.warning(
-            "Drive history file missing at %s; skipping drive context features.",
-            PLAYER_DRIVE_HISTORY_PATH,
+            "Player drive directory missing at %s; skipping drive context features.",
+            PLAYER_DRIVE_DIR,
         )
         return enriched
 
-    drive_history = pl.read_parquet(str(PLAYER_DRIVE_HISTORY_PATH))
-    if drive_history.is_empty():
-        return enriched
-
-    drive_history = drive_history.sort(["player_id", "team", "game_date"])
-    drive_history = drive_history.with_columns(
-        pl.col("game_date").cast(pl.Datetime("ms"))
+    # Ensure IDs are string for join/filter
+    enriched = enriched.with_columns([
+        pl.col("player_id").cast(pl.Utf8),
+        pl.col("team").cast(pl.Utf8),
+        pl.col("game_id").cast(pl.Utf8),
+        pl.col("season").cast(pl.Int32),
+        pl.col("week").cast(pl.Int32),
+    ])
+    
+    target_players = enriched.select("player_id").unique()
+    
+    # 1. Load Drive Data (Sparse)
+    drive_scan = pl.scan_parquet(
+        str(PLAYER_DRIVE_DIR / "season=*/week=*/part.parquet"),
+        glob=True,
+        hive_partitioning=True,
+        missing_columns="insert",
+        extra_columns="ignore",
     )
-    if "data_as_of" in drive_history.columns:
-        drive_history = drive_history.with_columns(pl.col("data_as_of").cast(pl.Datetime("ms")))
+    drive_scan = drive_scan.with_columns([
+        pl.col("season").cast(pl.Int32),
+        pl.col("week").cast(pl.Int32),
+        pl.col("player_id").cast(pl.Utf8),
+        pl.col("team").cast(pl.Utf8),
+    ])
+    
+    # 2. Load Game Data (Dense Scaffold for History)
+    game_scan = pl.scan_parquet(
+        str(PLAYER_GAME_DIR / "season=*/week=*/part.parquet"),
+        glob=True,
+        hive_partitioning=True,
+        missing_columns="insert",
+        extra_columns="ignore",
+    )
+    game_scan = game_scan.with_columns([
+        pl.col("season").cast(pl.Int32),
+        pl.col("week").cast(pl.Int32),
+        pl.col("player_id").cast(pl.Utf8),
+        pl.col("team").cast(pl.Utf8),
+    ])
 
-    join_keys = ["player_id", "team"] if "team" in enriched.columns else ["player_id"]
-    target_col = "decision_cutoff_ts" if "decision_cutoff_ts" in enriched.columns else "game_date"
-    if target_col in enriched.columns and enriched.schema.get(target_col) == pl.Datetime("ms", "UTC"):
-        enriched = enriched.with_columns(
-            pl.col(target_col).dt.replace_time_zone(None).alias(target_col)
+    # Load history for target players
+    drive_hist = drive_scan.filter(pl.col("player_id").is_in(target_players.get_column("player_id"))).collect(streaming=True)
+    
+    game_hist = game_scan.filter(pl.col("player_id").is_in(target_players.get_column("player_id"))).select(
+        ["season", "week", "game_id", "team", "player_id", "game_date"]
+    ).collect(streaming=True)
+    
+    # Filter out current games from history to prevent leakage/duplication
+    # Use anti-join for robustness
+    current_games_df = enriched.select(pl.col("game_id").cast(pl.Utf8).str.strip_chars().unique())
+    
+    if not drive_hist.is_empty() and "game_id" in drive_hist.columns:
+         drive_hist = drive_hist.with_columns(pl.col("game_id").cast(pl.Utf8).str.strip_chars())
+         drive_hist = drive_hist.join(current_games_df, on="game_id", how="anti")
+    
+    if not game_hist.is_empty() and "game_id" in game_hist.columns:
+         game_hist = game_hist.with_columns(pl.col("game_id").cast(pl.Utf8).str.strip_chars())
+         game_hist = game_hist.join(current_games_df, on="game_id", how="anti")
+    
+    # Aggregate drive history (sparse)
+    if not drive_hist.is_empty():
+        drive_hist = compute_drive_level_aggregates(drive_hist)
+    
+    # Create Full Scaffold (History + Current)
+    current_placeholder = enriched.select(
+        ["season", "week", "game_id", "team", "player_id", "game_date"]
+    ).unique().with_columns(pl.col("game_id").cast(pl.Utf8))
+    
+    if game_hist.is_empty():
+        full_scaffold = current_placeholder
+    else:
+        full_scaffold = pl.concat([
+            game_hist.select(current_placeholder.columns),
+            current_placeholder
+        ], how="vertical_relaxed").unique()
+
+    # Join Drive History into Full Scaffold
+    join_cols = ["season", "week", "game_id", "team", "player_id"]
+    
+    if not full_scaffold.is_empty():
+        full_scaffold = full_scaffold.with_columns([
+            pl.col("season").cast(pl.Int32),
+            pl.col("week").cast(pl.Int32),
+            pl.col("game_id").cast(pl.Utf8),
+            pl.col("team").cast(pl.Utf8),
+            pl.col("player_id").cast(pl.Utf8),
+        ])
+        
+    if not drive_hist.is_empty():
+        drive_hist = drive_hist.with_columns([
+            pl.col("season").cast(pl.Int32),
+            pl.col("week").cast(pl.Int32),
+            pl.col("game_id").cast(pl.Utf8),
+            pl.col("team").cast(pl.Utf8),
+            pl.col("player_id").cast(pl.Utf8),
+        ])
+        
+        if "game_date" in drive_hist.columns:
+            drive_hist = drive_hist.rename({"game_date": "game_date_drive"})
+            
+        combined = full_scaffold.join(
+            drive_hist,
+            on=join_cols,
+            how="left",
         )
-    drive_join = (
-        drive_history
-        .drop_nulls("data_as_of")
-        .with_columns(pl.col("data_as_of").alias("__drive_ctx_data_as_of"))
-        .sort(join_keys + ["__drive_ctx_data_as_of"])
-    )
-    enriched = enriched.with_columns(
-        pl.col(target_col).cast(pl.Datetime("ms")).alias("__drive_ctx_target_ts")
-        if target_col in enriched.columns
-        else pl.col("game_date").cast(pl.Datetime("ms")).alias("__drive_ctx_target_ts")
-    ).join_asof(
-        drive_join,
-        left_on="__drive_ctx_target_ts",
-        right_on="__drive_ctx_data_as_of",
-        by=join_keys,
-        strategy="backward",
-    ).rename({"__drive_ctx_data_as_of": "drive_ctx_data_as_of"}).drop("__drive_ctx_target_ts")
+        
+        # Fill nulls for aggregation columns with 0
+        agg_cols = [
+            "drive_count", "drive_touch_drives", "drive_td_drives", "drive_total_yards",
+            "drive_red_zone_drives", "drive_goal_to_go_drives"
+        ]
+        fill_cols = [c for c in agg_cols if c in combined.columns]
+        if fill_cols:
+            combined = combined.with_columns([pl.col(c).fill_null(0) for c in fill_cols])
+            
+    else:
+        combined = full_scaffold
+        agg_cols = ["drive_count", "drive_touch_drives", "drive_td_drives", "drive_total_yards"]
+        combined = combined.with_columns([
+            pl.lit(0.0).cast(pl.Float32).alias(c) for c in agg_cols
+        ])
+        
+    # Finalize
+    finalized = finalize_drive_history_features(combined)
+    
+    # Join back to Enriched (only current rows)
+    join_cols_enriched = ["season", "week", "game_id", "player_id"]
+    features_to_join = finalized.select(join_cols_enriched + [c for c in finalized.columns if c.startswith("drive_hist_")])
+    
+    enriched = enriched.join(features_to_join, on=join_cols_enriched, how="left")
 
     drive_cols = [col for col in enriched.columns if col.startswith("drive_hist_")]
     if drive_cols:
         enriched = enriched.with_columns(
             [pl.col(col).fill_null(0.0).cast(pl.Float32) for col in drive_cols]
         )
-    if "drive_ctx_data_as_of" in enriched.columns:
-        enriched = enriched.with_columns(pl.col("drive_ctx_data_as_of").cast(pl.Datetime("ms")))
 
     return enriched
 
 
 def _compute_vacancy_features(enriched: pl.DataFrame) -> pl.DataFrame:
     """
-    Compute vacancy features for inference using current rolling stats.
-    Vacancy features: Sum of historical usage (3g avg) from players who are OUT.
+    Ensure vacated-usage columns exist and match training semantics.
+
+    Training currently computes vacated usage inside the offense-context
+    builder, but at the time those histories were generated the required
+    3g rolling features were not available, so the model was effectively
+    trained with these columns as zeros for this era.
+
+    To guarantee strict train/predict parity (and avoid introducing new
+    information at inference time), we mirror that behaviour here by
+    simply ensuring the columns exist and are 0.0 where missing.
     """
     vacancy_cols = [
         "vacated_targets_position",
@@ -1788,64 +1949,13 @@ def _compute_vacancy_features(enriched: pl.DataFrame) -> pl.DataFrame:
         "vacated_rz_targets_position",
         "vacated_gl_carries_position",
     ]
+    exprs: list[pl.Expr] = []
     for col in vacancy_cols:
-        if col not in enriched.columns:
-            enriched = enriched.with_columns(pl.lit(0.0).cast(pl.Float32).alias(col))
-            
-    if "injury_game_designation" not in enriched.columns:
-        return enriched
-
-    # Find OUT players
-    out_mask = pl.col("injury_game_designation").cast(pl.Utf8).str.to_uppercase() == "OUT"
-    
-    agg_exprs = []
-    if "3g_target_per_game" in enriched.columns:
-        agg_exprs.append(pl.col("3g_target_per_game").sum().alias("vacated_targets_position"))
-    elif "target_l3" in enriched.columns: 
-        agg_exprs.append(pl.col("target_l3").sum().alias("vacated_targets_position"))
-        
-    if "3g_carry_per_game" in enriched.columns:
-        agg_exprs.append(pl.col("3g_carry_per_game").sum().alias("vacated_carries_position"))
-    elif "carry_l3" in enriched.columns:
-        agg_exprs.append(pl.col("carry_l3").sum().alias("vacated_carries_position"))
-        
-    if "3g_red_zone_target_per_game" in enriched.columns:
-        agg_exprs.append(pl.col("3g_red_zone_target_per_game").sum().alias("vacated_rz_targets_position"))
-    elif "red_zone_target_l3" in enriched.columns:
-        agg_exprs.append(pl.col("red_zone_target_l3").sum().alias("vacated_rz_targets_position"))
-        
-    if "3g_goal_to_go_carry_per_game" in enriched.columns:
-        agg_exprs.append(pl.col("3g_goal_to_go_carry_per_game").sum().alias("vacated_gl_carries_position"))
-    elif "goal_to_go_carry_l3" in enriched.columns:
-        agg_exprs.append(pl.col("goal_to_go_carry_l3").sum().alias("vacated_gl_carries_position"))
-        
-    if not agg_exprs:
-        return enriched
-        
-    vacated_usage = (
-        enriched.filter(out_mask)
-        .group_by(["season", "week", "team", "position"])
-        .agg(agg_exprs)
-    )
-    
-    if vacated_usage.is_empty():
-        return enriched
-        
-    enriched = enriched.join(
-        vacated_usage,
-        on=["season", "week", "team", "position"],
-        how="left",
-        suffix="_vac"
-    )
-    
-    for col in vacancy_cols:
-        vac_col = f"{col}_vac"
-        if vac_col in enriched.columns:
-            enriched = enriched.with_columns(
-                pl.col(vac_col).fill_null(0.0).cast(pl.Float32).alias(col)
-            ).drop(vac_col)
-            
-    return enriched
+        if col in enriched.columns:
+            exprs.append(pl.col(col).fill_null(0.0).cast(pl.Float32).alias(col))
+        else:
+            exprs.append(pl.lit(0.0).cast(pl.Float32).alias(col))
+    return enriched.with_columns(exprs)
 
 
 def _apply_injury_availability_model_inference(enriched: pl.DataFrame) -> pl.DataFrame:
@@ -1902,129 +2012,15 @@ def _apply_injury_availability_model_inference(enriched: pl.DataFrame) -> pl.Dat
     return enriched
 
 
-def _compute_history_dependent_features(enriched: pl.DataFrame) -> pl.DataFrame:
+def _attach_history_features(enriched: pl.DataFrame) -> pl.DataFrame:
     """
-    Compute features requiring historical player state by loading processed history.
-    - Injury history rates (cumulative)
-    - Inactivity streaks
+    Attach team / opponent and position-bucket TD rate history to the
+    prediction frame using the same helper that training uses.
+
+    This keeps all TD-rate features in strict parity without introducing
+    any extra defaults or inference-only logic.
     """
-    req_cols = [
-        "season", "week", "player_id", "team", "depth_chart_position",
-        "injury_practice_status_sequence", "injury_is_inactive_designation",
-        "status"
-    ]
-    
-    try:
-        # Use manual file iteration to handle schema evolution (e.g. int32 vs dictionary encoded season)
-        files = sorted(PLAYER_GAME_DIR.glob("season=*/week=*/part.parquet"))
-        dfs = []
-        for f in files:
-            try:
-                dfs.append(pd.read_parquet(f, columns=req_cols))
-            except Exception:
-                continue
-        
-        if not dfs:
-            return enriched
-            
-        history_pd = pd.concat(dfs, ignore_index=True)
-        
-        # Enforce types for critical join keys
-        if "season" in history_pd.columns:
-            history_pd["season"] = history_pd["season"].astype("int32")
-        if "week" in history_pd.columns:
-            history_pd["week"] = history_pd["week"].astype("int32")
-            
-        history = pl.from_pandas(history_pd)
-    except Exception as e:
-        logger.warning(f"Failed to load player history: {e}")
-        return enriched
-
-    if history.is_empty():
-        return enriched
-
-    targets = enriched.select(["season", "week"]).unique()
-    if not targets.is_empty():
-        history = history.join(targets, on=["season", "week"], how="anti")
-
-    if "injury_is_inactive_designation" not in enriched.columns:
-        enriched = enriched.with_columns(
-            pl.when(pl.col("injury_game_designation").cast(pl.Utf8).str.to_uppercase() == "OUT")
-            .then(pl.lit(1.0))
-            .otherwise(pl.lit(0.0))
-            .alias("injury_is_inactive_designation")
-        )
-        
-    if "status" not in enriched.columns:
-        enriched = enriched.with_columns(pl.lit("ACT").alias("status"))
-        
-    common_cols = [c for c in history.columns if c in enriched.columns]
-    current = enriched.select(common_cols)
-    history_subset = history.select(common_cols)
-    
-    combined = pl.concat([history_subset, current], how="vertical_relaxed")
-    
-    combined = _compute_injury_history_rates(combined)
-    
-    if "status" in combined.columns:
-        combined = combined.with_columns(
-            (pl.col("status") == "INA").cast(pl.Int8).alias("is_inactive")
-        )
-        combined = combined.with_columns(pl.col("is_inactive").fill_null(0))
-        
-        combined = combined.sort(["player_id", "season", "week"])
-        
-        combined = combined.with_columns([
-            pl.col("is_inactive")
-            .rolling_sum(window_size=5, min_periods=1)
-            .shift(1)
-            .over("player_id")
-            .fill_null(0)
-            .alias("recent_inactivity_count"),
-            
-            pl.col("is_inactive")
-            .shift(1)
-            .over("player_id")
-            .fill_null(0)
-            .alias("was_inactive_last_game")
-        ])
-    
-    features_to_join = [
-        "injury_player_inactive_rate_prior",
-        "injury_depth_slot_inactive_rate_prior",
-        "injury_practice_pattern_inactive_rate_prior",
-        "recent_inactivity_count",
-        "was_inactive_last_game"
-    ]
-    
-    features = combined.select(["season", "week", "player_id", "team"] + [f for f in features_to_join if f in combined.columns])
-    
-    enriched = enriched.join(
-        features,
-        on=["season", "week", "player_id", "team"],
-        how="left"
-    )
-    enriched = _apply_injury_availability_model_inference(enriched)
-    
-    injury_defaults = {
-        "injury_hours_since_last_report": 168.0,
-        "injury_hours_until_game_at_last_report": 0.0,
-        "injury_hours_between_last_reports": 0.0,
-        "injury_report_count": 0.0,
-        "injury_transaction_days_since": 365.0,
-        "injury_snapshot_valid": 0,
-        "injury_snapshot_ts_missing": 1,
-    }
-    for col, val in injury_defaults.items():
-        if col not in enriched.columns:
-             enriched = enriched.with_columns(pl.lit(val).alias(col))
-    if "injury_last_transaction_note" not in enriched.columns:
-        enriched = enriched.with_columns(pl.lit("UNKNOWN").alias("injury_last_transaction_note"))
-
-    if "off_ctx_game_date" not in enriched.columns:
-        enriched = enriched.with_columns(pl.col("game_date").alias("off_ctx_game_date"))
-        
-    return enriched
+    return attach_td_rate_history_features(enriched)
 
 
 def _attach_injury_features(enriched: pl.DataFrame) -> pl.DataFrame:
@@ -2035,7 +2031,9 @@ def _attach_injury_features(enriched: pl.DataFrame) -> pl.DataFrame:
     seasons = enriched.get_column("season").unique().to_list()
     raw = _load_raw_injuries_for_predictions(seasons)
     if raw is None or raw.is_empty():
-        return enriched
+        # Even if we have no raw injury reports, try to backfill injury history
+        # from the player_game_by_week artifacts to maintain parity.
+        return _attach_injury_history_from_player_games(enriched)
 
     keys = enriched.select(["season", "week"]).unique()
     meta_cols = [c for c in ["season", "week", "team", "game_date", "game_start_utc"] if c in enriched.columns]
@@ -2273,7 +2271,162 @@ def _attach_injury_features(enriched: pl.DataFrame) -> pl.DataFrame:
         pl.col("injury_inactive_probability").fill_null(0.1).cast(pl.Float32)
     )
 
-    return enriched.join(aggregated, on=["season", "week", "player_id"], how="left")
+    enriched = enriched.join(
+        aggregated,
+        on=["season", "week", "player_id"],
+        how="left",
+    )
+
+    enriched = enriched.with_columns(
+        [
+            pl.col("injury_is_inactive_designation").fill_null(0.0).alias("injury_is_inactive_designation"),
+            pl.col("injury_practice_dnp_count").fill_null(0.0).alias("injury_practice_dnp_count"),
+            pl.col("injury_practice_limited_count").fill_null(0.0).alias("injury_practice_limited_count"),
+            pl.col("injury_practice_full_count").fill_null(0.0).alias("injury_practice_full_count"),
+        ]
+    )
+
+    # Attach historical injury priors and recency metrics from the
+    # player_game_by_week artifacts to mirror the training pipeline.
+    enriched = _attach_injury_history_from_player_games(enriched)
+    return enriched
+
+
+def _attach_injury_history_from_player_games(enriched: pl.DataFrame) -> pl.DataFrame:
+    """
+    Backfill injury history features (priors, recency, rest) by joining the
+    precomputed player_game_by_week artifacts used in training.
+
+    Ensures parity for columns like:
+      - injury_player_inactive_rate_prior
+      - injury_depth_slot_inactive_rate_prior
+      - injury_practice_pattern_inactive_rate_prior
+      - injury_hours_*_last_report
+      - rest_days_since_last_game
+      - recent_inactivity_count
+      - injury_snapshot_valid, injury_transaction_days_since, injury_last_transaction_note
+      - injury_report_count
+    """
+    required = {"season", "week", "player_id"}
+    if not required <= set(enriched.columns):
+        return enriched
+
+    seasons = enriched.get_column("season").unique().to_list()
+    weeks = enriched.get_column("week").unique().to_list()
+
+    try:
+        hist_scan = pl.scan_parquet(
+            str(PLAYER_GAME_DIR / "season=*/week=*/part.parquet"),
+            glob=True,
+            hive_partitioning=True,
+            missing_columns="insert",
+            extra_columns="ignore",
+        )
+    except Exception as e:
+        logger.warning(f"Failed to load player_game_by_week for injury history: {e}")
+        return enriched
+
+    hist_scan = hist_scan.with_columns(
+        [
+            pl.col("season").cast(pl.Int32),
+            pl.col("week").cast(pl.Int32),
+            pl.col("player_id").cast(pl.Utf8),
+        ]
+    )
+
+    injury_hist_cols = [
+        # Injury priors / recency
+        "recent_inactivity_count",
+        "injury_hours_since_last_report",
+        "injury_hours_until_game_at_last_report",
+        "injury_hours_between_last_reports",
+        "rest_days_since_last_game",
+        "injury_player_inactive_rate_prior",
+        "injury_depth_slot_inactive_rate_prior",
+        "injury_practice_pattern_inactive_rate_prior",
+        "injury_snapshot_valid",
+        "injury_transaction_days_since",
+        "injury_last_transaction_note",
+        "injury_report_count",
+        # Roster & inactivity flags
+        "depth_chart_mobility",
+        "depth_chart_position",
+        "was_inactive_last_game",
+        "injury_inactive_probability",
+        # Snap share history (offense/defense/ST)
+        "snap_offense_pct_prev",
+        "snap_offense_pct_l3",
+        "snap_offense_snaps_prev",
+        "snap_defense_pct_prev",
+        "snap_defense_pct_l3",
+        "snap_defense_snaps_prev",
+        "snap_st_pct_prev",
+        "snap_st_pct_l3",
+        "snap_st_snaps_prev",
+    ]
+
+    hist_scan = hist_scan.filter(
+        pl.col("season").is_in(seasons) & pl.col("week").is_in(weeks)
+    )
+
+    select_cols = ["season", "week", "player_id"] + [
+        c for c in injury_hist_cols if c in hist_scan.columns
+    ]
+    hist_df = hist_scan.select(select_cols).collect()
+    if hist_df.is_empty():
+        return enriched
+
+    # Normalize dtypes
+    cast_exprs = [
+        pl.col("season").cast(pl.Int32),
+        pl.col("week").cast(pl.Int32),
+        pl.col("player_id").cast(pl.Utf8),
+    ]
+    for col in injury_hist_cols:
+        # Keep text columns (like injury_last_transaction_note and depth_chart_position)
+        # as strings; cast numeric-like columns to Float32.
+        if col in hist_df.columns and col not in ("injury_last_transaction_note", "depth_chart_position"):
+            cast_exprs.append(pl.col(col).cast(pl.Float32))
+    hist_df = hist_df.with_columns(cast_exprs)
+
+    # Join and prefer existing enriched values; fill nulls from history
+    joined = enriched.join(
+        hist_df,
+        on=["season", "week", "player_id"],
+        how="left",
+        suffix="_hist",
+    )
+
+    fill_exprs: list[pl.Expr] = []
+    for col in injury_hist_cols:
+        hist_col = f"{col}_hist"
+        if col in joined.columns and hist_col in joined.columns:
+            if col == "injury_last_transaction_note":
+                fill_exprs.append(
+                    pl.when(pl.col(col).is_null() | (pl.col(col) == "UNKNOWN"))
+                    .then(pl.col(hist_col))
+                    .otherwise(pl.col(col))
+                    .alias(col)
+                )
+            else:
+                fill_exprs.append(
+                    pl.when(pl.col(col).is_null())
+                    .then(pl.col(hist_col))
+                    .otherwise(pl.col(col))
+                    .alias(col)
+                )
+        elif hist_col in joined.columns and col not in joined.columns:
+            fill_exprs.append(pl.col(hist_col).alias(col))
+
+    if fill_exprs:
+        joined = joined.with_columns(fill_exprs)
+
+    # Drop helper _hist columns
+    drop_cols = [c for c in joined.columns if c.endswith("_hist")]
+    if drop_cols:
+        joined = joined.drop(drop_cols)
+
+    return joined
 
 
 def _load_artifacts(problem_name: str) -> dict:
@@ -2340,7 +2493,11 @@ def _latest_model_path(problem: str) -> Path:
         model_path = latest / "model.joblib"
         if model_path.exists():
             if name != problem:
-                logger.warning("Using legacy model directory for %s located at %s", problem, latest)
+                logger.warning(
+                    "Using legacy model directory for %s located at %s",
+                    problem,
+                    latest,
+                )
             return model_path
     raise FileNotFoundError(f"No model directory found for {problem}.")
 
@@ -2360,7 +2517,11 @@ def _metrics_path(problem: str) -> Path:
         path = latest / "metrics.yaml"
         if path.exists():
             if name != problem:
-                logger.warning("Using legacy metrics directory for %s located at %s", problem, latest)
+                logger.warning(
+                    "Using legacy metrics directory for %s located at %s",
+                    problem,
+                    latest,
+                )
             return path
     return Path()
 
@@ -2373,62 +2534,388 @@ def _load_threshold(metrics_path: Path) -> float:
     return float(metrics.get("decision_threshold", 0.5))
 
 def _apply_guards_inline(features_df: pd.DataFrame, preds: np.ndarray) -> np.ndarray:
-     adj = preds.copy()
-     
-     # 1. Inactive / Out
-     if "injury_is_inactive_designation" in features_df.columns:
-         mask = pd.to_numeric(features_df["injury_is_inactive_designation"], errors="coerce").fillna(0).astype(bool).to_numpy()
-         adj[mask] = 0.0
-     
-     if "injury_game_designation" in features_df.columns:
-         des = features_df["injury_game_designation"].fillna("").astype(str).str.upper()
-         out_mask = des.isin(["OUT", "INACTIVE"]).to_numpy()
-         adj[out_mask] = 0.0
-         
-         doubtful_mask = (des == "DOUBTFUL").to_numpy()
-         adj[doubtful_mask] *= 0.25
-         
-         q_mask = (des == "QUESTIONABLE").to_numpy()
-         adj[q_mask] *= 0.85
-     
-     if "injury_practice_status" in features_df.columns:
-         prac = features_df["injury_practice_status"].fillna("").astype(str).str.upper()
-         dnp_mask = prac.str.contains("DID NOT PARTICIPATE", regex=False).to_numpy()
-         adj[dnp_mask] *= 0.55
-         
-         lim_mask = prac.str.contains("LIMITED", regex=False).to_numpy()
-         adj[lim_mask] *= 0.85
-     
-     return np.clip(adj, 0.0, 1.0)
+    adj = preds.copy()
+    # 1. Inactive / Out
+    if "injury_is_inactive_designation" in features_df.columns:
+        mask = (
+            pd.to_numeric(
+                features_df["injury_is_inactive_designation"], errors="coerce"
+            )
+            .fillna(0)
+            .astype(bool)
+            .to_numpy()
+        )
+        adj[mask] = 0.0
+
+    if "injury_game_designation" in features_df.columns:
+        des = (
+            features_df["injury_game_designation"]
+            .fillna("")
+            .astype(str)
+            .str.upper()
+        )
+        out_mask = des.isin(["OUT", "INACTIVE"]).to_numpy()
+        adj[out_mask] = 0.0
+
+        doubtful_mask = (des == "DOUBTFUL").to_numpy()
+        adj[doubtful_mask] *= 0.25
+
+        q_mask = (des == "QUESTIONABLE").to_numpy()
+        adj[q_mask] *= 0.85
+
+    if "injury_practice_status" in features_df.columns:
+        prac = (
+            features_df["injury_practice_status"]
+            .fillna("")
+            .astype(str)
+            .str.upper()
+        )
+        dnp_mask = prac.str.contains("DID NOT PARTICIPATE", regex=False).to_numpy()
+        adj[dnp_mask] *= 0.55
+
+        lim_mask = prac.str.contains("LIMITED", regex=False).to_numpy()
+        adj[lim_mask] *= 0.85
+
+    return np.clip(adj, 0.0, 1.0)
 
 def _apply_availability_floor(features_df: pd.DataFrame, preds: np.ndarray) -> np.ndarray:
     """Apply minimum availability floor for active players with missing history."""
     adj = preds.copy()
-    
     if "snap_offense_pct_l3" in features_df.columns:
-         history = pd.to_numeric(features_df["snap_offense_pct_l3"], errors="coerce").fillna(0)
-         no_history_mask = (history == 0).to_numpy()
-         
-         # Determine active status
-         if "injury_is_inactive_designation" in features_df.columns:
-             inactive = pd.to_numeric(features_df["injury_is_inactive_designation"], errors="coerce").fillna(0).astype(bool).to_numpy()
-             active_mask = ~inactive
-         else:
-             active_mask = np.ones(len(adj), dtype=bool)
-             
-         # Apply floor to active players with no history
-         if "position" in features_df.columns:
-             is_qb = (features_df["position"] == "QB").to_numpy()
-             qb_floor_mask = no_history_mask & active_mask & is_qb
-             other_floor_mask = no_history_mask & active_mask & (~is_qb)
-             
-             adj[qb_floor_mask] = np.maximum(adj[qb_floor_mask], 0.9) # Starters usually play 100%
-             adj[other_floor_mask] = np.maximum(adj[other_floor_mask], 0.35)
-         else:
-             floor_mask = no_history_mask & active_mask
-             adj[floor_mask] = np.maximum(adj[floor_mask], 0.35)
-             
+        history = pd.to_numeric(
+            features_df["snap_offense_pct_l3"], errors="coerce"
+        ).fillna(0)
+        no_history_mask = (history == 0).to_numpy()
+
+        # Determine active status
+        if "injury_is_inactive_designation" in features_df.columns:
+            inactive = (
+                pd.to_numeric(
+                    features_df["injury_is_inactive_designation"], errors="coerce"
+                )
+                .fillna(0)
+                .astype(bool)
+                .to_numpy()
+            )
+            active_mask = ~inactive
+        else:
+            active_mask = np.ones(len(adj), dtype=bool)
+
+        # Apply floor to active players with no history
+        if "position" in features_df.columns:
+            is_qb = (features_df["position"] == "QB").to_numpy()
+            qb_floor_mask = no_history_mask & active_mask & is_qb
+            other_floor_mask = no_history_mask & active_mask & (~is_qb)
+
+            # Starters usually play close to 100%
+            adj[qb_floor_mask] = np.maximum(adj[qb_floor_mask], 0.9)
+            adj[other_floor_mask] = np.maximum(adj[other_floor_mask], 0.35)
+        else:
+            floor_mask = no_history_mask & active_mask
+            adj[floor_mask] = np.maximum(adj[floor_mask], 0.35)
+
     return adj
+
+def _apply_snaps_ceiling_cap(features_df: pd.DataFrame, preds: np.ndarray) -> np.ndarray:
+    """
+    Apply post-processing cap for snaps predictions.
+    
+    For low-usage players (max_snap_pct_l5 < 0.25), cap predictions at
+    snap_ceiling_l5 * 1.5 to prevent absurd overpredictions for specialists.
+    
+    This improves:
+    - Low snaps (1-15): MAE -3.21
+    - Zero snaps: MAE -2.00
+    - Fullbacks: MAE -1.15
+    While minimally affecting starters (+0.22 MAE).
+    """
+    adjusted = preds.copy()
+    
+    ceiling = None
+    max_snap_pct = None
+    
+    if "snap_ceiling_l5" in features_df.columns:
+        ceiling = pd.to_numeric(features_df["snap_ceiling_l5"], errors="coerce").to_numpy()
+    if "max_snap_pct_l5" in features_df.columns:
+        max_snap_pct = pd.to_numeric(features_df["max_snap_pct_l5"], errors="coerce").to_numpy()
+    
+    if ceiling is None or max_snap_pct is None:
+        return adjusted
+    
+    # Only cap low-usage players (max_snap_pct < 0.25)
+    threshold = 0.25
+    multiplier = 1.5
+    
+    should_cap = (~np.isnan(ceiling)) & (~np.isnan(max_snap_pct)) & (max_snap_pct < threshold)
+    cap_values = ceiling * multiplier
+    
+    # Apply cap where conditions are met and prediction exceeds cap
+    capped_mask = should_cap & (adjusted > cap_values)
+    adjusted[capped_mask] = cap_values[capped_mask]
+    
+    n_capped = capped_mask.sum()
+    if n_capped > 0:
+        logger.info(f"Snaps ceiling cap applied to {n_capped} predictions")
+    
+    return adjusted
+
+
+def _apply_usage_targets_position_cap(features_df: pd.DataFrame, preds: np.ndarray) -> np.ndarray:
+    """
+    Apply post-processing for usage_targets predictions.
+    
+    - QBs: Set target_share to 0 (99.2% have 0 targets in reality)
+    - FBs: Cap at 0.10 (max realistic is ~15%, most have 0)
+    
+    Analysis showed:
+    - QB predictions were ~11% when actual is ~0.03%
+    - FB predictions were overpredicted but some FBs (Juszczyk) do get targets
+    """
+    adjusted = preds.copy()
+    n_zeroed = 0
+    n_capped = 0
+    
+    # Zero out QBs
+    if "position" in features_df.columns:
+        is_qb = (features_df["position"] == "QB").to_numpy()
+        n_zeroed = is_qb.sum()
+        adjusted[is_qb] = 0.0
+    
+    # Cap FBs at 0.10
+    if "is_fullback" in features_df.columns:
+        is_fb = (features_df["is_fullback"] == 1).to_numpy()
+        fb_cap = 0.10
+        exceeds_cap = is_fb & (adjusted > fb_cap)
+        n_capped = exceeds_cap.sum()
+        adjusted[exceeds_cap] = fb_cap
+    
+    # Cap RBs based on historical target tier
+    # Analysis shows RBs are overpredicted by 73-386% depending on tier
+    if "position" in features_df.columns and "hist_target_share_l3" in features_df.columns:
+        is_rb = (features_df["position"] == "RB").to_numpy()
+        hist_ts = pd.to_numeric(features_df["hist_target_share_l3"], errors="coerce").fillna(0).to_numpy()
+        
+        # Cap RB predictions at historical target share + 50% buffer, minimum 0.03
+        rb_cap = np.maximum(hist_ts * 1.5, 0.03)
+        rb_exceeds = is_rb & (adjusted > rb_cap)
+        n_rb_capped = rb_exceeds.sum()
+        adjusted[rb_exceeds] = rb_cap[rb_exceeds]
+        
+        if n_rb_capped > 0:
+            logger.info(f"Usage targets: capped {n_rb_capped} RB predictions at hist_target_share × 1.5")
+    
+    if n_zeroed > 0 or n_capped > 0:
+        logger.info(f"Usage targets post-processing: zeroed {n_zeroed} QBs, capped {n_capped} FBs at 0.10")
+    
+    return adjusted
+
+
+def _apply_usage_carries_position_cap(features_df: pd.DataFrame, preds: np.ndarray) -> np.ndarray:
+    """
+    Apply post-processing for usage_carries predictions.
+    
+    Data analysis shows:
+    - WRs: 90.1% have 0 carries, mean 0.005 → Cap at 0.05
+    - TEs: 98.0% have 0 carries, mean 0.001 → Cap at 0.02
+    - QBs: 58.8% have 0 carries, mean 0.06, but rushing QBs can have 25%+ → Cap at 0.30
+    - FBs: 85.2% have 0 carries, mean 0.007 → Cap at 0.10
+    - RBs: Keep as-is (primary ball carriers)
+    """
+    adjusted = preds.copy()
+    n_capped = 0
+    
+    if "position" in features_df.columns:
+        position = features_df["position"].to_numpy()
+        
+        # Cap WRs at 0.05
+        is_wr = position == "WR"
+        wr_exceeds = is_wr & (adjusted > 0.05)
+        adjusted[wr_exceeds] = 0.05
+        n_capped += wr_exceeds.sum()
+        
+        # Cap TEs at 0.02
+        is_te = position == "TE"
+        te_exceeds = is_te & (adjusted > 0.02)
+        adjusted[te_exceeds] = 0.02
+        n_capped += te_exceeds.sum()
+        
+        # Cap QBs at 0.30 (rushing QBs like Lamar, Hurts can have ~25%)
+        is_qb = position == "QB"
+        qb_exceeds = is_qb & (adjusted > 0.30)
+        adjusted[qb_exceeds] = 0.30
+        n_capped += qb_exceeds.sum()
+    
+    # Cap FBs at 0.10
+    if "is_fullback" in features_df.columns:
+        is_fb = (features_df["is_fullback"] == 1).to_numpy()
+        fb_exceeds = is_fb & (adjusted > 0.10)
+        adjusted[fb_exceeds] = 0.10
+        n_capped += fb_exceeds.sum()
+    
+    if n_capped > 0:
+        logger.info(f"Usage carries post-processing: capped {n_capped} non-RB predictions")
+    
+    return adjusted
+
+
+def _apply_usage_target_yards_position_cap(features_df: pd.DataFrame, preds: np.ndarray) -> np.ndarray:
+    """
+    Apply post-processing for usage_target_yards predictions.
+    
+    Based on data analysis:
+    - RBs: Mean 0.0, median 0.0 - cap at 2.0 yards (most are screens/checkdowns)
+    - FBs: Rarely targeted, always short - set to 0
+    - QBs: Only 37 games with 43 total targets in entire dataset - set to 0
+    - TEs: No cap (range from -1 to 16)
+    - WRs: No cap (natural deep targets)
+    """
+    adjusted = preds.copy()
+    n_zeroed = 0
+    n_capped = 0
+    
+    if "position" in features_df.columns:
+        position = features_df["position"].to_numpy()
+        
+        # QBs: Set to 0 (extremely rare, trick plays only)
+        is_qb = position == "QB"
+        n_zeroed = is_qb.sum()
+        adjusted[is_qb] = 0.0
+        
+        # RBs: Cap between 0 and 2 yards (median is 0, most are screens/checkdowns)
+        is_rb = position == "RB"
+        adjusted[is_rb] = np.clip(adjusted[is_rb], 0.0, 2.0)
+        n_capped += (is_rb & (preds > 2.0)).sum()
+    
+    # FBs: Set to 0 (almost never targeted)
+    if "is_fullback" in features_df.columns:
+        is_fb = (features_df["is_fullback"] == 1).to_numpy()
+        adjusted[is_fb] = 0.0
+    
+    if n_zeroed > 0 or n_capped > 0:
+        logger.info(f"Usage target yards post-processing: zeroed {n_zeroed} QBs, capped {n_capped} RBs")
+    
+    return adjusted
+
+
+def _apply_efficiency_rec_yards_air_cap(features_df: pd.DataFrame, preds: np.ndarray) -> np.ndarray:
+    """
+    Apply post-processing for efficiency_rec_yards_air predictions.
+    
+    Based on data analysis:
+    - RBs: Mean -0.6 (checkdowns behind line) - cap at 0
+    - FBs: Also get short targets - cap at 0
+    - TEs/WRs: No cap
+    """
+    adjusted = preds.copy()
+    n_capped = 0
+    
+    if "position" in features_df.columns:
+        position = features_df["position"].to_numpy()
+        
+        # RBs: Cap at 0 (they get checkdowns, often behind line of scrimmage)
+        is_rb = position == "RB"
+        exceeds = is_rb & (adjusted > 0)
+        adjusted[exceeds] = 0.0
+        n_capped = exceeds.sum()
+    
+    # FBs: Also cap at 0
+    if "is_fullback" in features_df.columns:
+        is_fb = (features_df["is_fullback"] == 1).to_numpy()
+        adjusted[is_fb] = 0.0
+    
+    if n_capped > 0:
+        logger.info(f"Efficiency rec yards air post-processing: capped {n_capped} RBs at 0")
+    
+    return adjusted
+
+
+def _check_moe_available(problem_name: str) -> bool:
+    """Check if MoE (per-position) models are available for a problem."""
+    moe_artifacts_path = Path("output/models") / f"inference_artifacts_{problem_name}_moe.joblib"
+    return moe_artifacts_path.exists()
+
+
+def _predict_moe_for_problem(features: pd.DataFrame, problem_name: str) -> np.ndarray:
+    """Make predictions using per-position MoE models.
+    
+    Routes each row to the appropriate position-specific model.
+    """
+    moe_artifacts_path = Path("output/models") / f"inference_artifacts_{problem_name}_moe.joblib"
+    artifacts = joblib.load(moe_artifacts_path)
+    
+    feature_columns = artifacts["feature_columns"]
+    positions = artifacts["positions"]
+    fallback_pos = artifacts.get("fallback_position", "WR")
+    
+    # Load per-position models
+    models = {}
+    model_base = Path("output/models") / problem_name / "xgboost"
+    for pos in positions:
+        model_path = model_base / f"model.{pos}.joblib"
+        if model_path.exists():
+            models[pos] = joblib.load(model_path)
+            logger.info(f"Loaded MoE model: {problem_name}.{pos}")
+    
+    if not models:
+        raise ValueError(f"No MoE models found for {problem_name}")
+    
+    # Prepare features
+    available_cols = [c for c in feature_columns if c in features.columns]
+    X = features[available_cols].copy()
+    
+    # Convert non-numeric columns
+    for col in X.columns:
+        if X[col].dtype == 'object':
+            X[col] = pd.to_numeric(X[col], errors='coerce')
+        elif str(X[col].dtype) == 'category':
+            X[col] = X[col].cat.codes
+        elif 'datetime' in str(X[col].dtype).lower():
+            X = X.drop(columns=[col])
+    X = X.fillna(0)
+    
+    # Get position groups
+    if "position_group" in features.columns:
+        position_groups = features["position_group"]
+    elif "position" in features.columns:
+        # Normalize position to position_group
+        def normalize_pos(p):
+            p = str(p).upper()
+            if p in {"RB", "HB", "FB"}:
+                return "RB"
+            if p == "WR":
+                return "WR"
+            if p == "TE":
+                return "TE"
+            if p == "QB":
+                return "QB"
+            return "WR"
+        position_groups = features["position"].apply(normalize_pos)
+    else:
+        # Default all to fallback
+        position_groups = pd.Series([fallback_pos] * len(features))
+    
+    # Make predictions by position
+    preds = np.zeros(len(features), dtype=np.float64)
+    
+    for pos, model in models.items():
+        mask = (position_groups == pos).values
+        if mask.sum() == 0:
+            continue
+        
+        X_pos = X.loc[mask]
+        preds[mask] = model.predict(X_pos)
+        logger.info(f"MoE {problem_name}.{pos}: {mask.sum()} predictions")
+    
+    # Handle positions not in models (use fallback)
+    known_positions = set(models.keys())
+    fallback_mask = ~position_groups.isin(known_positions).values
+    if fallback_mask.sum() > 0 and fallback_pos in models:
+        X_fallback = X.loc[fallback_mask]
+        preds[fallback_mask] = models[fallback_pos].predict(X_fallback)
+        logger.info(f"MoE {problem_name}: {fallback_mask.sum()} using fallback ({fallback_pos})")
+    
+    return preds
+
 
 def _predict_for_problem(features: pd.DataFrame, problem_config: dict, artifacts: dict, threshold: float = 0.5) -> np.ndarray:
     """Load the trained model and return probability or point forecasts based on task metadata."""
@@ -2509,7 +2996,13 @@ def main() -> None:
                 logger.warning("Skipping %s (artifacts not found).", p_name)
                 continue
 
-            preds = _predict_for_problem(features, problem, artifacts)
+            # Check if MoE (per-position) models are available for this problem
+            use_moe = _check_moe_available(p_name)
+            if use_moe:
+                logger.info(f"Using MoE (per-position) models for {p_name}")
+                preds = _predict_moe_for_problem(features, p_name)
+            else:
+                preds = _predict_for_problem(features, problem, artifacts)
             
             # Apply guards for availability components immediately
             if p_name == "availability_active":
@@ -2523,6 +3016,21 @@ def main() -> None:
                 preds = np.clip(preds, 0.0, 1.0)
             elif p_name == "pre_snap_scripted_touches":
                 preds = np.clip(preds, 0.0, None)
+            elif p_name == "snaps":
+                # Apply ceiling cap for low-usage players
+                preds = _apply_snaps_ceiling_cap(features, preds)
+            elif p_name == "usage_targets":
+                # Zero out QBs (99.2% have 0 targets), cap FBs at 0.10
+                preds = _apply_usage_targets_position_cap(features, preds)
+            elif p_name == "usage_carries":
+                # Cap WRs at 0.05, TEs at 0.02, QBs at 0.30, FBs at 0.10
+                preds = _apply_usage_carries_position_cap(features, preds)
+            elif p_name == "usage_target_yards":
+                # QBs and FBs to 0, RBs capped at 2 yards
+                preds = _apply_usage_target_yards_position_cap(features, preds)
+            elif p_name == "efficiency_rec_yards_air":
+                # RBs get checkdowns (often negative air yards), cap at 0
+                preds = _apply_efficiency_rec_yards_air_cap(features, preds)
 
             features[pred_col] = preds
             
@@ -2532,10 +3040,17 @@ def main() -> None:
             print("------------------------")
             
             if p_name == "availability":
-                 print("--- Availability Feature Inputs (Head) ---")
-                 cols = ["player_name", "snap_offense_pct_prev", "snap_offense_pct_l3", "injury_is_listed", "depth_chart_order", "depth_chart_position"]
-                 print(features[[c for c in cols if c in features.columns]].head())
-                 print("------------------------------------------")
+                print("--- Availability Feature Inputs (Head) ---")
+                cols = [
+                    "player_name",
+                    "snap_offense_pct_prev",
+                    "snap_offense_pct_l3",
+                    "injury_is_listed",
+                    "depth_chart_order",
+                    "depth_chart_position",
+                ]
+                print(features[[c for c in cols if c in features.columns]].head())
+                print("------------------------------------------")
 
             if p_name == "efficiency_tds":
                 features = _inject_composed_features(features)
@@ -2547,6 +3062,8 @@ def main() -> None:
             # but the Usage models use it as input.
             
             # IMPORTANT: Inject composed features incrementally so next models can use them
+
+        # Ensure composed features are present after the full chain as well.
         features = _inject_composed_features(features)
 
         # Debug: composed features
@@ -2564,7 +3081,7 @@ def main() -> None:
                 final_prob_col = "pred_anytime_td_meta"
             else:
                 logger.error("Final prediction column %s not found in features.", final_prob_col)
-                return
+            return
 
         # Prepare final output dataframe
         # We need to re-score the final model to get "implied_decimal_odds" and "prediction" boolean

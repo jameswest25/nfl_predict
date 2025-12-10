@@ -326,41 +326,58 @@ def _append_offense_context_columns(
     if "game_date_offctx" in df.columns:
         rename_map["game_date_offctx"] = "off_ctx_game_date"
     df = df.rename(rename_map)
+    if "off_ctx_game_date" in df.columns:
+        df = df.with_columns(pl.col("off_ctx_game_date").cast(pl.Datetime("ms")))
 
     df = df.sort(["team", "player_id", "game_date"])
     if "off_ctx_data_as_of" in df.columns:
         df = df.with_columns(pl.col("off_ctx_data_as_of").cast(pl.Datetime("ms")))
     
-    player_prev_red_zone = (
-        pl.col("red_zone_target")
-        .fill_null(0.0)
-        .cast(pl.Float32)
-        .shift(1)
-        .over(["team", "player_id"])
-    )
-    player_l3_red_zone = (
-        pl.col("red_zone_target")
-        .fill_null(0.0)
-        .cast(pl.Float32)
-        .rolling_mean(window_size=3, min_periods=1)
-        .shift(1)
-        .over(["team", "player_id"])
-    )
-    player_prev_goal = (
-        pl.col("goal_to_go_carry")
-        .fill_null(0.0)
-        .cast(pl.Float32)
-        .shift(1)
-        .over(["team", "player_id"])
-    )
-    player_l3_goal = (
-        pl.col("goal_to_go_carry")
-        .fill_null(0.0)
-        .cast(pl.Float32)
-        .rolling_mean(window_size=3, min_periods=1)
-        .shift(1)
-        .over(["team", "player_id"])
-    )
+    if "1g_red_zone_target_per_game" in df.columns:
+        player_prev_red_zone = pl.col("1g_red_zone_target_per_game")
+    else:
+        player_prev_red_zone = (
+            pl.col("red_zone_target")
+            .fill_null(0.0)
+            .cast(pl.Float32)
+            .shift(1)
+            .over(["team", "player_id"])
+        )
+
+    if "3g_red_zone_target_per_game" in df.columns:
+        player_l3_red_zone = pl.col("3g_red_zone_target_per_game")
+    else:
+        player_l3_red_zone = (
+            pl.col("red_zone_target")
+            .fill_null(0.0)
+            .cast(pl.Float32)
+            .rolling_mean(window_size=3, min_periods=1)
+            .shift(1)
+            .over(["team", "player_id"])
+        )
+
+    if "1g_goal_to_go_carry_per_game" in df.columns:
+        player_prev_goal = pl.col("1g_goal_to_go_carry_per_game")
+    else:
+        player_prev_goal = (
+            pl.col("goal_to_go_carry")
+            .fill_null(0.0)
+            .cast(pl.Float32)
+            .shift(1)
+            .over(["team", "player_id"])
+        )
+
+    if "3g_goal_to_go_carry_per_game" in df.columns:
+        player_l3_goal = pl.col("3g_goal_to_go_carry_per_game")
+    else:
+        player_l3_goal = (
+            pl.col("goal_to_go_carry")
+            .fill_null(0.0)
+            .cast(pl.Float32)
+            .rolling_mean(window_size=3, min_periods=1)
+            .shift(1)
+            .over(["team", "player_id"])
+        )
     
     share_exprs: list[pl.Expr] = []
     if "off_ctx_team_red_zone_targets_prev" in df.columns:
@@ -435,7 +452,7 @@ def _append_offense_context_columns(
     ]
     df = df.with_columns(
         [
-            pl.col(col).fill_null(0.0).cast(pl.Float32)
+            pl.col(col).cast(pl.Float32)
             for col in context_columns
             if col in df.columns
         ]
@@ -491,15 +508,8 @@ def add_offense_context_features_inference(
         logger.warning("Offense context history missing at %s; skipping join.", history_path)
         return df
     history = pl.read_parquet(str(history_path))
-    history = history.sort(["team", "game_date"])
-    if "data_as_of" in history.columns:
-        history = history.with_columns(pl.col("data_as_of").cast(pl.Datetime("ms")))
 
-    join_columns = [
-        "team",
-        "game_date",
-        "offensive_coordinator",
-        "primary_qb_id",
+    context_cols = [
         "off_ctx_team_red_zone_targets_prev",
         "off_ctx_team_goal_to_go_carries_prev",
         "off_ctx_team_touchdowns_prev",
@@ -513,44 +523,59 @@ def add_offense_context_features_inference(
         "off_ctx_qb_goal_to_go_carries_l3",
         "off_ctx_qb_touchdowns_l3",
     ]
-    join_columns = [col for col in join_columns if col in history.columns]
-    target_ts_col = cutoff_column if cutoff_column and cutoff_column in df.columns else "game_date"
-    history_join = history.select(join_columns + ["data_as_of"]).rename({"data_as_of": "__off_ctx_data_as_of"})
 
-    if "game_date" in df.columns and df["game_date"].dtype != history["game_date"].dtype:
-        history_join = history_join.with_columns(pl.col("game_date").cast(df["game_date"].dtype))
+    # Training-style join: by (season, week, team) when no explicit cutoff
+    # is provided, to mirror add_offense_context_features_training and
+    # guarantee train/predict parity.
+    if cutoff_column is None:
+        required_keys = {"season", "week", "team"}
+        if not required_keys.issubset(df.columns) or not required_keys.issubset(history.columns):
+            return df
 
-    joined = df.with_columns(
-        pl.col(target_ts_col).cast(pl.Datetime("ms")).alias("__off_ctx_target_ts")
-        if target_ts_col in df.columns
-        else pl.col("game_date").cast(pl.Datetime("ms")).alias("__off_ctx_target_ts")
-    ).join_asof(
-        history_join,
-        left_on="__off_ctx_target_ts",
-        right_on="__off_ctx_data_as_of",
-        by="team",
-        strategy="backward",
-        suffix="_offctx",
-    ).rename({"__off_ctx_data_as_of": "off_ctx_data_as_of"}).drop("__off_ctx_target_ts")
+        join_cols = ["season", "week", "team", "game_date"] + [c for c in context_cols if c in history.columns]
+        hist_join = history.select([c for c in join_cols if c in history.columns])
+        if "game_date" in hist_join.columns:
+            hist_join = hist_join.rename({"game_date": "off_ctx_game_date"})
 
-    context_columns = [
-        "off_ctx_team_red_zone_targets_prev",
-        "off_ctx_team_goal_to_go_carries_prev",
-        "off_ctx_team_touchdowns_prev",
-        "off_ctx_team_red_zone_targets_l3",
-        "off_ctx_team_goal_to_go_carries_l3",
-        "off_ctx_team_touchdowns_l3",
-        "off_ctx_coord_red_zone_targets_l3",
-        "off_ctx_coord_goal_to_go_carries_l3",
-        "off_ctx_coord_touchdowns_l3",
-        "off_ctx_qb_red_zone_targets_l3",
-        "off_ctx_qb_goal_to_go_carries_l3",
-        "off_ctx_qb_touchdowns_l3",
-    ]
+        joined = df.join(hist_join, on=["season", "week", "team"], how="left")
+    else:
+        # Default inference behavior: as-of join on data_as_of vs cutoff/game_date.
+        history = history.sort(["team", "game_date"])
+        if "data_as_of" in history.columns:
+            history = history.with_columns(pl.col("data_as_of").cast(pl.Datetime("ms")))
+
+        join_columns = [
+            "team",
+            "game_date",
+            "offensive_coordinator",
+            "primary_qb_id",
+            *context_cols,
+        ]
+        join_columns = [col for col in join_columns if col in history.columns]
+        target_ts_col = cutoff_column if cutoff_column and cutoff_column in df.columns else "game_date"
+        history_join = history.select(join_columns + ["data_as_of"]).rename({"data_as_of": "__off_ctx_data_as_of"})
+
+        if "game_date" in df.columns and df["game_date"].dtype != history["game_date"].dtype:
+            history_join = history_join.with_columns(pl.col("game_date").cast(df["game_date"].dtype))
+
+        joined = df.with_columns(
+            pl.col(target_ts_col).cast(pl.Datetime("ms")).alias("__off_ctx_target_ts")
+            if target_ts_col in df.columns
+            else pl.col("game_date").cast(pl.Datetime("ms")).alias("__off_ctx_target_ts")
+        ).join_asof(
+            history_join,
+            left_on="__off_ctx_target_ts",
+            right_on="__off_ctx_data_as_of",
+            by="team",
+            strategy="backward",
+            suffix="_offctx",
+        ).rename({"__off_ctx_data_as_of": "off_ctx_data_as_of"}).drop("__off_ctx_target_ts")
+
+    context_columns = [col for col in context_cols if col in joined.columns]
 
     joined = joined.with_columns(
         [
-            pl.col(col).fill_null(0.0).cast(pl.Float32)
+            pl.col(col).cast(pl.Float32)
             for col in context_columns
             if col in joined.columns
         ]
@@ -570,7 +595,6 @@ def add_offense_context_features_inference(
                     "off_ctx_data_as_of >= cutoff detected for %d rows; earlier filtering enforced.",
                     potential,
                 )
-    
     share_exprs: list[pl.Expr] = []
     if {
         "1g_red_zone_target_per_game",

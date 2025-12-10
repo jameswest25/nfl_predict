@@ -67,7 +67,7 @@ def main():
     
     # Get date range from config
     pipeline_cfg = config.get('pipeline', {})
-    start_date_str = pipeline_cfg.get('start_date', '2024-09-05')
+    start_date_str = pipeline_cfg.get('start_date', '2021-09-09')
     end_date_str = pipeline_cfg.get('end_date')
     
     start_date = date.fromisoformat(start_date_str)
@@ -144,6 +144,9 @@ if __name__ == "__main__":
     pipeline_cfg = config.get('pipeline', {})
     default_start = pipeline_cfg.get('start_date', '2024-09-05')
     
+    # Check for flags
+    recompute_flag = '-recompute' in sys.argv
+    
     # Individual step execution
     steps = {
         "collect": lambda: collect_nfl_data(
@@ -163,6 +166,7 @@ if __name__ == "__main__":
         "feature": lambda: build_feature_matrix(
             start_date=date.fromisoformat(default_start),
             end_date=date.today(),
+            recompute_intermediate=recompute_flag,
             build_rolling=True,
         ),
         "train": train,
@@ -173,7 +177,8 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         step_arg = sys.argv[1].lower()
         if step_arg in steps:
-            logger.info(f"Executing pipeline step: {step_arg}")
+            flag_msg = " (with -recompute)" if recompute_flag and step_arg == "feature" else ""
+            logger.info(f"Executing pipeline step: {step_arg}{flag_msg}")
             steps[step_arg]()
             logger.info(f"✅ Step '{step_arg}' completed.")
         else:

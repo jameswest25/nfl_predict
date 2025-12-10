@@ -324,6 +324,7 @@ class RollingWindow:
                     feature_names_by_ctx[ctx].append(feature_name)
         
         context_frames: dict[str, pl.LazyFrame | None] = {}
+        ctx_support: dict[str, pl.DataFrame] = {}
         int_windows = [w for w in windows if isinstance(w, int)]
         use_season = "season" in windows
         use_lifetime = "lifetime" in windows
@@ -340,6 +341,7 @@ class RollingWindow:
             ctx_df = unified_df.filter(pl.col("ctx") == ctx)
             if ctx_df.is_empty():
                 context_frames[ctx] = None
+                ctx_support[ctx] = pl.DataFrame()
                 continue
             
             feature_frames: list[pl.DataFrame] = []
@@ -450,6 +452,17 @@ class RollingWindow:
                 context_frames[ctx] = feat_ctx_df.lazy()
             else:
                 context_frames[ctx] = None
+
+            # Compute simple support metric for vs_team: total historical denom per (player, opponent)
+            if ctx == "vs_team":
+                try:
+                    sup_df = (
+                        ctx_df.groupby(["player_id", "opponent"], maintain_order=True)
+                        .agg(pl.col("denom").sum().alias("vs_team_support"))
+                    )
+                    ctx_support[ctx] = sup_df
+                except Exception:
+                    ctx_support[ctx] = pl.DataFrame()
         
         feat_vs_any = context_frames.get("vs_any")
         feat_vs_team = context_frames.get("vs_team")
@@ -471,7 +484,7 @@ class RollingWindow:
                 by=["player_id"],
             )
         
-        # Join vs_team
+        # Join vs_team with simple density gating.
         if "vs_team" in contexts and feat_vs_team is not None:
             out_joined = (
                 out_joined.join_asof(
@@ -482,6 +495,39 @@ class RollingWindow:
                 )
                 .select(pl.exclude(r"^.*_right$"))
             )
+            # Apply gating: zero out vs_team features for sparse player-opponent pairs.
+            sup_df = ctx_support.get("vs_team")
+            if sup_df is not None and not sup_df.is_empty():
+                # Threshold on total historical denom; small threshold to avoid overfitting on 1-game samples.
+                threshold = 4.0
+                gate = (
+                    sup_df.with_columns(
+                        (pl.col("vs_team_support").cast(pl.Float32) >= threshold)
+                        .cast(pl.Int8)
+                        .alias("_vs_team_dense")
+                    )
+                    .select(["player_id", "opponent", "_vs_team_dense"])
+                )
+                out_joined = out_joined.join(
+                    gate, on=["player_id", "opponent"], how="left"
+                ).with_columns(
+                    pl.col("_vs_team_dense").fill_null(0).cast(pl.Int8)
+                )
+                vs_team_feats = [
+                    c for c in out_joined.columns if c.endswith("_vs_team")
+                ]
+                if vs_team_feats:
+                    out_joined = out_joined.with_columns(
+                        [
+                            pl.when(pl.col("_vs_team_dense") == 1)
+                            .then(pl.col(col))
+                            .otherwise(0.0)
+                            .cast(pl.Float32)
+                            .alias(col)
+                            for col in vs_team_feats
+                        ]
+                    )
+                out_joined = out_joined.drop("_vs_team_dense")
 
         # Join with_team
         if "with_team" in contexts and feat_with_team is not None:

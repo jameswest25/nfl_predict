@@ -24,6 +24,7 @@ NFL_TARGET_SCHEMA = {
     "anytime_td": pl.Int8,  # Primary MVP target: did player score a TD?
     "anytime_td_offense": pl.Int8,
     "anytime_td_all": pl.Int8,
+    "anytime_td_skill": pl.Int8,
     "anytime_td_rush": pl.Int8,
     "anytime_td_rec": pl.Int8,
     "anytime_td_pass_thrown": pl.Int8,
@@ -32,7 +33,28 @@ NFL_TARGET_SCHEMA = {
     "td_count": pl.Int64,  # Number of TDs scored (receiving + rushing)
     "td_count_offense": pl.Int64,
     "td_count_all": pl.Int64,
+    "td_count_skill": pl.Int64,
+    # Usage-share regression targets (per-team shares; used for usage models)
+    "target_share_label": pl.Float32,
+    "carry_share_label": pl.Float32,
+    # Scripted TD specificity (did a TD occur on a scripted touch?)
+    "pre_snap_scripted_td": pl.Int8,
     "passing_td": pl.Int64,  # Number of passing TDs (QB only)
+    # Snaps regression label
+    "snaps_label": pl.Float32,
+    # Usage-success labels
+    "rec_success_rate_label": pl.Float32,
+    "rush_success_rate_label": pl.Float32,
+    "yards_per_target_label": pl.Float32,
+    "yards_per_catch_label": pl.Float32,
+    "air_yards_per_catch_label": pl.Float32,
+    "yac_per_catch_label": pl.Float32,
+    "air_yards_per_target_label": pl.Float32,
+    "yards_per_carry_label": pl.Float32,
+    "td_per_target_label": pl.Float32,
+    "td_per_carry_label": pl.Float32,
+    "td_per_rz_carry_label": pl.Float32,
+    "td_per_gl_carry_label": pl.Float32,
     
     # Yardage regression targets
     "receiving_yards": pl.Float64,

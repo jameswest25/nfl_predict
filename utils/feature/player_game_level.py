@@ -511,6 +511,8 @@ def _compute_pre_snap_usage(df: pl.DataFrame) -> pl.DataFrame:
                 "team",
                 pl.col("receiver_player_id").cast(pl.Utf8).alias("player_id"),
                 "is_scripted_play",
+                pl.lit(1).cast(pl.Int8).alias("is_target_touch"),
+                pl.lit(0).cast(pl.Int8).alias("is_carry_touch"),
             ]
         )
     )
@@ -525,6 +527,8 @@ def _compute_pre_snap_usage(df: pl.DataFrame) -> pl.DataFrame:
                 "team",
                 pl.col("rusher_player_id").cast(pl.Utf8).alias("player_id"),
                 "is_scripted_play",
+                pl.lit(0).cast(pl.Int8).alias("is_target_touch"),
+                pl.lit(1).cast(pl.Int8).alias("is_carry_touch"),
             ]
         )
     )
@@ -540,14 +544,37 @@ def _compute_pre_snap_usage(df: pl.DataFrame) -> pl.DataFrame:
                 pl.col("is_scripted_play").sum().cast(pl.Float32).alias(
                     "ps_scripted_touches"
                 ),
+                # Decompose scripted touches into target/carry components.
+                (
+                    (pl.col("is_scripted_play") * pl.col("is_target_touch"))
+                    .sum()
+                    .cast(pl.Float32)
+                ).alias("ps_scripted_target_touches"),
+                (
+                    (pl.col("is_scripted_play") * pl.col("is_carry_touch"))
+                    .sum()
+                    .cast(pl.Float32)
+                ).alias("ps_scripted_carry_touches"),
             ]
         )
         scripted_stats = scripted_stats.with_columns(
-            pl.when(pl.col("ps_total_touches") > 0)
-            .then(pl.col("ps_scripted_touches") / pl.col("ps_total_touches"))
-            .otherwise(0.0)
-            .cast(pl.Float32)
-            .alias("ps_scripted_touch_share")
+            [
+                pl.when(pl.col("ps_total_touches") > 0)
+                .then(pl.col("ps_scripted_touches") / pl.col("ps_total_touches"))
+                .otherwise(0.0)
+                .cast(pl.Float32)
+                .alias("ps_scripted_touch_share"),
+                pl.when(pl.col("ps_total_touches") > 0)
+                .then(pl.col("ps_scripted_target_touches") / pl.col("ps_total_touches"))
+                .otherwise(0.0)
+                .cast(pl.Float32)
+                .alias("ps_scripted_target_share"),
+                pl.when(pl.col("ps_total_touches") > 0)
+                .then(pl.col("ps_scripted_carry_touches") / pl.col("ps_total_touches"))
+                .otherwise(0.0)
+                .cast(pl.Float32)
+                .alias("ps_scripted_carry_share"),
+            ]
         )
     else:
         scripted_stats = pl.DataFrame()
@@ -911,6 +938,9 @@ def _append_zero_usage_players(
         pl.lit(0.0).cast(pl.Float64).alias("passing_yards"),
         pl.lit(0.0).cast(pl.Float64).alias("rushing_yards"),
         pl.lit(0.0).cast(pl.Float64).alias("receiving_yards"),
+        pl.lit(0.0).cast(pl.Float64).alias("air_yards_total"),
+        pl.lit(0.0).cast(pl.Float64).alias("air_yards_all_targets"),
+        pl.lit(0.0).cast(pl.Float64).alias("yards_after_catch_total"),
         pl.lit(0).cast(pl.Int64).alias("pass_attempt"),
         pl.lit(0).cast(pl.Int64).alias("completion"),
         pl.lit(0).cast(pl.Int64).alias("carry"),
@@ -1003,6 +1033,12 @@ def _append_zero_usage_players(
             .alias("was_inactive_last_game")
         )
 
+    # ------------------------------------------------------------------
+    # Role flags (red-zone / goal-line) derived from historical shares
+    # ------------------------------------------------------------------
+    combined = _append_role_flags(combined)
+    combined = _append_moe_position_features(combined)
+
     return combined
 
 
@@ -1065,6 +1101,249 @@ def _append_role_flags(df: pl.DataFrame, quantile: float = 0.7) -> pl.DataFrame:
         )
         df = df.drop(threshold_col, strict=False)
 
+    return df
+
+
+def _append_moe_position_features(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Add position-specific features optimized for Mixture of Experts (MoE) modeling.
+    
+    These features help MoE models by providing explicit position-role signals:
+    - QB: is_likely_starter - binary indicator for starting QB
+    - RB: rb_workload_tier - binned usage tier (0-3)
+    - WR: wr_depth_tier - binned snap % tier (0-3 for WR4+/WR3/WR2/WR1)
+    - TE: te_is_receiving_te - binary indicator for receiving-focused TE
+    """
+    new_cols = []
+    
+    # QB Feature: is_likely_starter (snap_pct_prev > 0.8)
+    if "snap_offense_pct_prev" in df.columns and "position" in df.columns:
+        new_cols.append(
+            pl.when(pl.col("position").str.to_uppercase() == "QB")
+            .then(
+                (pl.col("snap_offense_pct_prev").fill_null(0.0) > 0.8).cast(pl.Int8)
+            )
+            .otherwise(pl.lit(None).cast(pl.Int8))
+            .alias("qb_is_likely_starter")
+        )
+        logger.info("Added qb_is_likely_starter feature for MoE QB model.")
+    
+    # RB Feature: rb_workload_tier (binned combined usage share)
+    if "combined_usage_share_l3" in df.columns and "position" in df.columns:
+        # Tier 0: <10%, Tier 1: 10-25%, Tier 2: 25-40%, Tier 3: >40%
+        new_cols.append(
+            pl.when(pl.col("position").str.to_uppercase().is_in(["RB", "HB", "FB"]))
+            .then(
+                pl.when(pl.col("combined_usage_share_l3").fill_null(0.0) > 0.4)
+                .then(pl.lit(3))
+                .when(pl.col("combined_usage_share_l3").fill_null(0.0) > 0.25)
+                .then(pl.lit(2))
+                .when(pl.col("combined_usage_share_l3").fill_null(0.0) > 0.10)
+                .then(pl.lit(1))
+                .otherwise(pl.lit(0))
+                .cast(pl.Int8)
+            )
+            .otherwise(pl.lit(None).cast(pl.Int8))
+            .alias("rb_workload_tier")
+        )
+        logger.info("Added rb_workload_tier feature for MoE RB model.")
+    
+    # RB Feature: rb_is_receiving_back (target share > carry share)
+    if "hist_target_share_l3" in df.columns and "hist_carry_share_l3" in df.columns and "position" in df.columns:
+        new_cols.append(
+            pl.when(pl.col("position").str.to_uppercase().is_in(["RB", "HB", "FB"]))
+            .then(
+                (pl.col("hist_target_share_l3").fill_null(0.0) > 
+                 pl.col("hist_carry_share_l3").fill_null(0.0)).cast(pl.Int8)
+            )
+            .otherwise(pl.lit(None).cast(pl.Int8))
+            .alias("rb_is_receiving_back")
+        )
+        logger.info("Added rb_is_receiving_back feature for MoE RB model.")
+    
+    # WR Feature: wr_depth_tier (binned snap_offense_pct_prev)
+    # Tier 0: <40% (WR4+), Tier 1: 40-70% (WR3), Tier 2: 70-85% (WR2), Tier 3: >85% (WR1)
+    if "snap_offense_pct_prev" in df.columns and "position" in df.columns:
+        new_cols.append(
+            pl.when(pl.col("position").str.to_uppercase() == "WR")
+            .then(
+                pl.when(pl.col("snap_offense_pct_prev").fill_null(0.0) > 0.85)
+                .then(pl.lit(3))
+                .when(pl.col("snap_offense_pct_prev").fill_null(0.0) > 0.70)
+                .then(pl.lit(2))
+                .when(pl.col("snap_offense_pct_prev").fill_null(0.0) > 0.40)
+                .then(pl.lit(1))
+                .otherwise(pl.lit(0))
+                .cast(pl.Int8)
+            )
+            .otherwise(pl.lit(None).cast(pl.Int8))
+            .alias("wr_depth_tier")
+        )
+        logger.info("Added wr_depth_tier feature for MoE WR model.")
+    
+    # WR Feature: wr_is_slot_receiver
+    if "ps_targets_slot_share_l3" in df.columns and "position" in df.columns:
+        new_cols.append(
+            pl.when(pl.col("position").str.to_uppercase() == "WR")
+            .then(
+                (pl.col("ps_targets_slot_share_l3").fill_null(0.0) > 0.4).cast(pl.Int8)
+            )
+            .otherwise(pl.lit(None).cast(pl.Int8))
+            .alias("wr_is_slot_receiver")
+        )
+        logger.info("Added wr_is_slot_receiver feature for MoE WR model.")
+    
+    # TE Feature: te_is_receiving_te (target share > 10%)
+    if "hist_target_share_l3" in df.columns and "position" in df.columns:
+        new_cols.append(
+            pl.when(pl.col("position").str.to_uppercase() == "TE")
+            .then(
+                (pl.col("hist_target_share_l3").fill_null(0.0) > 0.10).cast(pl.Int8)
+            )
+            .otherwise(pl.lit(None).cast(pl.Int8))
+            .alias("te_is_receiving_te")
+        )
+        logger.info("Added te_is_receiving_te feature for MoE TE model.")
+    
+    # TE Feature: te_target_concentration (target share / snap share)
+    if "hist_target_share_l3" in df.columns and "snap_offense_pct_l3" in df.columns and "position" in df.columns:
+        new_cols.append(
+            pl.when(pl.col("position").str.to_uppercase() == "TE")
+            .then(
+                pl.col("hist_target_share_l3").fill_null(0.0) / 
+                (pl.col("snap_offense_pct_l3").fill_null(0.01) + 0.01)
+            )
+            .otherwise(pl.lit(None).cast(pl.Float32))
+            .alias("te_target_concentration")
+        )
+        logger.info("Added te_target_concentration feature for MoE TE model.")
+    
+    # =========================================================================
+    # Additional RB Features (High-Impact for MoE)
+    # =========================================================================
+    
+    # RB Feature: rb_is_lead_back (carry share > 40%) - 0.536 correlation with snaps!
+    if "hist_carry_share_l3" in df.columns and "position" in df.columns:
+        new_cols.append(
+            pl.when(pl.col("position").str.to_uppercase().is_in(["RB", "HB", "FB"]))
+            .then(
+                (pl.col("hist_carry_share_l3").fill_null(0.0) > 0.40).cast(pl.Int8)
+            )
+            .otherwise(pl.lit(None).cast(pl.Int8))
+            .alias("rb_is_lead_back")
+        )
+        logger.info("Added rb_is_lead_back feature for MoE RB model.")
+    
+    # RB Feature: rb_is_committee_back (carry share 15-40%)
+    if "hist_carry_share_l3" in df.columns and "position" in df.columns:
+        new_cols.append(
+            pl.when(pl.col("position").str.to_uppercase().is_in(["RB", "HB", "FB"]))
+            .then(
+                ((pl.col("hist_carry_share_l3").fill_null(0.0) >= 0.15) & 
+                 (pl.col("hist_carry_share_l3").fill_null(0.0) <= 0.40)).cast(pl.Int8)
+            )
+            .otherwise(pl.lit(None).cast(pl.Int8))
+            .alias("rb_is_committee_back")
+        )
+        logger.info("Added rb_is_committee_back feature for MoE RB model.")
+    
+    # RB Feature: rb_snap_tier (binned snap percentage for RBs)
+    # Tier 0: <20%, Tier 1: 20-40%, Tier 2: 40-60%, Tier 3: >60%
+    if "snap_offense_pct_prev" in df.columns and "position" in df.columns:
+        new_cols.append(
+            pl.when(pl.col("position").str.to_uppercase().is_in(["RB", "HB", "FB"]))
+            .then(
+                pl.when(pl.col("snap_offense_pct_prev").fill_null(0.0) > 0.60)
+                .then(pl.lit(3))
+                .when(pl.col("snap_offense_pct_prev").fill_null(0.0) > 0.40)
+                .then(pl.lit(2))
+                .when(pl.col("snap_offense_pct_prev").fill_null(0.0) > 0.20)
+                .then(pl.lit(1))
+                .otherwise(pl.lit(0))
+                .cast(pl.Int8)
+            )
+            .otherwise(pl.lit(None).cast(pl.Int8))
+            .alias("rb_snap_tier")
+        )
+        logger.info("Added rb_snap_tier feature for MoE RB model.")
+    
+    # RB Feature: rb_goal_line_indicator (goal line carry share > 20%)
+    if "hist_goal_to_go_carry_share_l3" in df.columns and "position" in df.columns:
+        new_cols.append(
+            pl.when(pl.col("position").str.to_uppercase().is_in(["RB", "HB", "FB"]))
+            .then(
+                (pl.col("hist_goal_to_go_carry_share_l3").fill_null(0.0) > 0.20).cast(pl.Int8)
+            )
+            .otherwise(pl.lit(None).cast(pl.Int8))
+            .alias("rb_is_goal_line_rb")
+        )
+        logger.info("Added rb_is_goal_line_rb feature for MoE RB model.")
+    
+    # =========================================================================
+    # Additional TE Features (High-Impact for MoE)
+    # =========================================================================
+    
+    # TE Feature: te_is_te1 (snap_pct > 65%) - 0.554 correlation with snaps!
+    if "snap_offense_pct_l3" in df.columns and "position" in df.columns:
+        new_cols.append(
+            pl.when(pl.col("position").str.to_uppercase() == "TE")
+            .then(
+                (pl.col("snap_offense_pct_l3").fill_null(0.0) > 0.65).cast(pl.Int8)
+            )
+            .otherwise(pl.lit(None).cast(pl.Int8))
+            .alias("te_is_te1")
+        )
+        logger.info("Added te_is_te1 feature for MoE TE model.")
+    
+    # TE Feature: te_is_blocking_te (high snap, low target)
+    if "snap_offense_pct_l3" in df.columns and "hist_target_share_l3" in df.columns and "position" in df.columns:
+        new_cols.append(
+            pl.when(pl.col("position").str.to_uppercase() == "TE")
+            .then(
+                ((pl.col("snap_offense_pct_l3").fill_null(0.0) > 0.40) & 
+                 (pl.col("hist_target_share_l3").fill_null(0.0) < 0.08)).cast(pl.Int8)
+            )
+            .otherwise(pl.lit(None).cast(pl.Int8))
+            .alias("te_is_blocking_te")
+        )
+        logger.info("Added te_is_blocking_te feature for MoE TE model.")
+    
+    # TE Feature: te_snap_tier (binned snap percentage for TEs)
+    # Tier 0: <30%, Tier 1: 30-50%, Tier 2: 50-70%, Tier 3: >70%
+    if "snap_offense_pct_prev" in df.columns and "position" in df.columns:
+        new_cols.append(
+            pl.when(pl.col("position").str.to_uppercase() == "TE")
+            .then(
+                pl.when(pl.col("snap_offense_pct_prev").fill_null(0.0) > 0.70)
+                .then(pl.lit(3))
+                .when(pl.col("snap_offense_pct_prev").fill_null(0.0) > 0.50)
+                .then(pl.lit(2))
+                .when(pl.col("snap_offense_pct_prev").fill_null(0.0) > 0.30)
+                .then(pl.lit(1))
+                .otherwise(pl.lit(0))
+                .cast(pl.Int8)
+            )
+            .otherwise(pl.lit(None).cast(pl.Int8))
+            .alias("te_snap_tier")
+        )
+        logger.info("Added te_snap_tier feature for MoE TE model.")
+    
+    # TE Feature: te_route_participation (from pre-snap data)
+    if "ps_game_route_participation_pct" in df.columns and "position" in df.columns:
+        new_cols.append(
+            pl.when(pl.col("position").str.to_uppercase() == "TE")
+            .then(
+                pl.col("ps_game_route_participation_pct").fill_null(0.0).cast(pl.Float32)
+            )
+            .otherwise(pl.lit(None).cast(pl.Float32))
+            .alias("te_route_participation")
+        )
+        logger.info("Added te_route_participation feature for MoE TE model.")
+    
+    if new_cols:
+        df = df.with_columns(new_cols)
+        logger.info(f"Added {len(new_cols)} MoE position-specific features.")
+    
     return df
 
 
@@ -1171,6 +1450,118 @@ def _load_roster_snapshots_for_years(years: list[int]) -> pl.DataFrame:
         return pl.DataFrame()
 
     return pl.concat(frames, how="diagonal_relaxed").filter(pl.col("player_id").is_not_null())
+
+
+# Cache for nflverse depth charts
+_DEPTH_CHART_CACHE: dict[int, pl.DataFrame] = {}
+
+
+def _load_nflverse_depth_charts(years: list[int]) -> pl.DataFrame:
+    """Load official NFL depth chart data from nflverse via nfl_data_py.
+    
+    Returns a DataFrame with columns:
+        - season, week, team, player_id, position, depth_chart_order, formation
+    """
+    from nfl_data_py import import_depth_charts
+    
+    frames: list[pl.DataFrame] = []
+    for year in sorted(set(years)):
+        if year in _DEPTH_CHART_CACHE:
+            frames.append(_DEPTH_CHART_CACHE[year])
+            continue
+        
+        try:
+            dc_pd = import_depth_charts([year])
+            if dc_pd.empty:
+                logger.warning("No depth chart data available for %s", year)
+                continue
+            
+            # Filter to offensive skill positions only
+            dc_pd = dc_pd[dc_pd['formation'] == 'Offense']
+            dc_pd = dc_pd[dc_pd['position'].isin(['QB', 'RB', 'WR', 'TE', 'FB'])]
+            
+            # Rename and select relevant columns
+            dc_pd = dc_pd.rename(columns={
+                'club_code': 'team',
+                'gsis_id': 'player_id',
+                'depth_team': 'depth_chart_order',
+            })
+            
+            dc_pl = pl.from_pandas(dc_pd[['season', 'week', 'team', 'player_id', 'position', 'depth_chart_order']])
+            dc_pl = dc_pl.with_columns([
+                pl.col('season').cast(pl.Int32),
+                pl.col('week').cast(pl.Int32),
+                pl.col('team').str.strip_chars().str.to_uppercase(),
+                pl.col('player_id').cast(pl.Utf8),
+                pl.col('position').cast(pl.Utf8),
+                pl.col('depth_chart_order').cast(pl.Int16),
+            ])
+            
+            _DEPTH_CHART_CACHE[year] = dc_pl
+            frames.append(dc_pl)
+            logger.info("Loaded %d depth chart entries for season %s", dc_pl.height, year)
+            
+        except Exception as exc:
+            logger.warning("Failed to load depth charts for %s: %s", year, exc)
+            continue
+    
+    if not frames:
+        return pl.DataFrame()
+    
+    return pl.concat(frames, how="diagonal_relaxed")
+
+
+def _join_nflverse_depth_charts(df: pl.DataFrame) -> pl.DataFrame:
+    """Join official nflverse depth chart data to the player-game DataFrame.
+    
+    This populates depth_chart_order with real depth chart rankings from NFL data.
+    """
+    required_cols = {"season", "week", "team", "player_id"}
+    if not required_cols.issubset(set(df.columns)):
+        logger.warning("Missing columns for depth chart join: %s", required_cols - set(df.columns))
+        return df
+    
+    seasons = df.get_column("season").unique().to_list()
+    seasons = [int(s) for s in seasons if s is not None]
+    
+    if not seasons:
+        return df
+    
+    depth_charts = _load_nflverse_depth_charts(seasons)
+    if depth_charts.is_empty():
+        logger.warning("No depth chart data loaded for seasons %s", seasons)
+        return df
+    
+    # Join depth charts to player-game data
+    # Use left join to preserve all player-game rows
+    df = df.join(
+        depth_charts.select(["season", "week", "team", "player_id", "depth_chart_order"]).rename(
+            {"depth_chart_order": "_nfl_depth_order"}
+        ),
+        on=["season", "week", "team", "player_id"],
+        how="left",
+    )
+    
+    # Update depth_chart_order: prefer nflverse data, fall back to existing if any
+    if "depth_chart_order" in df.columns:
+        df = df.with_columns(
+            pl.coalesce([pl.col("_nfl_depth_order"), pl.col("depth_chart_order")])
+            .cast(pl.Int16)
+            .alias("depth_chart_order")
+        )
+    else:
+        df = df.with_columns(
+            pl.col("_nfl_depth_order").cast(pl.Int16).alias("depth_chart_order")
+        )
+    
+    df = df.drop("_nfl_depth_order")
+    
+    # Log coverage
+    total = df.height
+    with_depth = df.filter(pl.col("depth_chart_order").is_not_null()).height
+    logger.info("Depth chart coverage: %d/%d rows (%.1f%%)", with_depth, total, 100 * with_depth / total if total > 0 else 0)
+    
+    return df
 
 
 def _log_roster_arrivals(season: int, roster_pd: pd.DataFrame) -> None:
@@ -1341,7 +1732,11 @@ def _normalize_player_name_expr() -> pl.Expr:
 
 
 def _load_snap_counts_for_years(years: list[int]) -> pl.DataFrame:
-    """Load snap count data for the given years with caching."""
+    """Load snap count data for the given years with caching.
+    
+    Note: Snap counts from nfl_data_py use pfr_player_id, but our feature matrix
+    uses gsis_id (player_id). We load the ID mapping to convert between them.
+    """
     if not years:
         raise ValueError("No seasons provided for snap count load.")
 
@@ -1374,6 +1769,29 @@ def _load_snap_counts_for_years(years: list[int]) -> pl.DataFrame:
         return pl.DataFrame()
 
     snap_pl = pl.concat(frames, how="diagonal_relaxed")
+    
+    # Convert pfr_player_id to gsis_id (player_id) using the ID mapping
+    # This fixes name mismatch issues (e.g., "A.St. Brown" vs "Amon-Ra St. Brown")
+    if "pfr_player_id" in snap_pl.columns and "player_id" not in snap_pl.columns:
+        try:
+            import nfl_data_py as nfl
+            ids_pd = nfl.import_ids()
+            if ids_pd is not None and not ids_pd.empty:
+                ids_pl = pl.from_pandas(ids_pd[["gsis_id", "pfr_id"]].dropna())
+                ids_pl = ids_pl.rename({"gsis_id": "player_id", "pfr_id": "pfr_player_id"})
+                ids_pl = ids_pl.with_columns([
+                    pl.col("player_id").cast(pl.Utf8),
+                    pl.col("pfr_player_id").cast(pl.Utf8),
+                ])
+                snap_pl = snap_pl.with_columns(pl.col("pfr_player_id").cast(pl.Utf8))
+                snap_pl = snap_pl.join(ids_pl, on="pfr_player_id", how="left")
+                matched = snap_pl.filter(pl.col("player_id").is_not_null()).height
+                total = snap_pl.height
+                logger.info("Snap counts: mapped %d/%d rows from pfr_player_id to gsis_id (%.1f%%)", 
+                           matched, total, 100 * matched / total if total > 0 else 0)
+        except Exception as exc:
+            logger.warning("Failed to load ID mapping for snap counts: %s", exc)
+    
     return snap_pl
 
 
@@ -1690,9 +2108,43 @@ def build_player_game_level(
     
     # Merge rows where same player had multiple roles in same game
     # (e.g., QB who also rushed, WR who also rushed)
-    df_merged = _merge_multi_role_players(df_all, label_version=label_version or DEFAULT_LABEL_VERSION)
+    df_merged = _merge_multi_role_players(
+        df_all, label_version=label_version or DEFAULT_LABEL_VERSION
+    )
 
+    # IMPORTANT: Ensure zero-usage rostered players are present *before* we
+    # derive any TD label columns so that they receive consistent anytime_td_*
+    # and td_count_* labels (all zeros when they have no TD components).
     df_merged = _append_zero_usage_players(df_merged, seasons_in_window)
+
+    # Recompute standardized TD labels from core components so that
+    # anytime_td_* and td_count_* columns follow the canonical semantics
+    # (including the skill-only variants) for *all* players, including
+    # the appended zero-usage scaffold rows.
+    df_merged = compute_td_labels(df_merged, version=label_version or DEFAULT_LABEL_VERSION)
+
+    # Scripted TD flag: did this player score a TD on a game where they had scripted touches?
+    if "pre_snap_scripted_td" not in df_merged.columns:
+        if "ps_game_scripted_touches" in df_merged.columns:
+            has_skill_td: pl.Expr | None = None
+            if "anytime_td_skill" in df_merged.columns:
+                has_skill_td = pl.col("anytime_td_skill")
+            elif "anytime_td" in df_merged.columns:
+                has_skill_td = pl.col("anytime_td")
+            if has_skill_td is not None:
+                df_merged = df_merged.with_columns(
+                    (
+                        (has_skill_td.fill_null(0) == 1)
+                        & (pl.col("ps_game_scripted_touches").fill_null(0) > 0)
+                    )
+                    .cast(pl.Int8)
+                    .alias("pre_snap_scripted_td")
+                )
+        # If scripted stats are unavailable, create a safe default column of zeros.
+        if "pre_snap_scripted_td" not in df_merged.columns:
+            df_merged = df_merged.with_columns(
+                pl.lit(0).cast(pl.Int8).alias("pre_snap_scripted_td")
+            )
     
     pre_snap_usage = _compute_pre_snap_usage(df)
     if not pre_snap_usage.is_empty():
@@ -1834,6 +2286,123 @@ def build_player_game_level(
             logger.info("Roster metadata joined for %d rows (seasons: %s)", len(df_merged), seasons_available)
         else:
             logger.info("No season identifiers found for roster enrichment; skipping.")
+
+    # ------------------------------------------------------------------
+    # Team-level usage totals and per-player share labels for usage models
+    # ------------------------------------------------------------------
+    if {"season", "week", "team", "game_id", "target", "carry"} <= set(df_merged.columns):
+        usage_team = (
+            df_merged
+            .group_by(["season", "week", "team", "game_id"])
+            .agg(
+                [
+                    pl.col("target").fill_null(0).sum().cast(pl.Float32).alias("team_targets_total"),
+                    pl.col("carry").fill_null(0).sum().cast(pl.Float32).alias("team_carries_total"),
+                ]
+            )
+        )
+        if not usage_team.is_empty():
+            df_merged = df_merged.join(
+                usage_team,
+                on=["season", "week", "team", "game_id"],
+                how="left",
+            )
+            eps = 1e-6
+            df_merged = df_merged.with_columns(
+                [
+                    (
+                        pl.col("target").fill_null(0).cast(pl.Float32)
+                        / (pl.col("team_targets_total").fill_null(0.0) + eps)
+                    )
+                    .clip(0.0, 1.0)
+                    .alias("target_share_label"),
+                    (
+                        pl.col("carry").fill_null(0).cast(pl.Float32)
+                        / (pl.col("team_carries_total").fill_null(0.0) + eps)
+                    )
+                    .clip(0.0, 1.0)
+                    .alias("carry_share_label"),
+                ]
+            )
+
+    if "rush_success_plays" not in df_merged.columns:
+        df_merged = df_merged.with_columns(pl.lit(0).cast(pl.Int64).alias("rush_success_plays"))
+
+    success_eps = 1e-6
+    df_merged = df_merged.with_columns(
+        [
+            (
+                pl.col("reception").fill_null(0).cast(pl.Float32)
+                / (pl.col("target").fill_null(0).cast(pl.Float32) + success_eps)
+            )
+            .clip(0.0, 1.0)
+            .alias("rec_success_rate_label"),
+            (
+                pl.col("rush_success_plays").fill_null(0).cast(pl.Float32)
+                / (pl.col("carry").fill_null(0).cast(pl.Float32) + success_eps)
+            )
+            .clip(0.0, 1.0)
+            .alias("rush_success_rate_label"),
+            (
+                pl.col("receiving_yards").fill_null(0).cast(pl.Float32)
+                / (pl.col("target").fill_null(0).cast(pl.Float32) + success_eps)
+            )
+            .alias("yards_per_target_label"),
+            # Yards per catch (only for completed receptions)
+            (
+                pl.col("receiving_yards").fill_null(0).cast(pl.Float32)
+                / (pl.col("reception").fill_null(0).cast(pl.Float32) + success_eps)
+            )
+            .alias("yards_per_catch_label"),
+            # Air yards per catch (depth of target on completions)
+            (
+                pl.col("air_yards_total").fill_null(0).cast(pl.Float32)
+                / (pl.col("reception").fill_null(0).cast(pl.Float32) + success_eps)
+            )
+            .alias("air_yards_per_catch_label"),
+            # Yards after catch per catch (YAC efficiency)
+            (
+                pl.col("yards_after_catch_total").fill_null(0).cast(pl.Float32)
+                / (pl.col("reception").fill_null(0).cast(pl.Float32) + success_eps)
+            )
+            .alias("yac_per_catch_label"),
+            # Air yards per target (depth of target, including incompletions)
+            (
+                pl.col("air_yards_all_targets").fill_null(0).cast(pl.Float32)
+                / (pl.col("target").fill_null(0).cast(pl.Float32) + success_eps)
+            )
+            .alias("air_yards_per_target_label"),
+            (
+                pl.col("rushing_yards").fill_null(0).cast(pl.Float32)
+                / (pl.col("carry").fill_null(0).cast(pl.Float32) + success_eps)
+            )
+            .alias("yards_per_carry_label"),
+            (
+                pl.col("receiving_td_count").fill_null(0).cast(pl.Float32)
+                / (pl.col("target").fill_null(0).cast(pl.Float32) + success_eps)
+            )
+            .clip(0.0, 1.0)
+            .alias("td_per_target_label"),
+            (
+                pl.col("rushing_td_count").fill_null(0).cast(pl.Float32)
+                / (pl.col("carry").fill_null(0).cast(pl.Float32) + success_eps)
+            )
+            .clip(0.0, 1.0)
+            .alias("td_per_carry_label"),
+            (
+                pl.col("rushing_td_count").fill_null(0).cast(pl.Float32)
+                / (pl.col("red_zone_carry").fill_null(0).cast(pl.Float32) + success_eps)
+            )
+            .clip(0.0, 1.0)
+            .alias("td_per_rz_carry_label"),
+            (
+                pl.col("rushing_td_count").fill_null(0).cast(pl.Float32)
+                / (pl.col("goal_to_go_carry").fill_null(0).cast(pl.Float32) + success_eps)
+            )
+            .clip(0.0, 1.0)
+            .alias("td_per_gl_carry_label"),
+        ]
+    )
 
     # Enrich with weekly injury reports
     if seasons_available:
@@ -2555,6 +3124,13 @@ def build_player_game_level(
                 if col in df_merged.columns
             ]
         )
+        # Persist an explicit snaps label for stage-1 modeling
+        if "offense_snaps" in df_merged.columns:
+            df_merged = df_merged.with_columns(
+                pl.col("offense_snaps").fill_null(0.0).cast(pl.Float32).alias("snaps_label")
+            )
+        else:
+            df_merged = df_merged.with_columns(pl.lit(0.0).cast(pl.Float32).alias("snaps_label"))
         if {"player_id", "game_date"} <= set(df_merged.columns):
             df_merged = df_merged.sort(["player_id", "game_date"])
             snap_pct_cols = [col for col in ("offense_pct", "defense_pct", "st_pct") if col in df_merged.columns]
@@ -2588,6 +3164,29 @@ def build_player_game_level(
                 df_merged = df_merged.with_columns(lag_exprs)
             if rolling_exprs:
                 df_merged = df_merged.with_columns(rolling_exprs)
+
+    # ---------------------------------------------------------------------------
+    # Join official NFL depth chart data from nflverse
+    # ---------------------------------------------------------------------------
+    df_merged = _join_nflverse_depth_charts(df_merged)
+
+    # ---------------------------------------------------------------------------
+    # Add zero-usage / no-history flags for snap prediction
+    # ---------------------------------------------------------------------------
+    # Players with no snap history are typically zero-usage appends from rosters
+    # who haven't appeared in play-by-play data yet. This is a strong signal
+    # that they likely won't play.
+    if "snap_offense_pct_l3" in df_merged.columns:
+        df_merged = df_merged.with_columns(
+            pl.col("snap_offense_pct_l3")
+            .is_null()
+            .cast(pl.Int8)
+            .alias("has_no_snap_history")
+        )
+    else:
+        df_merged = df_merged.with_columns(
+            pl.lit(0).cast(pl.Int8).alias("has_no_snap_history")
+        )
 
     leak_cols = [
         "target_share",
@@ -2631,6 +3230,7 @@ def build_player_game_level(
     if derived_exprs:
         df_merged = df_merged.with_columns(derived_exprs)
     df_merged = _append_role_flags(df_merged)
+    df_merged = _append_moe_position_features(df_merged)
 
     if "offense_pct" in df_merged.columns:
         df_merged = df_merged.with_columns(
@@ -3016,6 +3616,12 @@ def build_player_game_level(
         logger.error("Missing season/week columns, cannot partition")
         return
     
+    # Clean up duplicate columns from joins (columns ending with _right)
+    right_cols = [c for c in df_merged.columns if c.endswith("_right")]
+    if right_cols:
+        logger.info("Dropping %d duplicate join columns: %s", len(right_cols), right_cols[:5])
+        df_merged = df_merged.drop(right_cols)
+    
     for (s, w), sub in df_merged.group_by(["season", "week"], maintain_order=True):
         out_dir = PLAYER_GAME_DIR / f"season={int(s)}" / f"week={int(w)}"
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -3233,7 +3839,6 @@ def _aggregate_passers(df: pl.DataFrame) -> pl.DataFrame:
             pl.when(pl.col("rush_touchdown") == 1).then(1).otherwise(0).sum().cast(pl.Int64).alias("rushing_td_count"),
             pl.col("red_zone_carry").fill_null(0).sum().cast(pl.Int64).alias("red_zone_carry"),
             pl.col("goal_to_go_carry").fill_null(0).sum().cast(pl.Int64).alias("goal_to_go_carry"),
-            
             # No receiving for passers typically
             pl.lit(0.0).cast(pl.Float64).alias("receiving_yards"),
             pl.lit(0).cast(pl.Int64).alias("target"),
@@ -3241,6 +3846,13 @@ def _aggregate_passers(df: pl.DataFrame) -> pl.DataFrame:
             pl.lit(0).cast(pl.Int64).alias("receiving_td_count"),
             pl.lit(0).cast(pl.Int64).alias("red_zone_target"),
             pl.lit(0).cast(pl.Int64).alias("goal_to_go_target"),
+            pl.col("yards_gained")
+            .fill_null(0)
+            .gt(0)
+            .cast(pl.Int8)
+            .sum()
+            .cast(pl.Int64)
+            .alias("rush_success_plays"),
             
             # Touchdowns (scored by player, not thrown)
             pl.when(pl.col("touchdown_player_id") == pl.col("passer_player_id"))
@@ -3298,6 +3910,7 @@ def _aggregate_rushers(df: pl.DataFrame) -> pl.DataFrame:
             pl.lit(0).cast(pl.Int64).alias("receiving_td_count"),
             pl.lit(0).cast(pl.Int64).alias("red_zone_target"),
             pl.lit(0).cast(pl.Int64).alias("goal_to_go_target"),
+            pl.lit(0).cast(pl.Int64).alias("rush_success_plays"),
             
             # Touchdowns
             pl.when(pl.col("touchdown_player_id") == pl.col("rusher_player_id"))
@@ -3331,10 +3944,8 @@ def _aggregate_receivers(df: pl.DataFrame) -> pl.DataFrame:
     if receivers.is_empty():
         return pl.DataFrame()
     
-    return (
-        receivers
-        .group_by(["season", "week", "game_id", "game_date", "receiver_player_id", "receiver_player_name"])
-        .agg([
+    # Build dynamic aggregation list based on available columns
+    agg_exprs = [
             # Receiving stats
             pl.col("receiving_yards").fill_null(0).sum().cast(pl.Float64).alias("receiving_yards"),
             pl.col("target").fill_null(0).sum().cast(pl.Int64).alias("target"),
@@ -3342,6 +3953,43 @@ def _aggregate_receivers(df: pl.DataFrame) -> pl.DataFrame:
             pl.when(pl.col("pass_touchdown") == 1).then(1).otherwise(0).sum().cast(pl.Int64).alias("receiving_td_count"),
             pl.col("red_zone_target").fill_null(0).sum().cast(pl.Int64).alias("red_zone_target"),
             pl.col("goal_to_go_target").fill_null(0).sum().cast(pl.Int64).alias("goal_to_go_target"),
+    ]
+    
+    # Add air yards if available
+    if "air_yards" in receivers.columns:
+        # Air yards on completions only (for efficiency_rec_yards_air)
+        agg_exprs.append(
+            pl.when(pl.col("complete_pass") == 1)
+            .then(pl.col("air_yards"))
+            .otherwise(0)
+            .fill_null(0)
+            .sum()
+            .cast(pl.Float64)
+            .alias("air_yards_total")
+        )
+        # Air yards on ALL targets (for usage_target_yards - depth of target)
+        agg_exprs.append(
+            pl.col("air_yards")
+            .fill_null(0)
+            .sum()
+            .cast(pl.Float64)
+            .alias("air_yards_all_targets")
+        )
+    
+    # Add yards after catch if available (only for completions)
+    if "yards_after_catch" in receivers.columns:
+        agg_exprs.append(
+            pl.col("yards_after_catch")
+            .fill_null(0)
+            .sum()
+            .cast(pl.Float64)
+            .alias("yards_after_catch_total")
+        )
+    
+    return (
+        receivers
+        .group_by(["season", "week", "game_id", "game_date", "receiver_player_id", "receiver_player_name"])
+        .agg(agg_exprs + [
             
             # Initialize other stats to 0
             pl.lit(0.0).cast(pl.Float64).alias("passing_yards"),
@@ -3353,6 +4001,7 @@ def _aggregate_receivers(df: pl.DataFrame) -> pl.DataFrame:
             pl.lit(0).cast(pl.Int64).alias("rushing_td_count"),
             pl.lit(0).cast(pl.Int64).alias("red_zone_carry"),
             pl.lit(0).cast(pl.Int64).alias("goal_to_go_carry"),
+            pl.lit(0).cast(pl.Int64).alias("rush_success_plays"),
             
             # Touchdowns
             pl.when(pl.col("touchdown_player_id") == pl.col("receiver_player_id"))
@@ -3384,11 +4033,8 @@ def _merge_multi_role_players(df: pl.DataFrame, *, label_version: str | None = N
     Example: QB who passed and rushed, WR who received and rushed.
     """
     
-    # Group by (player, game) and sum all stats
-    merged = (
-        df
-        .group_by(["season", "week", "game_id", "game_date", "player_id", "player_name"])
-        .agg([
+    # Build aggregation expressions based on available columns
+    agg_exprs = [
             # Sum all yardage
             pl.col("passing_yards").fill_null(0).sum().alias("passing_yards"),
             pl.col("rushing_yards").fill_null(0).sum().alias("rushing_yards"),
@@ -3406,6 +4052,7 @@ def _merge_multi_role_players(df: pl.DataFrame, *, label_version: str | None = N
             pl.col("red_zone_carry").fill_null(0).sum().alias("red_zone_carry"),
             pl.col("goal_to_go_target").fill_null(0).sum().alias("goal_to_go_target"),
             pl.col("goal_to_go_carry").fill_null(0).sum().alias("goal_to_go_carry"),
+            pl.col("rush_success_plays").fill_null(0).sum().alias("rush_success_plays"),
             
             # Sum TD counts
             pl.col("passing_td").fill_null(0).sum().alias("passing_td"),
@@ -3417,7 +4064,24 @@ def _merge_multi_role_players(df: pl.DataFrame, *, label_version: str | None = N
             pl.col("team").first().alias("team"),
             pl.col("opponent").first().alias("opponent"),
             *_metadata_exprs(df),
-        ])
+    ]
+    
+    # Add air_yards and YAC aggregations if available
+    if "air_yards_total" in df.columns:
+        agg_exprs.insert(3, pl.col("air_yards_total").fill_null(0).sum().alias("air_yards_total"))
+    if "air_yards_all_targets" in df.columns:
+        agg_exprs.insert(4 if "air_yards_total" in df.columns else 3,
+                        pl.col("air_yards_all_targets").fill_null(0).sum().alias("air_yards_all_targets"))
+    if "yards_after_catch_total" in df.columns:
+        insert_pos = 3 + sum([1 for c in ["air_yards_total", "air_yards_all_targets"] if c in df.columns])
+        agg_exprs.insert(insert_pos, 
+                        pl.col("yards_after_catch_total").fill_null(0).sum().alias("yards_after_catch_total"))
+    
+    # Group by (player, game) and sum all stats
+    merged = (
+        df
+        .group_by(["season", "week", "game_id", "game_date", "player_id", "player_name"])
+        .agg(agg_exprs)
     )
     
     # Fill nulls with 0 for numeric columns
@@ -3425,7 +4089,8 @@ def _merge_multi_role_players(df: pl.DataFrame, *, label_version: str | None = N
         "passing_yards", "rushing_yards", "receiving_yards",
         "pass_attempt", "completion", "carry", "target", "reception",
         "passing_td", "rushing_td_count", "receiving_td_count", "touchdowns",
-        "td_count", "red_zone_target", "red_zone_carry", "goal_to_go_target", "goal_to_go_carry"
+        "td_count", "red_zone_target", "red_zone_carry", "goal_to_go_target", "goal_to_go_carry",
+        "rush_success_plays"
     ]
     
     for col in numeric_cols:

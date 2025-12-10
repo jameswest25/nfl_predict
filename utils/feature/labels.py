@@ -48,11 +48,16 @@ LABEL_VERSIONS: Dict[str, LabelSpec] = {
         name="v1_any_offense",
         primary="anytime_td_offense",
         labels={
+            # Offense-wide anytime TD (rush + rec + pass thrown)
             "anytime_td_offense": LabelRules(include_other=False),
+            # Skill-type specific labels
             "anytime_td_rush": LabelRules(include_rush=True, include_rec=False, include_pass_thrown=False, include_other=False),
             "anytime_td_rec": LabelRules(include_rush=False, include_rec=True, include_pass_thrown=False, include_other=False),
             "anytime_td_pass_thrown": LabelRules(include_rush=False, include_rec=False, include_pass_thrown=True, include_other=False),
+            # Any TD credited to the player (offense + other)
             "anytime_td_all": LabelRules(include_other=True),
+            # Skill-only anytime TD (rush + rec, excludes passing TDs and other)
+            "anytime_td_skill": LabelRules(include_rush=True, include_rec=True, include_pass_thrown=False, include_other=False),
         },
         aliases={
             # Maintain legacy column name as an alias to the offense-only label.
@@ -123,17 +128,20 @@ def compute_td_labels(df: pl.DataFrame, *, version: str | None = None) -> pl.Dat
     reported_total = pl.col("touchdowns").fill_null(0).cast(pl.Int64)
 
     offense_total = _sum_expr([rush, rec, passing]).alias("_td_offense_total")
+    skill_total = _sum_expr([rush, rec]).alias("_td_skill_total")
     other_total = (reported_total - offense_total).clip(lower_bound=0).alias("_td_other_total")
     all_total = (offense_total + other_total).alias("_td_all_total")
 
     totals_exprs = [
         offense_total,
+        skill_total,
         other_total,
         all_total,
     ]
 
     label_exprs: list[pl.Expr] = [
         pl.col("_td_offense_total").alias("td_count_offense"),
+        pl.col("_td_skill_total").alias("td_count_skill"),
         pl.col("_td_all_total").alias("td_count_all"),
     ]
 
@@ -161,7 +169,16 @@ def compute_td_labels(df: pl.DataFrame, *, version: str | None = None) -> pl.Dat
         if alias_exprs:
             df = df.with_columns(alias_exprs)
 
-    drop_cols = [col for col in ("_td_offense_total", "_td_other_total", "_td_all_total") if col in df.columns]
+    drop_cols = [
+        col
+        for col in (
+            "_td_offense_total",
+            "_td_skill_total",
+            "_td_other_total",
+            "_td_all_total",
+        )
+        if col in df.columns
+    ]
     if drop_cols:
         df = df.drop(drop_cols)
     return df

@@ -42,13 +42,29 @@ def fit_feature_artifacts(df_train: pd.DataFrame, problem_config: dict) -> Featu
 
     final_X = df_train[feature_columns].copy()
     datetime_cols: List[str] = []
-    for col in final_X.select_dtypes(include=["datetime", "datetimetz"]).columns.tolist():
-        col_as_dt = pd.to_datetime(final_X[col], utc=True, errors="coerce")
-        numeric = col_as_dt.astype("int64", copy=False).astype("float64")
-        mask = col_as_dt.isna().to_numpy()
-        numeric[mask] = np.nan
-        final_X[col] = numeric / 1_000_000.0
-        datetime_cols.append(col)
+    
+    # Detect datetime columns more robustly
+    # Check for: datetime64, datetimetz, and object columns that might contain dates
+    for col in final_X.columns:
+        dtype_str = str(final_X[col].dtype).lower()
+        is_datetime = (
+            'datetime' in dtype_str or 
+            pd.api.types.is_datetime64_any_dtype(final_X[col])
+        )
+        # Also check for known datetime column patterns
+        is_datetime_pattern = col in ('injury_snapshot_ts', 'opp_ctx_data_as_of', 
+                                       'team_ctx_data_as_of', 'off_ctx_data_as_of')
+        
+        if is_datetime or is_datetime_pattern:
+            try:
+                col_as_dt = pd.to_datetime(final_X[col], utc=True, errors="coerce")
+                numeric = col_as_dt.astype("int64", copy=False).astype("float64")
+                mask = col_as_dt.isna().to_numpy()
+                numeric[mask] = np.nan
+                final_X[col] = numeric / 1_000_000.0
+                datetime_cols.append(col)
+            except Exception as e:
+                logger.warning(f"Failed to convert {col} to numeric datetime: {e}")
 
     num_cols = final_X.select_dtypes(include=np.number).columns
     cat_cols = list(final_X.columns.difference(num_cols))
@@ -78,6 +94,7 @@ def apply_feature_artifacts(
     """
     X = df.reindex(columns=artifacts.feature_columns)
 
+    # Handle datetime features stored in artifacts
     for col in artifacts.datetime_features or []:
         if col in X.columns:
             col_as_dt = pd.to_datetime(X[col], utc=True, errors="coerce")
@@ -85,6 +102,29 @@ def apply_feature_artifacts(
             mask = col_as_dt.isna().to_numpy()
             numeric[mask] = np.nan
             X[col] = numeric / 1_000_000.0
+    
+    # Also detect and convert any datetime columns not in the stored list
+    # This handles legacy models that didn't capture datetime features properly
+    known_datetime_cols = {'injury_snapshot_ts', 'opp_ctx_data_as_of', 
+                           'team_ctx_data_as_of', 'off_ctx_data_as_of'}
+    for col in X.columns:
+        if col in (artifacts.datetime_features or []):
+            continue  # Already handled above
+        dtype_str = str(X[col].dtype).lower()
+        is_datetime = (
+            'datetime' in dtype_str or 
+            pd.api.types.is_datetime64_any_dtype(X[col]) or
+            col in known_datetime_cols
+        )
+        if is_datetime:
+            try:
+                col_as_dt = pd.to_datetime(X[col], utc=True, errors="coerce")
+                numeric = col_as_dt.astype("int64", copy=False).astype("float64")
+                mask = col_as_dt.isna().to_numpy()
+                numeric[mask] = np.nan
+                X[col] = numeric / 1_000_000.0
+            except Exception:
+                pass  # Leave as-is if conversion fails
 
     for col in artifacts.categorical_features or []:
         if col not in X.columns:

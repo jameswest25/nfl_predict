@@ -805,12 +805,37 @@ def add_nfl_odds_features_to_df(
     if df_pl.is_empty():
         return df_pl
     
-    if not api_key:
-        api_key = get_odds_api_key()
-    
     feature_cols = NFL_ODDS_COLUMNS + ODDS_FLAG_COLUMNS + ODDS_DATETIME_COLUMNS
     base_frame = df_pl.drop(feature_cols, strict=False)
     
+    # ------------------------------------------------------------------
+    # 1) Historical games: prefer stored odds snapshots for parity
+    # ------------------------------------------------------------------
+    use_snapshots = False
+    max_game_date: Optional[dt.date] = None
+    if "game_date" in df_pl.columns:
+        try:
+            max_game_date = df_pl.get_column("game_date").cast(pl.Date).max()
+        except Exception:
+            max_game_date = None
+    today = dt.date.today()
+    if (
+        max_game_date is not None
+        and max_game_date < today
+        and {"season", "week", "home_team", "away_team"}.issubset(set(df_pl.columns))
+        and ODDS_SNAPSHOT_DIR.exists()
+    ):
+        use_snapshots = True
+
+    if use_snapshots:
+        enriched = _attach_nfl_odds_from_snapshots(base_frame, df_pl)
+        if drop_schedule_rows and "odds_expected" in enriched.columns:
+            enriched = enriched.filter(pl.col("odds_expected") == 1)
+        return enriched
+
+    # ------------------------------------------------------------------
+    # 2) Fallback to live Odds API for current / future games
+    # ------------------------------------------------------------------
     if not api_key:
         empty_exprs = [pl.lit(None).cast(pl.Float32).alias(c) for c in NFL_ODDS_COLUMNS]
         empty_exprs += [pl.lit(None).cast(pl.Datetime("ms", "UTC")).alias(c) for c in ODDS_DATETIME_COLUMNS]
@@ -908,6 +933,117 @@ def add_nfl_odds_features_to_df(
     
     if drop_schedule_rows and "odds_expected" in enriched.columns:
         enriched = enriched.filter(pl.col("odds_expected") == 1)
+    
+    return enriched
+
+
+def _attach_nfl_odds_from_snapshots(
+    base_frame: pl.DataFrame,
+    df_pl: pl.DataFrame,
+) -> pl.DataFrame:
+    """
+    Attach NFL odds from stored snapshots for historical games.
+
+    This is used for dates inside the training horizon to avoid live API
+    drift and to guarantee train/predict parity. It joins against
+    `data/raw/odds_snapshots/season=*/week=*/part.parquet` on
+    (season, week, home_team, away_team).
+    """
+    # Ensure key columns are present
+    key_cols = {"season", "week", "home_team", "away_team"}
+    if not key_cols.issubset(set(df_pl.columns)):
+        return base_frame
+
+    if not ODDS_SNAPSHOT_DIR.exists():
+        return base_frame
+
+    try:
+        seasons = df_pl.get_column("season").unique().to_list()
+        weeks = df_pl.get_column("week").unique().to_list()
+    except Exception:
+        return base_frame
+
+    if not seasons or not weeks:
+        return base_frame
+
+    # Load relevant snapshot partitions eagerly and concatenate with relaxed schema
+    frames: list[pl.DataFrame] = []
+    for season in seasons:
+        for week in weeks:
+            path = ODDS_SNAPSHOT_DIR / f"season={int(season)}" / f"week={_format_week(week)}" / "part.parquet"
+            if path.exists():
+                try:
+                    frames.append(pl.read_parquet(path))
+                except Exception as exc:
+                    logger.warning("Failed to read odds snapshot %s: %s", path, exc)
+    if not frames:
+        return base_frame
+
+    snap = pl.concat(frames, how="diagonal_relaxed")
+    if snap.is_empty():
+        return base_frame
+
+    snap_cols_all = set(snap.columns)
+    numeric_cols = [c for c in NFL_ODDS_COLUMNS if c in snap_cols_all]
+    datetime_cols = [c for c in ODDS_DATETIME_COLUMNS if c in snap_cols_all]
+
+    select_cols = ["season", "week", "home_team", "away_team"] + numeric_cols + datetime_cols
+    select_cols = [c for c in select_cols if c in snap_cols_all]
+    snap = snap.select(select_cols)
+    if snap.is_empty():
+        return base_frame
+
+    # Normalise types
+    cast_exprs: list[pl.Expr] = []
+    for col in numeric_cols:
+        cast_exprs.append(pl.col(col).cast(pl.Float32))
+    for col in datetime_cols:
+        cast_exprs.append(pl.col(col).cast(pl.Datetime("ms", "UTC")))
+    if cast_exprs:
+        snap = snap.with_columns(cast_exprs)
+
+    # Odds flags: mark rows with any odds as expected
+    has_any_odds = None
+    for col in ("total_line", "moneyline_home", "moneyline_away"):
+        if col in snap.columns:
+            expr = pl.col(col).is_not_null()
+            has_any_odds = expr if has_any_odds is None else (has_any_odds | expr)
+    if has_any_odds is None:
+        has_any_odds = pl.lit(False)
+
+    snap = snap.with_columns(
+        [
+            has_any_odds.cast(pl.Int8).alias("odds_expected"),
+            pl.lit(0).cast(pl.Int8).alias("odds_schedule_fallback"),
+        ]
+    )
+
+    # Join back to base frame
+    enriched = base_frame.join(
+        snap,
+        on=["season", "week", "home_team", "away_team"],
+        how="left",
+    )
+
+    # Ensure all expected columns exist
+    missing_numeric = [c for c in NFL_ODDS_COLUMNS if c not in enriched.columns]
+    if missing_numeric:
+        enriched = enriched.with_columns(
+            [pl.lit(None).cast(pl.Float32).alias(c) for c in missing_numeric]
+        )
+
+    missing_dt = [c for c in ODDS_DATETIME_COLUMNS if c not in enriched.columns]
+    if missing_dt:
+        enriched = enriched.with_columns(
+            [pl.lit(None).cast(pl.Datetime("ms", "UTC")).alias(c) for c in missing_dt]
+        )
+
+    for flag in ODDS_FLAG_COLUMNS:
+        if flag not in enriched.columns:
+            default_val = 0
+            enriched = enriched.with_columns(
+                pl.lit(default_val).cast(pl.Int8).alias(flag)
+            )
     
     return enriched
 

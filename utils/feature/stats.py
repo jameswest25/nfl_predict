@@ -84,8 +84,10 @@ NFL_PLAYER_STATS: List[str] = [
 ROLLING_WINDOWS = [1, 3, 5, "season"]
 
 # Contexts for rolling computations
-# "vs_any" = all opponents; vs_team/with_team disabled until caches exist
-ROLLING_CONTEXTS = ["vs_any"]
+# "vs_any"     = all opponents
+# "with_team"  = career with current team only (uses ctx='with_team' in daily_totals cache)
+# "vs_team"    = games vs specific opponent; features are gated on support in RollingWindow
+ROLLING_CONTEXTS = ["vs_any", "with_team", "vs_team"]
 
 # Aggregation levels for rolling windows
 # Only per-game rolling is currently supported; drive-level cache not wired

@@ -40,6 +40,7 @@ def load_feature_matrix(path: str, time_col: str, columns=None):
     
     logger.info(f"Loaded {len(df)} records.")
     df = _augment_injury_signals(df)
+    df = _augment_implied_totals(df)
     return df
 
 
@@ -116,6 +117,51 @@ def _augment_injury_signals(df: pd.DataFrame) -> pd.DataFrame:
         inactive_prob = inactive_prob.where(~boost_mask, np.clip(inactive_prob + 0.10, 0.0, 1.0))
 
     df["injury_inactive_probability"] = inactive_prob.astype("float32")
+    return df
+
+
+def _augment_implied_totals(df: pd.DataFrame) -> pd.DataFrame:
+    """Derive team/opp implied totals from spread/total when missing.
+
+    This mirrors the inference-time computation in pipeline/predict.py so that
+    models see consistent features during training and prediction.
+    """
+    if df.empty:
+        return df
+
+    required = {"total_line", "spread_line", "team", "home_team", "away_team"}
+    if not required.issubset(df.columns):
+        return df
+
+    # If team_implied_total already has non-null values, respect them.
+    if "team_implied_total" in df.columns:
+        col = pd.to_numeric(df["team_implied_total"], errors="coerce")
+        if col.notna().any():
+            return df
+
+    total = pd.to_numeric(df["total_line"], errors="coerce")
+    spread = pd.to_numeric(df["spread_line"], errors="coerce")
+
+    home_total = (total - spread) / 2.0
+    away_total = total - home_total
+
+    team = df["team"].astype(str)
+    home = df["home_team"].astype(str)
+    away = df["away_team"].astype(str)
+
+    team_it = pd.Series(index=df.index, dtype="float32")
+    opp_it = pd.Series(index=df.index, dtype="float32")
+
+    home_mask = team == home
+    away_mask = team == away
+
+    team_it[home_mask] = home_total[home_mask]
+    opp_it[home_mask] = away_total[home_mask]
+    team_it[away_mask] = away_total[away_mask]
+    opp_it[away_mask] = home_total[away_mask]
+
+    df["team_implied_total"] = team_it.astype("float32")
+    df["opp_implied_total"] = opp_it.astype("float32")
     return df
 
 def split_data_chronologically(df: pd.DataFrame, time_col: str, split_cfg: dict, production_mode: bool):
