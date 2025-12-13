@@ -254,26 +254,41 @@ def fit_team_conformal_sums(trainer) -> None:
             base_idx  = idx_objs[0]
             base_pos  = base_idx.get_indexer(common)
             meta_dict = base_blob.get("meta") or {}
-            # Required meta columns
-            need = ["game_pk", "away_team_abbr", "home_team_abbr", "inning_topbot", trainer.time_col]
-            # Gracefully degrade if some are missing
+            # NFL/MLB-compatible meta handling:
+            # - Prefer explicit `team` per row when available (NFL).
+            # - Fall back to MLB's inning_topbot mapping when available (MLB).
+            group_col = getattr(trainer, "group_col", "game_id")
+            alt_group_col = "game_pk"
+            need = [group_col, alt_group_col, "team", "home_team", "away_team", "away_team_abbr", "home_team_abbr", "inning_topbot", trainer.time_col]
             meta = {k: np.asarray(meta_dict[k])[base_pos] for k in need if k in meta_dict}
 
-            if not {"game_pk", "inning_topbot"}.issubset(set(meta.keys())) \
-               or not (("away_team_abbr" in meta) and ("home_team_abbr" in meta)):
+            dt = pd.to_datetime(meta[trainer.time_col]) if trainer.time_col in meta else None
+
+            # Determine group id column
+            if group_col in meta:
+                gid = meta[group_col]
+                gid_col_name = group_col
+            elif alt_group_col in meta:
+                gid = meta[alt_group_col]
+                gid_col_name = alt_group_col
+            else:
+                logger.warning(f"[team:{name}] Missing group id meta columns; skipping.")
+                continue
+
+            # Determine team_for_row
+            if "team" in meta:
+                team_for_row = meta["team"].astype(str)
+            elif "inning_topbot" in meta and (("away_team_abbr" in meta) and ("home_team_abbr" in meta)):
+                itb = meta["inning_topbot"].astype(str)
+                away = meta["away_team_abbr"].astype(str)
+                home = meta["home_team_abbr"].astype(str)
+                team_for_row = np.where(np.char.startswith(itb, "Top"), away, home)
+            else:
                 logger.warning(f"[team:{name}] Missing team meta columns; skipping.")
                 continue
 
-            # team_for_row from inning_topbot: Top → away, Bottom/Bot → home
-            itb = meta["inning_topbot"].astype(str)
-            away = meta["away_team_abbr"].astype(str)
-            home = meta["home_team_abbr"].astype(str)
-            team_for_row = np.where(np.char.startswith(itb, "Top"), away, home)
-
-            # Group keys & frame
-            dt = pd.to_datetime(meta[trainer.time_col]) if trainer.time_col in meta else None
             df_row = pd.DataFrame({
-                "game_pk": meta["game_pk"],
+                gid_col_name: gid,
                 "team_for_row": team_for_row,
                 "y_true_row": Ytrue_row,
                 "y_hat_row": Yhat_row,
@@ -300,7 +315,7 @@ def fit_team_conformal_sums(trainer) -> None:
                     method = "naive"
             # Aggregate to team/game
             if method == "naive":
-                agg = (df_row.groupby(["game_pk", "team_for_row", "date"], as_index=False)
+                agg = (df_row.groupby([gid_col_name, "team_for_row", "date"], as_index=False)
                             .agg(y_true=("y_true_row","sum"),
                                  y_hat=("y_hat_row","sum")))
                 res_team = np.abs(agg["y_true"].values - agg["y_hat"].values)
@@ -316,7 +331,7 @@ def fit_team_conformal_sums(trainer) -> None:
             else:
                 # HC: RMS aggregate of per-row sigma_i within each team/game
                 df_row["_sig2"] = sigma_i ** 2
-                agg = (df_row.groupby(["game_pk", "team_for_row", "date"], as_index=False)
+                agg = (df_row.groupby([gid_col_name, "team_for_row", "date"], as_index=False)
                             .agg(y_true=("y_true_row","sum"),
                                  y_hat=("y_hat_row","sum"),
                                  sigsum=("_sig2","sum")))

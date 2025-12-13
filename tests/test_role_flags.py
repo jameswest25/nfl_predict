@@ -1,6 +1,6 @@
 import polars as pl
 
-from utils.feature.player_game_level import _append_role_flags
+from utils.feature.builders.player_game_level import _append_role_flags
 
 
 def test_role_flags_use_quantiles_per_team_position():

@@ -27,6 +27,9 @@ def fit_feature_artifacts(df_train: pd.DataFrame, problem_config: dict) -> Featu
     discard_cols = set(problem_config.get("columns_to_discard") or [])
 
     initial_features = [col for col in df_train.columns if col.startswith(include_prefixes)]
+    # Never silently include diagnostic MoE columns as training features.
+    # These are intended for inspection and for explicit MoE-only model configs.
+    initial_features = [c for c in initial_features if not str(c).endswith("_moe")]
     initial_features.extend([col for col in other_features if col in df_train.columns])
     feature_columns = sorted(list({col for col in initial_features if col not in discard_cols}))
 

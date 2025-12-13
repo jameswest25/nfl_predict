@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import polars as pl
 
-from utils.feature.offense_context import _build_is_unavailable_expr
+from utils.feature.enrichment.offense_context import _build_is_unavailable_expr
 
 
 def test_is_unavailable_uses_injury_designations_overrides():

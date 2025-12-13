@@ -31,6 +31,7 @@ __all__ = [
     "add_snap_weighted_usage",
     "add_position_baselines",
     "add_zero_usage_indicators",
+    "add_usage_carry_enhancements",
 ]
 
 logger = logging.getLogger(__name__)
@@ -438,9 +439,133 @@ def add_usage_helper_features(df: pl.DataFrame) -> pl.DataFrame:
     df = add_position_baselines(df)
     df = add_zero_usage_indicators(df)
     df = add_rb_usage_features(df)
+    df = add_usage_carry_enhancements(df)
     
     added = len(df.columns) - before_cols
     logger.info("    Added %d usage helper features", added)
     
+    return df
+
+
+def add_usage_carry_enhancements(df: pl.DataFrame) -> pl.DataFrame:
+    """Add carry-specific nuance features to aid MoE for usage_carries.
+    
+    - QB siphon/designed runs: capture QB run share that caps RB carries
+    - Carry volatility/trend: simple volatility proxy on carry share
+    - Situational carry rates: short-yardage and third-down carry rates
+    - Gadget propensity: carries per route for WR/TE gadget roles
+    - Team/opp run context: neutral run rate and opponent run-rate allowed
+    """
+    cols = set(df.columns)
+    exprs: list[pl.Expr] = []
+
+    # QB siphon / designed run share (team-level to apply to all positions)
+    if {"qb_profile_team_rush_attempts_l3", "qb_profile_team_dropbacks_l3"} <= cols:
+        qb_siphon = (
+            pl.col("qb_profile_team_rush_attempts_l3").fill_null(0.0)
+            / (pl.col("qb_profile_team_dropbacks_l3").fill_null(0.01) + 0.01)
+        ).clip(0.0, 1.0)
+        exprs.append(qb_siphon.cast(pl.Float32).alias("qb_carry_siphon_l3"))
+
+        if "qb_profile_team_scramble_rate_l3" in cols:
+            exprs.append(
+                (qb_siphon - pl.col("qb_profile_team_scramble_rate_l3").fill_null(0.0))
+                .clip(0.0, 1.0)
+                .cast(pl.Float32)
+                .alias("qb_designed_run_share_l3")
+            )
+    # Expose player-level scramble rate as a lightweight feature
+    if "qb_profile_scramble_rate_l3" in cols:
+        exprs.append(
+            pl.col("qb_profile_scramble_rate_l3")
+            .fill_null(0.0)
+            .cast(pl.Float32)
+            .alias("qb_scramble_rate_l3")
+        )
+
+    # Carry-share trend & volatility proxy (carry-specific, not snaps)
+    if {"hist_carry_share_prev", "hist_carry_share_l3"} <= cols:
+        trend = (
+            pl.col("hist_carry_share_prev").fill_null(0.0)
+            - pl.col("hist_carry_share_l3").fill_null(0.0)
+        )
+        exprs.append(trend.cast(pl.Float32).alias("carry_share_trend"))
+        exprs.append(
+            (trend.abs() / (pl.col("hist_carry_share_l3").fill_null(0.001).abs() + 0.001))
+            .clip(0.0, 5.0)
+            .cast(pl.Float32)
+            .alias("carry_share_cv_like")
+        )
+
+    # Situational carry rates from rolling counts
+    if {"3g_short_yard_carry_per_game", "3g_carry_per_game"} <= cols:
+        exprs.append(
+            (
+                pl.col("3g_short_yard_carry_per_game").fill_null(0.0)
+                / (pl.col("3g_carry_per_game").fill_null(0.0) + 0.001)
+            )
+            .clip(0.0, 1.0)
+            .cast(pl.Float32)
+            .alias("hist_short_yard_carry_rate_l3")
+        )
+    if {"3g_third_down_carry_per_game", "3g_carry_per_game"} <= cols:
+        exprs.append(
+            (
+                pl.col("3g_third_down_carry_per_game").fill_null(0.0)
+                / (pl.col("3g_carry_per_game").fill_null(0.0) + 0.001)
+            )
+            .clip(0.0, 1.0)
+            .cast(pl.Float32)
+            .alias("hist_third_down_carry_rate_l3")
+        )
+
+    # Gadget/jet proxy: carries per route participation
+    if {"hist_carry_share_l3", "ps_hist_route_participation_pct_l3"} <= cols:
+        exprs.append(
+            (
+                pl.col("hist_carry_share_l3").fill_null(0.0)
+                / (pl.col("ps_hist_route_participation_pct_l3").fill_null(0.01) + 0.01)
+            )
+            .clip(0.0, 3.0)
+            .cast(pl.Float32)
+            .alias("hist_carry_per_route_l3")
+        )
+    if {"hist_carry_share_l3", "hist_target_share_l3", "position"} <= cols:
+        exprs.append(
+            (
+                (pl.col("hist_carry_share_l3").fill_null(0.0) > 0.0)
+                & (pl.col("hist_target_share_l3").fill_null(0.0) < 0.12)
+                & (pl.col("position").is_in(["WR", "TE"]))
+            )
+            .cast(pl.Int8)
+            .alias("wr_gadget_flag")
+        )
+
+    # Team/opp run bias context (carry-specific)
+    if "team_ctx_rush_rate_l3" in cols:
+        exprs.append(
+            pl.col("team_ctx_rush_rate_l3")
+            .fill_null(0.0)
+            .cast(pl.Float32)
+            .alias("team_ctx_run_rate_neutral_l3")
+        )
+    if "team_ctx_rush_rate_prev" in cols:
+        exprs.append(
+            pl.col("team_ctx_rush_rate_prev")
+            .fill_null(0.0)
+            .cast(pl.Float32)
+            .alias("team_ctx_run_rate_prev")
+        )
+    if "opp_ctx_rush_rate_l3" in cols:
+        exprs.append(
+            pl.col("opp_ctx_rush_rate_l3")
+            .fill_null(0.0)
+            .cast(pl.Float32)
+            .alias("opp_run_rate_allowed_l3")
+        )
+
+    if exprs:
+        df = df.with_columns(exprs)
+
     return df
 

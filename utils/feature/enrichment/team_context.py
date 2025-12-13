@@ -6,7 +6,7 @@ from typing import Iterable
 
 import polars as pl
 
-from utils.feature.pace import compute_pace_metrics, add_pace_history
+from utils.feature.rolling.pace import compute_pace_metrics, add_pace_history
 
 logger = logging.getLogger(__name__)
 

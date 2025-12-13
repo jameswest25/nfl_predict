@@ -13,7 +13,7 @@ try:  # pandas is optional when this module is used during feature generation
 except Exception:  # pragma: no cover - optional dependency
     pd = None
 
-from utils.feature.labels import DEFAULT_LABEL_VERSION, get_label_spec
+from utils.feature.core.labels import DEFAULT_LABEL_VERSION, get_label_spec
 
 logger = logging.getLogger(__name__)
 

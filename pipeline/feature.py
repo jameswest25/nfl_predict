@@ -31,72 +31,77 @@ import polars as pl
 import polars.selectors as cs
 
 # Stage builders
-from utils.feature.play_level import build_play_level
-from utils.feature.player_drive_level import build_player_drive_level
-from utils.feature.player_game_level import build_player_game_level
-from utils.feature.opponent_splits import build_opponent_splits
-from utils.feature.daily_totals import build_daily_cache_range
-from utils.feature.rolling_window import add_rolling_features
-from utils.feature.stats import ROLLING_FEATURE_STATS, ROLLING_WINDOWS, ROLLING_CONTEXTS
+from utils.feature.builders.play_level import build_play_level
+from utils.feature.builders.player_drive_level import build_player_drive_level
+from utils.feature.builders.player_game_level import build_player_game_level
+from utils.feature.builders.opponent_splits import build_opponent_splits
+from utils.feature.rolling.daily_totals import build_daily_cache_range
+from utils.feature.rolling.rolling_window import add_rolling_features
+from utils.feature.rolling.stats import ROLLING_FEATURE_STATS, ROLLING_WINDOWS, ROLLING_CONTEXTS
 
 # Context enrichment
-from utils.feature.team_context import add_team_context_features, compute_team_context_history
-from utils.feature.offense_context import (
+from utils.feature.enrichment.team_context import add_team_context_features, compute_team_context_history
+from utils.feature.enrichment.offense_context import (
     add_offense_context_features_training,
     _append_offense_context_columns,
 )
-from utils.feature.weather_features import (
+from utils.feature.enrichment.weather_features import (
     add_weather_forecast_features_training,
     append_weather_context_flags,
 )
-from utils.feature.odds import add_nfl_odds_features_to_df
-from utils.feature.shared import (
+from utils.feature.enrichment.odds import add_nfl_odds_features_to_df
+from utils.feature.core.shared import (
     finalize_drive_history_features,
     attach_td_rate_history_features,
 )
 
 # Feature enrichment utilities
-from utils.feature.usage_features import add_usage_helper_features
-from utils.feature.position_features import (
+from utils.feature.derived.usage_features import add_usage_helper_features
+from utils.feature.derived.position_features import (
     add_position_group,
     add_specialist_role_flags,
     add_moe_position_features,
 )
-from utils.feature.catch_rate_features import add_catch_rate_features
-from utils.feature.target_depth_features import add_target_depth_features
-from utils.feature.snap_features import add_snap_features
-from utils.feature.historical_share_features import (
+from utils.feature.derived.catch_rate_features import add_catch_rate_features
+from utils.feature.derived.target_depth_features import add_target_depth_features
+from utils.feature.derived.snap_features import (
+    add_rolling_snap_features,
+    add_expected_snap_features,
+    add_role_stability_features,
+    add_market_odds_flag,
+)
+from utils.feature.derived.historical_share_features import (
     add_historical_share_features,
     add_combined_usage_features,
     add_role_share_flags,
     drop_leakage_columns,
 )
-from utils.feature.market_features import add_market_features
-from utils.feature.asof_enrichment import (
+from utils.feature.derived.market_features import add_market_features
+from utils.feature.enrichment.asof_enrichment import (
     attach_asof_metadata,
     apply_snapshot_guards,
     load_and_build_asof_metadata,
 )
 
 # Labels and validation
-from utils.feature.labels import DEFAULT_LABEL_VERSION, get_label_spec
-from utils.feature.targets import validate_target_columns
+from utils.feature.core.labels import DEFAULT_LABEL_VERSION, get_label_spec
+from utils.feature.core.targets import validate_target_columns
 
 # Leak guard and schema
-from utils.feature.leak_guard import (
+from utils.feature.core.leak_guard import (
     DEFAULT_LEAK_POLICY,
     build_schema_snapshot,
     enforce_leak_guard,
     write_schema_snapshot,
 )
-from utils.feature.asof import (
+from utils.feature.enrichment.asof import (
     decision_cutoff_horizons,
     decision_cutoff_override,
     get_decision_cutoff_hours,
     fallback_cutoff_hours,
     drop_missing_snapshots_enabled,
 )
-from utils.feature.asof_metadata import build_asof_metadata, load_asof_metadata
+from utils.feature.enrichment.asof_metadata import build_asof_metadata, load_asof_metadata
 
 # Paths and constants
 from utils.general.constants import LEAK_PRONE_COLUMNS, NFL_TARGET_COLUMNS, format_cutoff_label
@@ -184,7 +189,7 @@ def _load_player_game_data() -> pl.LazyFrame:
         pl.col("season").cast(pl.Int32),
         pl.col("week").cast(pl.Int32),
     ])
-    
+
     return player_game_scan
 
 
@@ -208,11 +213,11 @@ def _load_drive_features(target_players: pl.DataFrame) -> pl.DataFrame:
             [pl.col(col).cast(pl.Utf8) for col in drive_categorical_cols]
         )
     drive_scan = drive_scan.with_columns([
-        pl.col("team").cast(pl.Utf8) if "team" in drive_schema.names() else pl.lit(None).cast(pl.Utf8).alias("team"),
-        pl.col("player_id").cast(pl.Utf8) if "player_id" in drive_schema.names() else pl.lit(None).cast(pl.Utf8).alias("player_id"),
-        pl.col("game_id").cast(pl.Utf8) if "game_id" in drive_schema.names() else pl.lit(None).cast(pl.Utf8).alias("game_id"),
-        pl.col("season").cast(pl.Int32) if "season" in drive_schema.names() else pl.lit(None).cast(pl.Int32).alias("season"),
-        pl.col("week").cast(pl.Int32) if "week" in drive_schema.names() else pl.lit(None).cast(pl.Int32).alias("week"),
+            pl.col("team").cast(pl.Utf8) if "team" in drive_schema.names() else pl.lit(None).cast(pl.Utf8).alias("team"),
+            pl.col("player_id").cast(pl.Utf8) if "player_id" in drive_schema.names() else pl.lit(None).cast(pl.Utf8).alias("player_id"),
+            pl.col("game_id").cast(pl.Utf8) if "game_id" in drive_schema.names() else pl.lit(None).cast(pl.Utf8).alias("game_id"),
+            pl.col("season").cast(pl.Int32) if "season" in drive_schema.names() else pl.lit(None).cast(pl.Int32).alias("season"),
+            pl.col("week").cast(pl.Int32) if "week" in drive_schema.names() else pl.lit(None).cast(pl.Int32).alias("week"),
     ])
     drive_schema_names = set(drive_schema.names())
 
@@ -302,15 +307,15 @@ def _load_drive_features(target_players: pl.DataFrame) -> pl.DataFrame:
         pl.col("team").cast(pl.Utf8),
         pl.col("game_id").cast(pl.Utf8),
     ])
-
+    
     scaffold = game_scan.filter(
         pl.col("player_id").is_in(target_players.get_column("player_id"))
     ).select(
         ["season", "week", "game_id", "team", "player_id", "game_date"]
     ).collect(streaming=True)
-
+    
     join_keys = ["season", "week", "game_id", "team", "player_id"]
-
+    
     if not scaffold.is_empty():
         scaffold = scaffold.unique(subset=join_keys)
 
@@ -329,19 +334,19 @@ def _load_drive_features(target_players: pl.DataFrame) -> pl.DataFrame:
             suffix="_drive"
         )
         if "game_date_drive" in drive_features.columns:
-            drive_features = drive_features.with_columns(
-                pl.col("game_date").fill_null(pl.col("game_date_drive"))
-            ).drop("game_date_drive")
-
+             drive_features = drive_features.with_columns(
+                 pl.col("game_date").fill_null(pl.col("game_date_drive"))
+             ).drop("game_date_drive")
+        
         agg_cols = [
             "drive_count", "drive_touch_drives", "drive_td_drives", "drive_total_yards",
             "drive_red_zone_drives", "drive_goal_to_go_drives"
         ]
         existing_aggs = [c for c in agg_cols if c in drive_features.columns]
         if existing_aggs:
-            drive_features = drive_features.with_columns([
-                pl.col(c).fill_null(0) for c in existing_aggs
-            ])
+             drive_features = drive_features.with_columns([
+                 pl.col(c).fill_null(0) for c in existing_aggs
+             ])
     else:
         drive_features = scaffold
         agg_cols = ["drive_count", "drive_touch_drives", "drive_td_drives", "drive_total_yards"]
@@ -414,22 +419,22 @@ def _add_injury_availability_features(df: pl.DataFrame) -> pl.DataFrame:
 
     if "injury_inactive_probability_model" in df.columns:
         df = df.with_columns([
-            pl.col("injury_inactive_probability_model")
-            .fill_null(0.0)
-            .cast(pl.Float32)
-            .clip(0.0, 1.0)
-            .alias("availability_inactive_prob"),
-            (
                 pl.col("injury_inactive_probability_model")
                 .fill_null(0.0)
                 .cast(pl.Float32)
                 .clip(0.0, 1.0)
-                * (1.0 - pl.col("injury_inactive_probability_model")
-                           .fill_null(0.0)
-                           .cast(pl.Float32)
-                           .clip(0.0, 1.0))
-            )
-            .alias("availability_uncertainty"),
+                .alias("availability_inactive_prob"),
+                (
+                    pl.col("injury_inactive_probability_model")
+                    .fill_null(0.0)
+                    .cast(pl.Float32)
+                    .clip(0.0, 1.0)
+                    * (1.0 - pl.col("injury_inactive_probability_model")
+                               .fill_null(0.0)
+                               .cast(pl.Float32)
+                               .clip(0.0, 1.0))
+                )
+                .alias("availability_uncertainty"),
         ])
     
     return df
@@ -441,44 +446,44 @@ def _process_weather_columns(df: pl.DataFrame) -> pl.DataFrame:
     if not weather_cols:
         return df
     
-    drop_weather_cols = [
-        col
-        for col in weather_cols
-        if col.endswith("_ts")
-        or col.endswith("_source_detail")
-        or col in {"weather_conditions", "weather_precip_type"}
-    ]
-    if drop_weather_cols:
-        df = df.drop(drop_weather_cols, strict=False)
+        drop_weather_cols = [
+            col
+            for col in weather_cols
+            if col.endswith("_ts")
+            or col.endswith("_source_detail")
+            or col in {"weather_conditions", "weather_precip_type"}
+        ]
+        if drop_weather_cols:
+            df = df.drop(drop_weather_cols, strict=False)
     
-    weather_numeric_cols = [
-        col
-        for col in weather_cols
-        if col not in drop_weather_cols
-        and any(
+        weather_numeric_cols = [
+            col
+            for col in weather_cols
+            if col not in drop_weather_cols
+            and any(
             df.schema.get(col) == dtype
-            for dtype in (pl.Float64, pl.Float32, pl.Int64, pl.Int32, pl.UInt64, pl.UInt32)
-        )
-    ]
-    if weather_numeric_cols:
-        df = df.with_columns(
-            [pl.col(col).cast(pl.Float32) for col in weather_numeric_cols]
-        )
+                for dtype in (pl.Float64, pl.Float32, pl.Int64, pl.Int32, pl.UInt64, pl.UInt32)
+            )
+        ]
+        if weather_numeric_cols:
+            df = df.with_columns(
+                [pl.col(col).cast(pl.Float32) for col in weather_numeric_cols]
+            )
     
-    weather_flag_cols = [
-        col
-        for col in weather_cols
-        if col not in drop_weather_cols
-        and (
-            col.endswith("_flag")
-            or col.endswith("_is_backfill")
-            or col.endswith("_is_historical")
-        )
-    ]
-    if weather_flag_cols:
-        df = df.with_columns(
-            [pl.col(col).cast(pl.Int8) for col in weather_flag_cols]
-        )
+        weather_flag_cols = [
+            col
+            for col in weather_cols
+            if col not in drop_weather_cols
+            and (
+                col.endswith("_flag")
+                or col.endswith("_is_backfill")
+                or col.endswith("_is_historical")
+            )
+        ]
+        if weather_flag_cols:
+            df = df.with_columns(
+                [pl.col(col).cast(pl.Int8) for col in weather_flag_cols]
+            )
     
     df = append_weather_context_flags(df, roof_col="roof")
     
@@ -624,7 +629,7 @@ def _build_feature_matrix_internal(
     
     player_game_scan = _load_player_game_data()
     df = player_game_scan.collect(streaming=True)
-
+    
     # Clean up duplicate columns from upstream joins
     right_cols = [c for c in df.columns if c.endswith("_right")]
     if right_cols:
@@ -693,7 +698,7 @@ def _build_feature_matrix_internal(
 
     logger.info("Enriching offense situational context (OC/QB)...")
     df = add_offense_context_features_training(df, history_path=OFF_CONTEXT_PATH)
-
+            
     # Weather features
     if ENABLE_WEATHER_FEATURES:
         logger.info("Enriching weather forecast features...")
@@ -747,12 +752,17 @@ def _build_feature_matrix_internal(
             rolling_cols = [c for c in df.columns if "g_" in c or "season" in c]
             logger.info(f"✅  Added {len(rolling_cols)} rolling features")
 
-    # Snap features (rolling snaps, expected snaps, role stability)
-    df = add_snap_features(df)
+    # Basic rolling snap features (no dependencies on historical shares)
+    df = add_rolling_snap_features(df)
+    df = add_role_stability_features(df)
+    df = add_market_odds_flag(df)
 
-    # Historical share features
+    # Historical share features (must come before expected snap features)
     df = add_historical_share_features(df)
     df = add_combined_usage_features(df)
+
+    # Expected snap features (depends on historical shares for RZ/GL touches)
+    df = add_expected_snap_features(df)
 
     # Market features (implied totals, pace, interactions)
     df = add_market_features(df)
@@ -762,7 +772,7 @@ def _build_feature_matrix_internal(
 
     # MoE position-specific features
     df = add_moe_position_features(df)
-
+    
     # Catch rate features
     df = add_catch_rate_features(df)
 
@@ -794,7 +804,7 @@ def _build_feature_matrix_internal(
         logger.info("    Primary feature matrix updated → %s", primary_output)
     logger.info("    Rows: %d, Columns: %d", len(df), len(df.columns))
     logger.info("    Date range: %s to %s", df["game_date"].min(), df["game_date"].max())
-
+    
     spec = get_label_spec(label_version)
     label_candidates = {spec.primary, "anytime_td"}
     for label_col in label_candidates:
@@ -808,7 +818,7 @@ def _build_feature_matrix_internal(
                 td_count,
                 len(df),
             )
-
+    
     return df
 
 
@@ -873,12 +883,12 @@ def refresh_context_histories(*, end_date: date | None = None) -> None:
         extra_columns="ignore",
     )
     player_game_scan = player_game_scan.with_columns([
-        pl.col("player_id").cast(pl.Utf8),
-        pl.col("team").cast(pl.Utf8),
-        pl.col("opponent").cast(pl.Utf8),
-        pl.col("game_date").cast(pl.Date),
-        pl.col("season").cast(pl.Int32),
-        pl.col("week").cast(pl.Int32),
+            pl.col("player_id").cast(pl.Utf8),
+            pl.col("team").cast(pl.Utf8),
+            pl.col("opponent").cast(pl.Utf8),
+            pl.col("game_date").cast(pl.Date),
+            pl.col("season").cast(pl.Int32),
+            pl.col("week").cast(pl.Int32),
     ])
     if end_date is not None:
         player_game_scan = player_game_scan.filter(pl.col("game_date") <= pl.lit(end_date))
@@ -922,12 +932,12 @@ def refresh_context_histories(*, end_date: date | None = None) -> None:
         extra_columns="ignore",
     )
     drive_scan = drive_scan.with_columns([
-        pl.col("player_id").cast(pl.Utf8),
-        pl.col("team").cast(pl.Utf8),
-        pl.col("game_id").cast(pl.Utf8),
-        pl.col("season").cast(pl.Int32),
-        pl.col("week").cast(pl.Int32),
-        pl.col("game_date").cast(pl.Datetime("ms")),
+            pl.col("player_id").cast(pl.Utf8),
+            pl.col("team").cast(pl.Utf8),
+            pl.col("game_id").cast(pl.Utf8),
+            pl.col("season").cast(pl.Int32),
+            pl.col("week").cast(pl.Int32),
+            pl.col("game_date").cast(pl.Datetime("ms")),
     ])
     if end_date is not None:
         drive_scan = drive_scan.filter(

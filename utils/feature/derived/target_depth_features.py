@@ -86,13 +86,9 @@ def add_position_depth_priors(df: pl.DataFrame) -> pl.DataFrame:
         .alias("is_deep_target_position")
     )
     
-    # RB-specific: Expected near-zero depth (strong signal)
-    exprs.append(
-        pl.when(pl.col("position") == "RB").then(0.0)
-        .otherwise(pl.lit(None))
-        .cast(pl.Float32)
-        .alias("rb_expected_target_depth")
-    )
+    # Note: rb_expected_target_depth was removed because it was always 0.0
+    # (all RBs get short passes), providing no discriminative signal.
+    # Position-specific depth features are now in position_features.py
     
     # Position depth ceiling
     exprs.append(
@@ -256,8 +252,24 @@ def compute_historical_air_yards(df: pl.DataFrame) -> pl.DataFrame:
     """Compute historical player target depth (rolling average from previous games).
     
     This is the best feature - player's own historical air yards per target.
+    
+    Note: If hist_* columns already exist (pre-computed from historical data),
+    they are preserved to maintain parity between training and inference.
     """
     if "air_yards_all_targets" not in df.columns or "target" not in df.columns:
+        return df
+    
+    # Check if key historical columns already exist with valid values
+    # If so, skip recomputing them (they were pre-loaded from full history)
+    cols = set(df.columns)
+    already_have_hist = (
+        "hist_air_yards_sum_l3" in cols and 
+        "hist_targets_l3" in cols and
+        df.filter(pl.col("hist_air_yards_sum_l3").is_not_null()).height > 0
+    )
+    
+    if already_have_hist:
+        logger.debug("Skipping hist air yards computation - already present from historical data")
         return df
     
     # Sort by player and game_date

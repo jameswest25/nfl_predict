@@ -279,7 +279,8 @@ def run_walkforward(cfg: RollingConfig, config_yaml: str | Path = "config/traini
         # CV OOF for calibrator fit (inside _oof_predictions we can calibrate, but we need the
         # calibrator to apply to final model if we train single model). We'll just train model on full train.
         # Option 1: simple fit -> predict -> calibrate using held-out fold preds. We'll reuse _oof_predictions.
-        oof_tr = _oof_predictions(X_tr, y_tr, groups=pd.factorize(df_train["game_pk"])[0],
+        group_col = "game_id" if "game_id" in df_train.columns else "game_pk"
+        oof_tr = _oof_predictions(X_tr, y_tr, groups=pd.factorize(df_train[group_col])[0],
                                   use_cols=use_cols, params=params, n_splits=cfg.cv, calibrator="none")
 
         # Fit calibrator on train oof if required

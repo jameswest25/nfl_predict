@@ -29,14 +29,14 @@ def load_feature_matrix(path: str, time_col: str, columns=None):
             raise AssertionError(f"Requested columns missing from DataFrame: {missing}")
     df[time_col] = pd.to_datetime(df[time_col])
     df = df.sort_values(time_col).reset_index(drop=True)
-    # Check for game identifier column (game_id for NFL, game_pk for MLB)
-    if 'game_id' not in df.columns and 'game_pk' not in df.columns:
-        raise ValueError("game_id or game_pk column not found, required for PurgedGroupTimeSeriesSplit.")
-    
-    # Use game_id if available (NFL), otherwise game_pk (MLB legacy)
-    if 'game_id' in df.columns and 'game_pk' not in df.columns:
-        df['game_pk'] = df['game_id']  # Create temporary alias for cross-validation grouping
-        logger.info("Using game_id for cross-validation grouping")
+    # NOTE: Do NOT create MLB-era aliases like `game_pk` in the NFL pipeline.
+    # Grouping is handled by the caller via `group_col`/`groups_series`.
+    if 'game_id' in df.columns:
+        logger.info("Loaded feature matrix with NFL group column game_id")
+    elif 'game_pk' in df.columns:
+        logger.info("Loaded feature matrix with MLB group column game_pk")
+    else:
+        logger.warning("No game_id/game_pk column present in loaded feature matrix.")
     
     logger.info(f"Loaded {len(df)} records.")
     df = _augment_injury_signals(df)

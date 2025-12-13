@@ -20,6 +20,7 @@ __all__ = [
     "add_rolling_snap_features",
     "add_expected_snap_features",
     "add_role_stability_features",
+    "add_market_odds_flag",
     "add_snap_features",
 ]
 
@@ -89,9 +90,19 @@ def add_expected_snap_features(df: pl.DataFrame) -> pl.DataFrame:
     This converts relative snap % to absolute expected snaps.
     Key insight: FBs have 22% snap rate but only ~14 actual snaps
     because their team only uses them for specific situations.
+    
+    PARITY: If expected_snaps features already exist with values, skip computation.
     """
     expected_snaps_cols = {"team_ctx_offensive_plays_l3", "snap_offense_pct_l3"}
     if not expected_snaps_cols.issubset(set(df.columns)):
+        return df
+    
+    cols = set(df.columns)
+    
+    # PARITY: Skip if expected_snaps features already exist with values
+    if ("expected_snaps_l3" in cols and 
+        df.filter(pl.col("expected_snaps_l3").is_not_null()).height > 0):
+        logger.debug("Skipping expected snap feature computation - already present")
         return df
     
     logger.info("Adding expected snaps features...")
@@ -99,21 +110,23 @@ def add_expected_snap_features(df: pl.DataFrame) -> pl.DataFrame:
     exprs = []
     
     # Expected total snaps = team plays * player snap %
-    exprs.append(
-        (pl.col("team_ctx_offensive_plays_l3") * pl.col("snap_offense_pct_l3"))
-        .fill_null(0.0)
-        .cast(pl.Float32)
-        .alias("expected_snaps_l3")
-    )
-    
-    # Also add previous game version
-    if {"team_ctx_offensive_plays_prev", "snap_offense_pct_prev"} <= set(df.columns):
+    if "expected_snaps_l3" not in cols:
         exprs.append(
-            (pl.col("team_ctx_offensive_plays_prev") * pl.col("snap_offense_pct_prev"))
+            (pl.col("team_ctx_offensive_plays_l3") * pl.col("snap_offense_pct_l3"))
             .fill_null(0.0)
             .cast(pl.Float32)
-            .alias("expected_snaps_prev")
+            .alias("expected_snaps_l3")
         )
+    
+    # Also add previous game version
+    if {"team_ctx_offensive_plays_prev", "snap_offense_pct_prev"} <= cols:
+        if "expected_snaps_prev" not in cols:
+            exprs.append(
+                (pl.col("team_ctx_offensive_plays_prev") * pl.col("snap_offense_pct_prev"))
+                .fill_null(0.0)
+                .cast(pl.Float32)
+                .alias("expected_snaps_prev")
+            )
     
     # Expected red zone snaps
     rz_cols = {"team_ctx_offensive_plays_l3", "team_ctx_red_zone_play_rate_l3", 

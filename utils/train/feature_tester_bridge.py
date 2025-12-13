@@ -173,7 +173,9 @@ def _prepare_design_matrices(
         for _c in obj_cols:
             X_train[_c] = X_train[_c].astype("category")
 
-    groups = pd.factorize(df_train["game_pk"])[0]
+    # NFL uses `game_id`; MLB legacy uses `game_pk`.
+    group_col = "game_id" if "game_id" in df_train.columns else "game_pk"
+    groups = pd.factorize(df_train[group_col])[0]
     return X_train, y_train, groups
 
 # ─────────────────────────────────────────────────────────────────────────────

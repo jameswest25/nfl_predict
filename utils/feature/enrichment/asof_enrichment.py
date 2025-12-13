@@ -246,7 +246,7 @@ def load_and_build_asof_metadata(
     Returns:
         As-of metadata dataframe
     """
-    from utils.feature.asof_metadata import build_asof_metadata, load_asof_metadata
+    from utils.feature.enrichment.asof_metadata import build_asof_metadata, load_asof_metadata
     
     asof_meta = pl.DataFrame()
     

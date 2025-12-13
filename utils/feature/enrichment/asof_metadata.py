@@ -8,8 +8,8 @@ from typing import Iterable, Sequence
 import pandas as pd
 import polars as pl
 
-from utils.feature.asof import decision_cutoff_hours_for_season_type, fallback_cutoff_hours
-from utils.feature.odds import NFL_ODDS_COLUMNS
+from utils.feature.enrichment.asof import decision_cutoff_hours_for_season_type, fallback_cutoff_hours
+from utils.feature.enrichment.odds import NFL_ODDS_COLUMNS
 from utils.general.paths import (
     ASOF_METADATA_PATH,
     ODDS_SNAPSHOT_DIR,

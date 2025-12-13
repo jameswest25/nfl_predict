@@ -77,7 +77,7 @@ from utils.train.tuning import (
 from utils.train.seed import deterministic_seed, set_global_seed
 from utils.train.run_manifest import make_run_id, write_manifest
 from utils.train.team_total import TeamTotalAdjustedClassifier, TeamTotalConfig
-from utils.feature.asof import decision_cutoff_override, fallback_cutoff_hours, get_decision_cutoff_hours
+from utils.feature.enrichment.asof import decision_cutoff_override, fallback_cutoff_hours, get_decision_cutoff_hours
 from utils.collect.espn_injuries import collect_espn_injuries
 from utils.general.constants import format_cutoff_label
 
@@ -100,8 +100,8 @@ from utils.train.conformal_composite import (
     fit_team_conformal_sums,
     composite_sum_interval,
 )
-from utils.feature.leak_guard import DEFAULT_LEAK_POLICY, enforce_leak_guard
-from utils.feature.targets import require_target_column
+from utils.feature.core.leak_guard import DEFAULT_LEAK_POLICY, enforce_leak_guard
+from utils.feature.core.targets import require_target_column
 
 # Ignore specific, noisy warnings from dependencies
 warnings.filterwarnings(
@@ -280,7 +280,10 @@ class ModelTrainer:
         self._sample_weights: dict[str, dict[str, pd.Series]] = {}
         self._team_total_config: dict[str, TeamTotalConfig] = {}
         self.datetime_features: dict[str, list[str]] = {}
-        self._oof_preds_store = {}       # Store OOF predictions for stacking leakage prevention
+        self._oof_preds_store = {}       # Store GLOBAL OOF predictions for stacking leakage prevention
+        self._oof_preds_store_moe = {}   # Store MoE OOF predictions (per-position) for stacking
+        self._oof_keys_store = {}        # Store key frames aligned to OOF arrays (for merge-based injection)
+        self._best_thresholds: dict[str, float] = {}  # problem_name -> best decision threshold (GLOBAL)
         self._player_game_actuals: pd.DataFrame | None = None
 
 
@@ -303,11 +306,26 @@ class ModelTrainer:
         # Format: {problem_name: {"data": DataFrame, "keys": [cols...]}}
         self.problem_predictions: dict[str, dict[str, object]] = {}
 
+        # Which upstream problems are used as stack inputs anywhere downstream.
+        self._stack_input_problems: set[str] = set()
+        try:
+            for p in (self.problems or []):
+                for ip in (p.get("input_predictions") or []):
+                    self._stack_input_problems.add(str(ip))
+        except Exception:
+            self._stack_input_problems = set()
+
         # ==========================================================================
         # MoE (Mixture of Experts) Configuration
         # ==========================================================================
         # model_architecture: "global", "moe", or "both"
         self.model_architecture = self.config.get('training', {}).get('model_architecture', 'global')
+        if "model_architecture" in overrides and overrides["model_architecture"]:
+            self.model_architecture = str(overrides["model_architecture"])
+            try:
+                self.config.setdefault("training", {})["model_architecture"] = self.model_architecture
+            except Exception:
+                pass
         self.moe_position_groups = self.config.get('training', {}).get('moe_position_groups', ['RB', 'WR', 'TE', 'QB'])
         self.moe_models: dict[str, dict[str, object]] = {}  # {problem_name: {position: model}}
         self.moe_comparison_results: dict[str, dict] = {}  # Store comparison metrics
@@ -526,6 +544,7 @@ class ModelTrainer:
         df_train: pd.DataFrame,
         df_test: pd.DataFrame,
         sample_weight: pd.Series | None,
+        feature_columns_override: list[str] | None = None,
     ) -> dict[str, object]:
         """
         Train per-position MoE models for a single problem.
@@ -544,7 +563,14 @@ class ModelTrainer:
         position_models = {}
         position_metrics = {}
         
+        per_pos_cfg = problem_config.get("per_position_training", {}) or {}
+        allowed_positions = per_pos_cfg.get("positions", self.moe_position_groups)
+        min_rows = int(per_pos_cfg.get("min_rows", 50) or 50)
+        fallback_position = str(per_pos_cfg.get("fallback_position", "WR") or "WR").upper()
+
         for pos in self.moe_position_groups:
+            if allowed_positions and pos not in allowed_positions:
+                continue
             # Create masks for this position
             train_mask = (df_train["position_group"] == pos).values
             test_mask = (df_test["position_group"] == pos).values
@@ -552,14 +578,21 @@ class ModelTrainer:
             n_train = train_mask.sum()
             n_test = test_mask.sum()
             
-            if n_train < 50:
-                logger.warning(f"[MoE] Skipping {pos} for {problem_name}: only {n_train} training samples")
+            if n_train < min_rows:
+                logger.warning(
+                    f"[MoE] Skipping {pos} for {problem_name}: only {n_train} training samples "
+                    f"(min_rows={min_rows})"
+                )
                 continue
             
             logger.info(f"[MoE] Training {problem_name}.{pos}: {n_train} train, {n_test} test samples")
             
             # Subset data
             X_train_pos = X_train.loc[train_mask].copy()
+            if X_train_pos.columns.duplicated().any():
+                dupes = X_train_pos.columns[X_train_pos.columns.duplicated()].tolist()
+                logger.warning("[MoE] Duplicate feature columns detected for %s.%s (deduping): %s", problem_name, pos, dupes)
+                X_train_pos = X_train_pos.loc[:, ~X_train_pos.columns.duplicated()].copy()
             y_train_pos = y_train.loc[train_mask].copy()
             sw_pos = sample_weight.loc[train_mask] if sample_weight is not None else None
             
@@ -567,12 +600,47 @@ class ModelTrainer:
             for col in X_train_pos.columns:
                 if X_train_pos[col].dtype.name == 'category':
                     X_train_pos[col] = X_train_pos[col].cat.codes
+                elif is_datetime64_any_dtype(X_train_pos[col]):
+                    col_as_dt = pd.to_datetime(X_train_pos[col], utc=True, errors="coerce")
+                    numeric = col_as_dt.astype("int64", copy=False).astype("float64")
+                    numeric[col_as_dt.isna().to_numpy()] = np.nan
+                    X_train_pos[col] = numeric / 1_000_000.0
                 elif X_train_pos[col].dtype == 'object':
                     X_train_pos[col] = pd.to_numeric(X_train_pos[col], errors='coerce')
-            X_train_pos = X_train_pos.fillna(0)
+            # IMPORTANT: do NOT fill missing values with 0. XGBoost handles missing values.
             
-            # Get model parameters from config
+            # Get model parameters for MoE
+            # Use config defaults, then apply light regularization for smaller datasets.
+            # Analysis found that RB/TE prediction is dominated by general features 
+            # (snap_offense_pct_prev, is_inactive), so position-specific models 
+            # struggle to outperform Global without MUCH more data.
             xgb_params = self.config.get("xgboost", {}).copy()
+            
+            # Light regularization to prevent overfitting on smaller per-position data
+            xgb_params["n_estimators"] = 250
+            xgb_params["max_depth"] = 5
+            xgb_params["learning_rate"] = 0.05
+            xgb_params["min_child_weight"] = 5
+            xgb_params["subsample"] = 0.8
+            xgb_params["colsample_bytree"] = 0.8
+
+            # For hard-to-generalize usage/efficiency regressions, apply extra regularization
+            hard_regression = {
+                "usage_target_yards",
+                "efficiency_rec_yards_air",
+                "efficiency_rec_yards_yac",
+                "efficiency_rush_yards",
+                "usage_carries",
+            }
+            if task_type == "regression" and problem_name in hard_regression:
+                xgb_params["n_estimators"] = 300
+                xgb_params["max_depth"] = 3
+                xgb_params["learning_rate"] = 0.05
+                xgb_params["min_child_weight"] = 8
+                xgb_params["subsample"] = 0.7
+                xgb_params["colsample_bytree"] = 0.7
+                xgb_params["reg_alpha"] = xgb_params.get("reg_alpha", 0) + 0.2
+                xgb_params["reg_lambda"] = xgb_params.get("reg_lambda", 1) * 2
             
             # Adjust objective based on task type
             if task_type == "regression":
@@ -609,15 +677,24 @@ class ModelTrainer:
             # Compute test metrics for this position
             if n_test >= 10:
                 X_test_pos = X_test.loc[test_mask].copy()
+                if X_test_pos.columns.duplicated().any():
+                    dupes = X_test_pos.columns[X_test_pos.columns.duplicated()].tolist()
+                    logger.warning("[MoE] Duplicate feature columns detected for %s.%s test slice (deduping): %s", problem_name, pos, dupes)
+                    X_test_pos = X_test_pos.loc[:, ~X_test_pos.columns.duplicated()].copy()
                 y_test_pos = y_test.loc[test_mask].copy()
                 
                 # Convert categorical columns to numeric for XGBoost
                 for col in X_test_pos.columns:
                     if X_test_pos[col].dtype.name == 'category':
                         X_test_pos[col] = X_test_pos[col].cat.codes
+                    elif is_datetime64_any_dtype(X_test_pos[col]):
+                        col_as_dt = pd.to_datetime(X_test_pos[col], utc=True, errors="coerce")
+                        numeric = col_as_dt.astype("int64", copy=False).astype("float64")
+                        numeric[col_as_dt.isna().to_numpy()] = np.nan
+                        X_test_pos[col] = numeric / 1_000_000.0
                     elif X_test_pos[col].dtype == 'object':
                         X_test_pos[col] = pd.to_numeric(X_test_pos[col], errors='coerce')
-                X_test_pos = X_test_pos.fillna(0)
+                # IMPORTANT: do NOT fill missing values with 0. XGBoost handles missing values.
                 
                 if task_type == "regression":
                     preds_pos = model.predict(X_test_pos)
@@ -642,7 +719,12 @@ class ModelTrainer:
         self.moe_models[problem_name] = position_models
         
         # Save MoE models to disk
-        self._save_moe_models(problem_name, position_models)
+        self._save_moe_models(
+            problem_name,
+            position_models,
+            fallback_position=fallback_position,
+            feature_columns_override=feature_columns_override,
+        )
         
         # Store comparison metrics
         self.moe_comparison_results[problem_name] = {
@@ -652,7 +734,13 @@ class ModelTrainer:
         
         return position_models
     
-    def _save_moe_models(self, problem_name: str, position_models: dict[str, object]) -> None:
+    def _save_moe_models(
+        self,
+        problem_name: str,
+        position_models: dict[str, object],
+        fallback_position: str = "WR",
+        feature_columns_override: list[str] | None = None,
+    ) -> None:
         """Save MoE models to disk with position-specific filenames."""
         problem_dir = self.model_dir / problem_name / "xgboost"
         problem_dir.mkdir(parents=True, exist_ok=True)
@@ -664,13 +752,33 @@ class ModelTrainer:
         
         # Also save MoE inference artifacts
         moe_artifacts = {
-            "feature_columns": list(self.feature_columns) if self.feature_columns else [],
+            "feature_columns": (
+                list(feature_columns_override)
+                if feature_columns_override is not None
+                else (list(self.feature_columns) if self.feature_columns else [])
+            ),
             "positions": list(position_models.keys()),
-            "fallback_position": "WR",  # Default fallback
+            "fallback_position": fallback_position,  # From config
         }
-        artifacts_path = self.model_dir / f"inference_artifacts_{problem_name}_moe.joblib"
+        # Horizon-safe legacy artifact name (avoid mixing cutoffs).
+        cutoff_label = getattr(self, "cutoff_label", "default")
+        legacy_name = (
+            f"inference_artifacts_{problem_name}_moe_{cutoff_label}.joblib"
+            if cutoff_label != "default"
+            else f"inference_artifacts_{problem_name}_moe.joblib"
+        )
+        artifacts_path = self.model_dir / legacy_name
         joblib.dump(moe_artifacts, artifacts_path)
         logger.info(f"[MoE] Saved inference artifacts to {artifacts_path}")
+
+        # Also save a versioned copy under the run directory for robust discovery.
+        try:
+            v_dir = _vdir(self, problem_name, None, "artifacts") / "inference"
+            v_dir.mkdir(parents=True, exist_ok=True)
+            v_path = v_dir / legacy_name
+            joblib.dump(moe_artifacts, v_path)
+        except Exception:
+            pass
     
     def _predict_with_moe(
         self,
@@ -709,9 +817,14 @@ class ModelTrainer:
             for col in X_pos.columns:
                 if X_pos[col].dtype.name == 'category':
                     X_pos[col] = X_pos[col].cat.codes
+                elif is_datetime64_any_dtype(X_pos[col]):
+                    col_as_dt = pd.to_datetime(X_pos[col], utc=True, errors="coerce")
+                    numeric = col_as_dt.astype("int64", copy=False).astype("float64")
+                    numeric[col_as_dt.isna().to_numpy()] = np.nan
+                    X_pos[col] = numeric / 1_000_000.0
                 elif X_pos[col].dtype == 'object':
                     X_pos[col] = pd.to_numeric(X_pos[col], errors='coerce')
-            X_pos = X_pos.fillna(0)
+            # IMPORTANT: do NOT fill missing values with 0. XGBoost handles missing values.
             
             if hasattr(model, "predict_proba"):
                 pos_preds = model.predict_proba(X_pos)
@@ -734,9 +847,14 @@ class ModelTrainer:
             for col in X_fallback.columns:
                 if X_fallback[col].dtype.name == 'category':
                     X_fallback[col] = X_fallback[col].cat.codes
+                elif is_datetime64_any_dtype(X_fallback[col]):
+                    col_as_dt = pd.to_datetime(X_fallback[col], utc=True, errors="coerce")
+                    numeric = col_as_dt.astype("int64", copy=False).astype("float64")
+                    numeric[col_as_dt.isna().to_numpy()] = np.nan
+                    X_fallback[col] = numeric / 1_000_000.0
                 elif X_fallback[col].dtype == 'object':
                     X_fallback[col] = pd.to_numeric(X_fallback[col], errors='coerce')
-            X_fallback = X_fallback.fillna(0)
+            # IMPORTANT: do NOT fill missing values with 0. XGBoost handles missing values.
             
             if hasattr(fallback_model, "predict_proba"):
                 fallback_preds = fallback_model.predict_proba(X_fallback)
@@ -2395,6 +2513,215 @@ class ModelTrainer:
             
         return oof_preds
 
+    def _generate_oof_predictions_moe(
+        self,
+        problem_config: dict,
+        X: pd.DataFrame,
+        y: pd.Series,
+        df_raw: pd.DataFrame,
+        groups_series: pd.Series,
+        sample_weight: pd.Series | None = None,
+    ) -> np.ndarray:
+        """
+        Generate leak-safe Out-of-Fold predictions for MoE (Mixture-of-Experts) models.
+
+        This mirrors inference-time MoE routing:
+        - Train one model per position_group (RB/WR/TE/QB) on each fold's training slice.
+        - Predict on the corresponding fold validation slice.
+        - For any rows whose position_group is not trained, use the configured fallback_position.
+
+        Returns an array aligned to X (train+val frame), containing OOF predictions.
+        """
+        if groups_series is None:
+            raise ValueError("groups_series is required for MoE purged OOF generation.")
+        if df_raw is None or df_raw.empty:
+            raise ValueError("df_raw is required for MoE purged OOF generation.")
+
+        problem_name = problem_config["name"]
+        per_pos_cfg = problem_config.get("per_position_training", {}) or {}
+        if not per_pos_cfg.get("enabled"):
+            raise ValueError(f"Requested MoE OOF for {problem_name}, but per_position_training is not enabled.")
+
+        task_type = str(problem_config.get("task_type", "")).lower()
+        is_cls = task_type in {"classification", "binary", "multiclass"}
+
+        allowed_positions = [str(p).upper() for p in (per_pos_cfg.get("positions") or self.moe_position_groups)]
+        fallback_pos = str(per_pos_cfg.get("fallback_position", "WR") or "WR").upper()
+        min_rows = int(per_pos_cfg.get("min_rows", 50) or 50)
+
+        # Ensure position_group exists/aligned
+        df_raw = self._add_position_group(df_raw)
+        if "position_group" not in df_raw.columns:
+            raise ValueError(f"Could not derive position_group for MoE OOF on {problem_name}.")
+        position_groups = df_raw["position_group"].astype(str)
+
+        n_splits = int(self.config["data_split"].get("n_splits", 5))
+        embargo_days = int(self.config["data_split"].get("group_gap", self.config["data_split"].get("embargo_td", 0) or 0))
+        df_full = self._train_full_frames.get(problem_name)
+        group_gap = self._convert_embargo_days_to_group_gap(df_full, groups_series, embargo_days)
+        max_train = self.config["data_split"].get("max_train_group_size", np.inf)
+        max_test = self.config["data_split"].get("max_test_group_size", np.inf)
+
+        splitter = PurgedGroupTimeSeriesSplit(
+            n_splits=n_splits,
+            group_gap=group_gap,
+            max_train_group_size=max_train if max_train is not None else np.inf,
+            max_test_group_size=max_test if max_test is not None else np.inf,
+        )
+        groups_aligned = groups_series.loc[X.index].to_numpy()
+        dummy_X = np.zeros((len(X), 1), dtype=np.int8)
+
+        logger.info(
+            "Generating purged MoE OOF predictions for %s (n_splits=%d, embargo_days=%d, group_gap=%d, min_rows=%d, fallback=%s)...",
+            problem_name,
+            n_splits,
+            embargo_days,
+            group_gap,
+            min_rows,
+            fallback_pos,
+        )
+
+        oof_preds = np.full(len(X), np.nan, dtype=np.float32)
+
+        def _prep_matrix(frame: pd.DataFrame) -> pd.DataFrame:
+            out = frame.copy()
+            for col in out.columns:
+                if out[col].dtype.name == "category":
+                    out[col] = out[col].cat.codes
+                elif out[col].dtype == "object":
+                    out[col] = pd.to_numeric(out[col], errors="coerce")
+            # IMPORTANT: do NOT fillna(0) – XGBoost handles missing values.
+            return out
+
+        def _make_xgb_model() -> object:
+            # Mirror _train_moe_models parameterization
+            xgb_params = self.config.get("xgboost", {}).copy()
+            # Light regularization defaults for MoE
+            xgb_params["n_estimators"] = 250
+            xgb_params["max_depth"] = 5
+            xgb_params["learning_rate"] = 0.05
+            xgb_params["min_child_weight"] = 5
+            xgb_params["subsample"] = 0.8
+            xgb_params["colsample_bytree"] = 0.8
+
+            hard_regression = {
+                "usage_target_yards",
+                "efficiency_rec_yards_air",
+                "efficiency_rec_yards_yac",
+                "efficiency_rush_yards",
+                "usage_carries",
+            }
+            if (not is_cls) and problem_name in hard_regression:
+                xgb_params["n_estimators"] = 300
+                xgb_params["max_depth"] = 3
+                xgb_params["learning_rate"] = 0.05
+                xgb_params["min_child_weight"] = 8
+                xgb_params["subsample"] = 0.7
+                xgb_params["colsample_bytree"] = 0.7
+                xgb_params["reg_alpha"] = xgb_params.get("reg_alpha", 0) + 0.2
+                xgb_params["reg_lambda"] = xgb_params.get("reg_lambda", 1) * 2
+
+            if is_cls:
+                xgb_params["objective"] = "binary:logistic"
+                xgb_params["eval_metric"] = "auc"
+                return xgb.XGBClassifier(
+                    **{k: v for k, v in xgb_params.items() if k not in ("objective", "eval_metric")},
+                    objective=xgb_params.get("objective", "binary:logistic"),
+                    eval_metric=xgb_params.get("eval_metric", "auc"),
+                    random_state=self.base_seed,
+                    n_jobs=-1,
+                    use_label_encoder=False,
+                )
+            xgb_params["objective"] = "reg:squarederror"
+            xgb_params.pop("eval_metric", None)
+            return xgb.XGBRegressor(
+                **{k: v for k, v in xgb_params.items() if k not in ("objective", "eval_metric")},
+                objective=xgb_params.get("objective", "reg:squarederror"),
+                random_state=self.base_seed,
+                n_jobs=-1,
+            )
+
+        for fold, (train_idx, val_idx) in enumerate(splitter.split(dummy_X, groups=groups_aligned)):
+            # train/val masks in full index space
+            train_mask_all = np.zeros(len(X), dtype=bool)
+            val_mask_all = np.zeros(len(X), dtype=bool)
+            train_mask_all[train_idx] = True
+            val_mask_all[val_idx] = True
+
+            # Fit per-position models and predict their own val slices.
+            trained_models: dict[str, object] = {}
+
+            for pos in allowed_positions:
+                pos_train_mask = train_mask_all & (position_groups == pos).to_numpy()
+                pos_val_mask = val_mask_all & (position_groups == pos).to_numpy()
+                if pos_val_mask.sum() == 0:
+                    continue
+                if int(pos_train_mask.sum()) < min_rows:
+                    logger.warning(
+                        "MoE OOF cannot train %s.%s for fold %d: train_rows=%d < min_rows=%d (val_rows=%d). "
+                        "Leaving these OOF predictions as NaN; downstream stacked training will drop them.",
+                        problem_name,
+                        pos,
+                        fold + 1,
+                        int(pos_train_mask.sum()),
+                        min_rows,
+                        int(pos_val_mask.sum()),
+                    )
+                    continue
+
+                model = _make_xgb_model()
+                X_tr = _prep_matrix(X.loc[pos_train_mask])
+                y_tr = y.loc[pos_train_mask]
+                sw_tr = sample_weight.loc[pos_train_mask] if sample_weight is not None else None
+                fit_kwargs = {"sample_weight": sw_tr} if sw_tr is not None else {}
+                model.fit(X_tr, y_tr, **fit_kwargs)
+                trained_models[pos] = model
+
+                X_val = _prep_matrix(X.loc[pos_val_mask])
+                if is_cls and hasattr(model, "predict_proba"):
+                    p = model.predict_proba(X_val)[:, 1]
+                else:
+                    p = model.predict(X_val)
+                oof_preds[pos_val_mask] = np.asarray(p, dtype=np.float32)
+
+            # Predict fallback for any val rows not covered by trained positions
+            unknown_val_mask = val_mask_all & (~position_groups.isin(allowed_positions)).to_numpy()
+            if int(unknown_val_mask.sum()) > 0:
+                if fallback_pos not in trained_models:
+                    # Train fallback model on its own training slice (fold train only)
+                    fb_train_mask = train_mask_all & (position_groups == fallback_pos).to_numpy()
+                    if int(fb_train_mask.sum()) < min_rows:
+                        logger.warning(
+                            "MoE OOF cannot train fallback %s.%s for fold %d: train_rows=%d < min_rows=%d (unknown_val_rows=%d). "
+                            "Leaving these OOF predictions as NaN; downstream stacked training will drop them.",
+                            problem_name,
+                            fallback_pos,
+                            fold + 1,
+                            int(fb_train_mask.sum()),
+                            min_rows,
+                            int(unknown_val_mask.sum()),
+                        )
+                        continue
+                    fb_model = _make_xgb_model()
+                    X_tr = _prep_matrix(X.loc[fb_train_mask])
+                    y_tr = y.loc[fb_train_mask]
+                    sw_tr = sample_weight.loc[fb_train_mask] if sample_weight is not None else None
+                    fit_kwargs = {"sample_weight": sw_tr} if sw_tr is not None else {}
+                    fb_model.fit(X_tr, y_tr, **fit_kwargs)
+                    trained_models[fallback_pos] = fb_model
+
+                fb_model = trained_models[fallback_pos]
+                X_val = _prep_matrix(X.loc[unknown_val_mask])
+                if is_cls and hasattr(fb_model, "predict_proba"):
+                    p = fb_model.predict_proba(X_val)[:, 1]
+                else:
+                    p = fb_model.predict(X_val)
+                oof_preds[unknown_val_mask] = np.asarray(p, dtype=np.float32)
+
+            logger.info("  MoE OOF fold %d/%d complete. Val size: %d", fold + 1, n_splits, int(val_mask_all.sum()))
+
+        return oof_preds
+
     def train_and_evaluate_models(
         self,
         problem_config,
@@ -2438,6 +2765,17 @@ class ModelTrainer:
             # Must be done BEFORE any 'continue' statements
             if name == 'xgboost':
                 groups_full_series = self._groups_index_map.get(problem_name)
+                # Always store key frame aligned to X_train_full for merge-based OOF injection.
+                df_train_full = self._train_full_frames.get(problem_name)
+                if df_train_full is None or df_train_full.empty:
+                    raise ValueError(f"Missing train_full frame required for OOF generation ({problem_name}).")
+                key_candidates = ["game_id", "player_id", "season", "week", "team", "position"]
+                key_cols = [c for c in key_candidates if c in df_train_full.columns]
+                if not key_cols:
+                    raise ValueError(f"No key columns available for OOF injection ({problem_name}).")
+                self._oof_keys_store[problem_name] = df_train_full[key_cols].copy()
+
+                # GLOBAL OOF (required for leak-safe stacking inputs)
                 try:
                     oof_preds = self._generate_oof_predictions(
                         name,
@@ -2449,7 +2787,27 @@ class ModelTrainer:
                     )
                     self._oof_preds_store[problem_name] = oof_preds
                 except Exception as e:
-                    logger.warning(f"Failed to generate OOF predictions for {problem_name}: {e}")
+                    if problem_name in self._stack_input_problems:
+                        raise
+                    logger.warning("Failed to generate GLOBAL OOF predictions for %s: %s", problem_name, e)
+
+                # MoE OOF (required to build a real MoE stacked branch)
+                per_pos_cfg = problem_config.get("per_position_training", {}) or {}
+                if self.model_architecture in ("moe", "both") and per_pos_cfg.get("enabled"):
+                    try:
+                        oof_moe = self._generate_oof_predictions_moe(
+                            problem_config=problem_config,
+                            X=X_train_full,
+                            y=y_train_full,
+                            df_raw=df_train_full,
+                            groups_series=groups_full_series,
+                            sample_weight=sample_weight_train_full,
+                        )
+                        self._oof_preds_store_moe[problem_name] = oof_moe
+                    except Exception as e:
+                        if problem_name in self._stack_input_problems:
+                            raise
+                        logger.warning("Failed to generate MoE OOF predictions for %s: %s", problem_name, e)
 
 
             # In production mode df_test is empty; skip evaluation to avoid errors.
@@ -2735,7 +3093,8 @@ class ModelTrainer:
                             y_hat_cal_for_store = model.predict(X_cal)
                             
                             # Attach team meta for these rows (if available)
-                            meta_cols = ["game_pk", "away_team_abbr", "home_team_abbr", "inning_topbot", self.time_col]
+                            # NFL-first meta (MLB columns are not required and should not be assumed).
+                            meta_cols = [self.group_col, "home_team", "away_team", "team", "opponent", self.time_col]
                             meta_df = None
                             try:
                                 base_df = self._train_full_frames.get(problem_name)
@@ -2968,7 +3327,8 @@ class ModelTrainer:
                         y_hat_cal_for_store = model.predict(X_cal)  # uses mean-calibrated model if enabled
                         
                         # Attach team meta for these rows (if available)
-                        meta_cols = ["game_pk", "away_team_abbr", "home_team_abbr", "inning_topbot", self.time_col]
+                        # NFL-first meta (MLB columns are not required and should not be assumed).
+                        meta_cols = [self.group_col, "home_team", "away_team", "team", "opponent", self.time_col]
                         meta_df = None
                         try:
                             base_df = self._train_full_frames.get(problem_name)
@@ -3079,6 +3439,13 @@ class ModelTrainer:
                 model, X_cal, y_cal, calibration_enabled, calibration_method_cfg, thresh_cfg, groups_cal=groups_cal, problem_config=problem_config
             )
             self.models[params_key] = final_model
+
+            # Keep the best decision threshold around for MoE holdout evaluation parity.
+            try:
+                if best_thresh is not None and math.isfinite(float(best_thresh)):
+                    self._best_thresholds[problem_name] = float(best_thresh)
+            except Exception:
+                pass
 
             if is_classification(problem_config):
                 final_model = self._maybe_wrap_team_total_adjuster(problem_name, final_model)
@@ -3521,7 +3888,16 @@ class ModelTrainer:
             
             # --- Artifact Caching & "Golden" Feature List Creation ---
             use_cached_for_problem = self.config['training'].get('use_cached_artifacts', True)
+            # Horizon-safe artifact caching:
+            # Prefer cutoff-suffixed artifacts (prevents mixing horizons in legacy paths).
             artifact_path = self.model_dir / f"inference_artifacts_{problem_name}.joblib"
+            try:
+                if getattr(self, "cutoff_label", "default") != "default":
+                    suffixed = self.model_dir / f"inference_artifacts_{problem_name}_{self.cutoff_label}.joblib"
+                    if suffixed.exists():
+                        artifact_path = suffixed
+            except Exception:
+                pass
             
             if artifact_path.exists() and use_cached_for_problem:
                 logger.info(f"Loading cached inference artifacts for {problem_name} from {artifact_path}...")
@@ -3564,22 +3940,35 @@ class ModelTrainer:
 
             # Determine which columns to load for this problem
             if use_cached_for_problem:
-                needed_cols = list({self.time_col, 'game_pk', *target_load_cols, *self.feature_columns})
+                needed_cols = list({self.time_col, self.group_col, *target_load_cols, *self.feature_columns})
             else:
                 include_prefixes = tuple(problem_copy.get('feature_prefixes_to_include') or [])
                 other_features = problem_copy.get('other_features_to_include') or []
+                feature_blacklist = set(problem_copy.get('feature_blacklist') or [])
                 if all_parquet_cols is None:
                     logger.warning("Parquet schema unavailable; falling back to loading full dataset for this problem.")
                     needed_cols = None
                 else:
                     prefix_features = [col for col in all_parquet_cols if col.startswith(include_prefixes)]
+                    # Never auto-include diagnostic MoE columns from the parquet.
+                    # These are intended for inspection and must not silently become training features.
+                    prefix_features = [c for c in prefix_features if not str(c).endswith("_moe")]
                     prelim_features = sorted(list(set(prefix_features + [c for c in other_features if c in all_parquet_cols])))
+                    if feature_blacklist:
+                        prelim_features = [c for c in prelim_features if c not in feature_blacklist]
                     # Use group_col (game_id) from config
                     needed_cols = list({self.time_col, self.group_col, *target_load_cols, *prelim_features})
             
             # Always ensure player_id is present for prediction tracking/merging
             if "player_id" not in needed_cols:
                 needed_cols.append("player_id")
+
+            # Ensure `position` is available for MoE routing even if it is not a model feature.
+            # (Per-position training uses position_group derived from `position`.)
+            per_pos_cfg = problem_copy.get("per_position_training") or {}
+            if per_pos_cfg.get("enabled") and needed_cols is not None:
+                if "position" not in needed_cols and all_parquet_cols is not None and "position" in all_parquet_cols:
+                    needed_cols.append("position")
 
             # Check if this problem requires input predictions from previous problems
             input_preds = problem_copy.get('input_predictions', [])
@@ -3589,11 +3978,8 @@ class ModelTrainer:
                 if "player_id" not in needed_cols:
                     needed_cols.append('player_id')
 
-# 👇 NEW: add team meta columns if present
-            if needed_cols is not None and all_parquet_cols is not None:
-                for _c in ["away_team_abbr", "home_team_abbr", "inning_topbot"]:
-                    if _c in all_parquet_cols:
-                        needed_cols.append(_c)
+            # NOTE: Do not auto-include MLB-only meta columns (away_team_abbr/home_team_abbr/inning_topbot).
+            # NFL meta needed for modeling should be explicitly included via config.
 
             # Load problem-scoped frame with only the required columns
             logger.info(f"Loading problem-scoped columns from Parquet (cols={len(needed_cols) if needed_cols else 'ALL'}) …")
@@ -3606,6 +3992,12 @@ class ModelTrainer:
                 time_col=self.time_col,
                 columns=needed_cols,
             )
+            feature_blacklist = set(problem_copy.get('feature_blacklist') or [])
+            if feature_blacklist:
+                drop_now = list(feature_blacklist & set(df_problem.columns))
+                if drop_now:
+                    logger.info("Dropping %d blacklisted features for %s: %s", len(drop_now), problem_name, drop_now)
+                    df_problem = df_problem.drop(columns=drop_now, errors="ignore")
             if df_problem.columns.duplicated().any():
                 dup_cols = df_problem.columns[df_problem.columns.duplicated()].tolist()
                 logger.warning(f"Duplicate columns detected after load: {dup_cols}")
@@ -3648,13 +4040,31 @@ class ModelTrainer:
                         how='left',
                     )
 
-                    for col in extra_pred_cols:
-                        if df_problem[col].isnull().any():
-                            n_missing = int(df_problem[col].isnull().sum())
-                            logger.warning(f"Missing {n_missing} values for {col} after merge. Filling with mean.")
-                            df_problem[col] = df_problem[col].fillna(df_problem[col].mean())
-
                 df_problem = self._inject_composed_features(df_problem)
+
+                # STRICT STACKING: upstream OOF predictions are not defined for the earliest
+                # time blocks (no prior data to train on without peeking). Those rows must be
+                # excluded from downstream stacked training rather than imputed.
+                required_pred_cols: list[str] = []
+                for pred_name in input_preds:
+                    base = f"pred_{pred_name}"
+                    if base in df_problem.columns:
+                        required_pred_cols.append(base)
+                    moe_col = f"{base}_moe"
+                    if moe_col in df_problem.columns:
+                        required_pred_cols.append(moe_col)
+                required_pred_cols = list(dict.fromkeys(required_pred_cols))
+                if required_pred_cols:
+                    before = len(df_problem)
+                    df_problem = df_problem.dropna(subset=required_pred_cols).reset_index(drop=True)
+                    dropped = before - len(df_problem)
+                    if dropped > 0:
+                        logger.info(
+                            "Dropped %d rows for %s due to missing OOF upstream preds (cols=%s).",
+                            dropped,
+                            problem_name,
+                            required_pred_cols,
+                        )
 
             odds_horizon = problem_copy.get("odds_horizon")
             if odds_horizon:
@@ -3753,9 +4163,16 @@ class ModelTrainer:
             else:
                 df_train_full = (
                     pd.concat([df_train, df_val], ignore_index=True)
-                    .sort_values(self.time_col)
+                    .sort_values(
+                        [self.time_col, self.group_col]
+                        if (self.group_col and self.group_col in df_train.columns)
+                        else [self.time_col]
+                    )
                     .reset_index(drop=True)
                 )
+            # Ensure contiguity of group labels for purged CV / OOF generation.
+            if self.group_col and self.group_col in df_train_full.columns:
+                df_train_full = df_train_full.sort_values([self.time_col, self.group_col]).reset_index(drop=True)
             X_train_full, y_train_full = self._apply_feature_artifacts(df_train_full, problem_name)
             sample_weight_train_full = self._compute_sample_weights(df_train_full, problem_copy)
 
@@ -3798,16 +4215,95 @@ class ModelTrainer:
             # Train MoE models (per-position models)
             if train_moe:
                 logger.info(f"[MoE] Training per-position models for {problem_name}")
+                # For stacked problems, train MoE models on MoE upstream predictions.
+                # We do this by selecting `pred_<upstream>_moe` columns (OOF-injected) as inputs
+                # when available, instead of the GLOBAL `pred_<upstream>` columns.
+                moe_feature_cols_override: list[str] | None = None
+                X_train_full_moe = X_train_full
+                X_test_moe = X_test
+
+                input_preds = problem_copy.get("input_predictions") or []
+                if input_preds:
+                    moe_feature_cols_override = []
+                    missing: list[str] = []
+                    for base in list(self.feature_columns or []):
+                        if base.startswith("pred_"):
+                            # map `pred_snaps` -> `pred_snaps_moe` if snaps is an upstream input
+                            base_name = base.replace("pred_", "", 1)
+                            if base_name in input_preds:
+                                cand = f"pred_{base_name}_moe"
+                                if cand in df_train_full.columns and cand in df_test.columns:
+                                    moe_feature_cols_override.append(cand)
+                                    continue
+                                missing.append(cand)
+                        moe_feature_cols_override.append(base)
+
+                    if missing:
+                        raise ValueError(
+                            f"MoE structured training requested for {problem_name}, but missing MoE upstream inputs: {sorted(set(missing))}"
+                        )
+
+                    X_train_full_moe = df_train_full.reindex(columns=moe_feature_cols_override)
+                    X_test_moe = df_test.reindex(columns=moe_feature_cols_override)
+
                 self._train_moe_models(
                     problem_copy,
-                    X_train_full,
+                    X_train_full_moe,
                     y_train_full,
-                    X_test,
+                    X_test_moe,
                     y_test,
                     df_train_full,
                     df_test,
                     sample_weight_train_full,
+                    feature_columns_override=moe_feature_cols_override,
                 )
+
+                # --- NEW: evaluate MoE models on the same hold-out slice (classification only) ---
+                if is_classification(problem_copy) and problem_name in self.moe_models and not X_test_moe.empty:
+                    try:
+                        moe_probs = self._predict_with_moe(X_test_moe, df_test, problem_name)
+                        y_true = y_test.to_numpy() if hasattr(y_test, "to_numpy") else np.asarray(y_test)
+
+                        thr = float(self._best_thresholds.get(problem_name, 0.5))
+                        moe_pred = (moe_probs >= thr).astype(np.int8)
+
+                        # Some small test windows can have a single class; handle gracefully.
+                        if np.unique(y_true).size >= 2:
+                            moe_auc = float(roc_auc_score(y_true, moe_probs))
+                            try:
+                                moe_pr_auc = float(average_precision_score(y_true, moe_probs))
+                            except Exception:
+                                moe_pr_auc = float("nan")
+                            try:
+                                moe_brier = float(brier_score_loss(y_true, moe_probs))
+                            except Exception:
+                                moe_brier = float("nan")
+                            try:
+                                moe_logloss = float(log_loss(y_true, moe_probs))
+                            except Exception:
+                                moe_logloss = float("nan")
+                        else:
+                            moe_auc = moe_pr_auc = moe_brier = moe_logloss = float("nan")
+
+                        moe_metrics = {
+                            "auc": moe_auc,
+                            "pr_auc": moe_pr_auc,
+                            "brier_score": moe_brier,
+                            "log_loss": moe_logloss,
+                            "precision_at_thresh": float(precision_score(y_true, moe_pred, zero_division=0)),
+                            "recall_at_thresh": float(recall_score(y_true, moe_pred, zero_division=0)),
+                            "decision_threshold": thr,
+                            "n_test": int(len(y_true)),
+                            "note": "MoE hold-out evaluation on same slice as GLOBAL; threshold uses GLOBAL best_thresh when available.",
+                        }
+
+                        out_dir = _vdir(self, problem_name, "xgboost", "metrics")
+                        moe_path = out_dir / "moe_metrics.yaml"
+                        with moe_path.open("w") as fh:
+                            yaml.safe_dump(moe_metrics, fh, sort_keys=False)
+                        logger.info("Saved MoE evaluation report for %s to %s", problem_name, moe_path)
+                    except Exception as e:
+                        logger.warning("Failed to evaluate MoE holdout metrics for %s: %s", problem_name, e)
                 
                 # If both trained, run comparison
                 if train_global and problem_name in self.moe_models:
@@ -3822,14 +4318,25 @@ class ModelTrainer:
                         else:
                             global_preds = global_model.predict(X_test)
                         
+                        # IMPORTANT: If MoE models were trained with a MoE-specific feature schema
+                        # (e.g., using `pred_<upstream>_moe` inputs), we must evaluate MoE using
+                        # the matching X_test_moe matrix. Otherwise XGBoost will throw a
+                        # feature_names mismatch and the comparison is invalid.
+                        X_test_for_moe = X_test_moe if "X_test_moe" in locals() else X_test
+
                         comparison = self._compare_global_vs_moe(
-                            problem_name, X_test, y_test, df_test, global_preds, task_type
+                            problem_name, X_test_for_moe, y_test, df_test, global_preds, task_type
                         )
                         self.moe_comparison_results[problem_name]["comparison"] = comparison
         
         # --- NEW: build composite & team conformal sum artifacts after all problems trained ---
-            # Generate and store predictions for downstream models
-            # Determine which model to use: MoE (if enabled and available) or global
+            # Generate and store predictions for downstream models.
+            #
+            # CRITICAL (stacking integrity):
+            # We only generate leak-safe OOF predictions for the GLOBAL model. Therefore the
+            # canonical stacked inputs `pred_<problem>` must be sourced from the GLOBAL model
+            # (with OOF injection), even if MoE models exist. If MoE predictions are needed for
+            # diagnostics, we persist them separately as `pred_<problem>_moe`.
             primary_model_name = 'xgboost'
             model_key = f"{problem_name}_{primary_model_name}"
             
@@ -3842,8 +4349,11 @@ class ModelTrainer:
             has_global_model = model_key in self.models
             
             if use_moe_for_preds or has_global_model:
-                pred_source = "MoE" if use_moe_for_preds else "Global"
-                logger.info(f"Generating full predictions for {problem_name} using {pred_source} model for downstream consumption...")
+                logger.info(
+                    "Generating full predictions for %s using GLOBAL for stacking%s",
+                    problem_name,
+                    " (also computing MoE diagnostic preds)" if use_moe_for_preds else "",
+                )
                 
                 # We need to apply artifacts to the FULL df_problem to get X_full
                 # Note: df_problem was modified in place (merged with inputs), so it has all cols.
@@ -3857,35 +4367,63 @@ class ModelTrainer:
                     logger.info(f"X_full shape after artifacts: {X_full.shape}")
                     
                     preds = None
-                    
-                    if use_moe_for_preds:
-                        # Use MoE (per-position) models
-                        preds = self._predict_with_moe(X_full, df_problem, problem_name)
-                        logger.info(f"[MoE] Generated {len(preds)} predictions for {problem_name}")
-                    else:
-                        # Use global model
+                    moe_preds = None
+
+                    # Always compute GLOBAL preds for canonical pred_<problem> when available.
+                    if has_global_model:
                         model = self.models[model_key]
-                    base_model = self._unwrap_base_model(model)
-                    
-                    # If it's a pipeline/calibrated classifier, it usually has predict_proba
-                    if hasattr(model, "predict_proba"):
-                         # Passing self.feature_columns to ensure correct column alignment/selection in batching
-                         preds = predict_proba_batched(model, X_full, self.feature_columns, batch_size=10000)
-                         if preds.ndim > 1:
-                             preds = preds[:, 1]
-                    elif hasattr(model, "predict"):
-                         preds = model.predict(X_full)
+                        base_model = self._unwrap_base_model(model)
+                        target_model = base_model if base_model is not None else model
+
+                        # If it's a pipeline/calibrated classifier, it usually has predict_proba
+                        if hasattr(target_model, "predict_proba"):
+                            # Passing self.feature_columns to ensure correct column alignment/selection in batching
+                            preds = predict_proba_batched(target_model, X_full, self.feature_columns, batch_size=10000)
+                            if preds.ndim > 1:
+                                preds = preds[:, 1]
+                        elif hasattr(target_model, "predict"):
+                            preds = target_model.predict(X_full)
+
+                    # Optionally compute MoE preds for diagnostics (NOT used for stacking inputs).
+                    if use_moe_for_preds:
+                        # IMPORTANT: Some MoE models are trained with a MoE-specific feature schema
+                        # (e.g., consuming `pred_<upstream>_moe` inputs). When that's the case, we
+                        # must generate MoE predictions using the matching feature matrix.
+                        if "moe_feature_cols_override" in locals() and moe_feature_cols_override is not None:
+                            X_full_moe = df_problem.reindex(columns=moe_feature_cols_override)
+                            moe_preds = self._predict_with_moe(X_full_moe, df_problem, problem_name)
+                        else:
+                            moe_preds = self._predict_with_moe(X_full, df_problem, problem_name)
+                        logger.info(f"[MoE] Generated {len(moe_preds)} predictions for {problem_name} (diagnostic only)")
                     
                     if preds is not None:
-                        # STACKING FIX: If we have OOF predictions for the training set, overwrite them
-                        if problem_name in self._oof_preds_store:
-                            oof_preds = self._oof_preds_store[problem_name]
-                            n_oof = len(oof_preds)
-                            if n_oof <= len(preds):
-                                logger.info(f"Injecting OOF predictions for {problem_name} (first {n_oof} rows) to prevent stacking leakage.")
-                                preds[:n_oof] = oof_preds
-                            else:
-                                logger.warning(f"OOF predictions length ({n_oof}) exceeds total rows ({len(preds)})! Skipping OOF injection.")
+                        # STACKING FIX: overwrite training rows with OOF predictions using keys (not index length).
+                        # NOTE: GLOBAL OOF is generated for the GLOBAL model only.
+                        if has_global_model and problem_name in self._oof_preds_store and problem_name in self._oof_keys_store:
+                            try:
+                                oof_arr = self._oof_preds_store[problem_name]
+                                oof_keys = self._oof_keys_store[problem_name]
+                                if len(oof_arr) != len(oof_keys):
+                                    raise ValueError("OOF keys/preds length mismatch.")
+                                pred_col = f"pred_{problem_name}"
+                                oof_df = oof_keys.copy()
+                                oof_df["__oof_row__"] = 1
+                                oof_df[pred_col] = oof_arr
+
+                                # merge into df_problem key space, overwrite where present
+                                key_cols = list(oof_keys.columns)
+                                df_keys = df_problem[key_cols].copy()
+                                merged = df_keys.merge(oof_df, on=key_cols, how="left")
+                                mask = (merged["__oof_row__"] == 1).to_numpy()
+                                n_mask = int(mask.sum())
+                                if n_mask > 0:
+                                    logger.info(
+                                        "Injecting GLOBAL OOF predictions for %s (%d/%d rows) via keys to prevent stacking leakage.",
+                                        problem_name, n_mask, len(preds)
+                                    )
+                                    preds[mask] = merged.loc[mask, pred_col].to_numpy(dtype=float)
+                            except Exception as e:
+                                logger.warning("Failed GLOBAL OOF injection via keys for %s: %s", problem_name, e)
 
                         raw_preds = preds.copy()
                         if problem_name == "availability":
@@ -3910,6 +4448,47 @@ class ModelTrainer:
                         # RBs get checkdowns (often negative air yards), cap at 0
                         if problem_name == "efficiency_rec_yards_air":
                             preds = self._apply_efficiency_rec_yards_air_cap(df_problem, preds)
+
+                        # Apply the same post-processing to MoE diagnostic preds (if present),
+                        # and inject MoE OOF via keys (when available).
+                        if moe_preds is not None:
+                            # MoE OOF injection (aligned by keys)
+                            if problem_name in self._oof_preds_store_moe and problem_name in self._oof_keys_store:
+                                try:
+                                    oof_arr = self._oof_preds_store_moe[problem_name]
+                                    oof_keys = self._oof_keys_store[problem_name]
+                                    if len(oof_arr) != len(oof_keys):
+                                        raise ValueError("MoE OOF keys/preds length mismatch.")
+                                    pred_col_moe = f"pred_{problem_name}_moe"
+                                    oof_df = oof_keys.copy()
+                                    oof_df["__oof_row__"] = 1
+                                    oof_df[pred_col_moe] = oof_arr
+                                    key_cols = list(oof_keys.columns)
+                                    df_keys = df_problem[key_cols].copy()
+                                    merged = df_keys.merge(oof_df, on=key_cols, how="left")
+                                    mask = (merged["__oof_row__"] == 1).to_numpy()
+                                    n_mask = int(mask.sum())
+                                    if n_mask > 0:
+                                        logger.info(
+                                            "Injecting MoE OOF predictions for %s (%d/%d rows) via keys.",
+                                            problem_name, n_mask, len(moe_preds)
+                                        )
+                                        moe_preds[mask] = merged.loc[mask, pred_col_moe].to_numpy(dtype=float)
+                                except Exception as e:
+                                    logger.warning("Failed MoE OOF injection via keys for %s: %s", problem_name, e)
+
+                            if problem_name == "availability":
+                                moe_preds = self._apply_availability_guards(df_problem, moe_preds)
+                            if problem_name == "snaps":
+                                moe_preds = self._apply_snaps_ceiling_cap(df_problem, moe_preds)
+                            if problem_name == "usage_targets":
+                                moe_preds = self._apply_usage_targets_position_cap(df_problem, moe_preds)
+                            if problem_name == "usage_carries":
+                                moe_preds = self._apply_usage_carries_position_cap(df_problem, moe_preds)
+                            if problem_name == "usage_target_yards":
+                                moe_preds = self._apply_usage_target_yards_position_cap(df_problem, moe_preds)
+                            if problem_name == "efficiency_rec_yards_air":
+                                moe_preds = self._apply_efficiency_rec_yards_air_cap(df_problem, moe_preds)
                         # Store
                         pred_col = f"pred_{problem_name}"
                         # Ensure we have the keys
@@ -3922,6 +4501,8 @@ class ModelTrainer:
                             out_df[pred_col] = preds
                             if problem_name == "availability":
                                 out_df[f"{pred_col}_raw"] = raw_preds
+                            if moe_preds is not None:
+                                out_df[f"{pred_col}_moe"] = moe_preds
                             before = len(out_df)
                             out_df = out_df.drop_duplicates(subset=key_cols, keep='last')
                             if len(out_df) != before:
@@ -3953,7 +4534,7 @@ class ModelTrainer:
                             if problem_name == "anytime_td_structured":
                                 self._persist_anytime_td_structured_metrics(df_problem, preds)
                     else:
-                         logger.warning(f"Could not generate predictions for {problem_name}: Model has no predict method")
+                        logger.warning(f"Could not generate predictions for {problem_name}: Model has no predict method")
                 except Exception as e:
                     logger.error(f"Failed to generate downstream predictions for {problem_name}: {e}")
 

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import polars as pl
 
-from utils.feature.leak_guard import (
+from utils.feature.core.leak_guard import (
     DEFAULT_LEAK_POLICY,
     enforce_leak_guard,
     evaluate_leak_prone_columns,

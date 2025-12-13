@@ -33,8 +33,23 @@ def compute_historical_catch_rates(df: pl.DataFrame) -> pl.DataFrame:
     - hist_catch_rate_l5: Rolling 5-game catch rate
     - hist_catch_rate_prev: Previous game catch rate
     - hist_targets_count_l3/l5: Target volume for uncertainty estimation
+    
+    Note: If hist_catch_rate_* columns already exist (pre-computed from historical data),
+    they are preserved to maintain parity between training and inference.
     """
     if "reception" not in df.columns or "target" not in df.columns:
+        return df
+    
+    # Check if key historical columns already exist with valid values
+    cols = set(df.columns)
+    already_have_hist = (
+        "hist_catch_rate_l3" in cols and 
+        "hist_catch_rate_l5" in cols and
+        df.filter(pl.col("hist_catch_rate_l3").is_not_null()).height > 0
+    )
+    
+    if already_have_hist:
+        logger.debug("Skipping hist catch rate computation - already present from historical data")
         return df
     
     logger.info("Computing historical catch rate features...")

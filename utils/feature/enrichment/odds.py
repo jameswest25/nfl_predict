@@ -684,7 +684,7 @@ def _compute_game_odds(
     snapshot_ts_map: Dict[str, Optional[pd.Timestamp]] = {}
     
     # Cutoff snapshot
-    from utils.feature.asof import decision_cutoff_hours_default, fallback_cutoff_hours
+    from utils.feature.enrichment.asof import decision_cutoff_hours_default, fallback_cutoff_hours
 
     default_cutoff = decision_cutoff_hours_default()
     cutoff_hours_value = default_cutoff

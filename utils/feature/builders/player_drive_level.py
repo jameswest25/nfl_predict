@@ -20,7 +20,7 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     import_weekly_rosters = None
 
-from utils.feature.stats import PLAYER_DRIVE_STATS
+from utils.feature.rolling.stats import PLAYER_DRIVE_STATS
 from utils.general.paths import PROJ_ROOT
 
 logger = logging.getLogger(__name__)

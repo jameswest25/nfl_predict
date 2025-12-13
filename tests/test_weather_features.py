@@ -1,6 +1,6 @@
 import polars as pl
 
-from utils.feature.weather_features import append_weather_context_flags
+from utils.feature.enrichment.weather_features import append_weather_context_flags
 
 
 def _base_weather_row(**overrides):

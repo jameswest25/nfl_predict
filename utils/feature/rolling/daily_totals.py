@@ -14,7 +14,7 @@ from typing import Callable
 import polars as pl
 import logging
 
-from utils.feature.stats import NFL_PLAYER_STATS
+from utils.feature.rolling.stats import NFL_PLAYER_STATS
 
 logger = logging.getLogger(__name__)
 

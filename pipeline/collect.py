@@ -43,7 +43,7 @@ from utils.collect import (
     collect_weather_forecasts,
 )
 from utils.collect.audit import run_collect_audit
-from utils.feature.odds import collect_odds_snapshots
+from utils.feature.enrichment.odds import collect_odds_snapshots
 
 # Module logger
 logger = logging.getLogger(__name__)

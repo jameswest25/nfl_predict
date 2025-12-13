@@ -49,8 +49,13 @@ def save_inference_artifacts(trainer, problem_name: str, problem_config: dict | 
     v_dir = _vdir(trainer, problem_name, None, "artifacts") / "inference"
     v_dir.mkdir(parents=True, exist_ok=True)
     v_path = v_dir / f"inference_artifacts_{problem_name}.joblib"
-    # Legacy artifact path (loader in train.py reads this)
-    legacy = trainer.paths.model_dir / f"inference_artifacts_{problem_name}.joblib"
+    # Legacy artifact path (kept for BC, but MUST be horizon-safe).
+    cutoff_label = getattr(trainer, "cutoff_label", "default")
+    legacy = (
+        trainer.paths.model_dir / f"inference_artifacts_{problem_name}_{cutoff_label}.joblib"
+        if cutoff_label != "default"
+        else trainer.paths.model_dir / f"inference_artifacts_{problem_name}.joblib"
+    )
     task_type = None
     output_mode = None
     if problem_config:
@@ -84,9 +89,18 @@ def save_model_and_metrics(trainer, problem_name: str, model_name: str, metrics:
     model_path_v = v_models / f"model.joblib"
     metrics_path_v = v_metrics / f"metrics.yaml"
 
-    # Legacy paths (kept for BC with any external scripts)
-    legacy_model = trainer.paths.model_dir / f"{problem_name}_{model_name}.joblib"
-    legacy_metrics = trainer.paths.metric_dir / f"{problem_name}_{model_name}.yaml"
+    # Legacy paths (kept for BC, but MUST be horizon-safe to avoid mixing cutoffs).
+    cutoff_label = getattr(trainer, "cutoff_label", "default")
+    legacy_model = (
+        trainer.paths.model_dir / f"{problem_name}_{model_name}_{cutoff_label}.joblib"
+        if cutoff_label != "default"
+        else trainer.paths.model_dir / f"{problem_name}_{model_name}.joblib"
+    )
+    legacy_metrics = (
+        trainer.paths.metric_dir / f"{problem_name}_{model_name}_{cutoff_label}.yaml"
+        if cutoff_label != "default"
+        else trainer.paths.metric_dir / f"{problem_name}_{model_name}.yaml"
+    )
 
     try:
         formatted_metrics = format_metrics_for_yaml(metrics)
@@ -180,7 +194,12 @@ def save_selective_diagnostics(trainer, model, problem_name: str, model_name: st
             logger.info(f"Saved gate architecture for {problem_name} to {arch_path}")
 
         # Copy inference artifacts to the selective model directory so prediction can find them
-        artifacts_src = trainer.paths.model_dir / f"inference_artifacts_{problem_name}.joblib"
+        cutoff_label = getattr(trainer, "cutoff_label", "default")
+        artifacts_src = (
+            trainer.paths.model_dir / f"inference_artifacts_{problem_name}_{cutoff_label}.joblib"
+            if cutoff_label != "default"
+            else trainer.paths.model_dir / f"inference_artifacts_{problem_name}.joblib"
+        )
         artifacts_dst = v_dir / f"inference_artifacts_{problem_name}.joblib"
         if artifacts_src.exists():
             import shutil

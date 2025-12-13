@@ -9,7 +9,7 @@ import yaml
 
 from pipeline.feature import build_feature_matrix
 from pipeline.train import ModelTrainer
-from utils.feature.asof import decision_cutoff_horizons, decision_cutoff_override
+from utils.feature.enrichment.asof import decision_cutoff_horizons, decision_cutoff_override
 from utils.general.constants import format_cutoff_label
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")

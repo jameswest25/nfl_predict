@@ -1,4 +1,8 @@
+"""Strict feature parity verification between training and inference.
 
+This test ensures that the unified feature builder produces identical
+features whether called from training or inference contexts.
+"""
 import sys
 import os
 import shutil
@@ -19,40 +23,38 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("verify_parity_strict")
 
 from pipeline.feature import _build_feature_matrix_internal
-from pipeline.predict import _compute_features
-from utils.feature.asof import decision_cutoff_override
-from utils.feature.stats import NFL_PLAYER_STATS
-from utils.feature.daily_totals import build_daily_cache_range
-from utils.feature.team_context import compute_team_context_history
-from utils.feature.offense_context import _append_offense_context_columns
-from utils.feature.shared import attach_td_rate_history_features
+from utils.predict.features import build_features
+from utils.predict.injuries import attach_injury_features
+from utils.feature.enrichment.asof import decision_cutoff_override
+from utils.feature.rolling.stats import NFL_PLAYER_STATS
+from utils.feature.rolling.daily_totals import build_daily_cache_range
+from utils.feature.enrichment.team_context import compute_team_context_history
+from utils.feature.enrichment.offense_context import _append_offense_context_columns
+from utils.feature.core.shared import attach_td_rate_history_features
+
 
 def verify_parity_strict():
+    """Verify strict feature parity between training and inference pipelines."""
     # Target: Week 10 of 2024 season (Nov 10, 2024)
     target_date = date(2024, 11, 10)
     season_start = date(2024, 9, 1)
-    target_datetime = datetime(2024, 11, 10, 18, 0, 0) 
+    target_datetime = datetime(2024, 11, 10, 18, 0, 0)
     
     logger.info(f"--- Verifying STRICT Feature Parity for {target_date} ---")
 
-    # 0. Clear Cache to ensure new stats (e.g. ps_) are built
-    # ------------------------------------------------------
+    # 0. Clear Cache to ensure new stats are built
     cache_dir = Path("cache/feature/daily_totals")
     if cache_dir.exists():
         logger.info(f"Clearing cache dir: {cache_dir}")
         shutil.rmtree(cache_dir)
 
     # 1. Build Daily Cache for Season (History)
-    # -----------------------------------------
     logger.info(f"Building daily totals cache from {season_start} to {target_date}...")
-    # Ensure we have game level cache
     build_daily_cache_range(season_start, target_date, level="game")
     
-    # 1b. Rebuild Context History (Team & Offense) to ensure alignment
-    # --------------------------------------------------------------
+    # 1b. Rebuild Context History
     logger.info("Rebuilding Context History from raw game data...")
     try:
-        # Load ALL player game data for context calculation
         pg_scan = pl.scan_parquet(
             "data/processed/player_game_by_week/season=*/week=*/part.parquet",
             glob=True,
@@ -60,10 +62,8 @@ def verify_parity_strict():
             extra_columns="ignore",
             missing_columns="insert",
         )
-        # Filter to history only (up to current season) to simulate "available data"
         full_pg = pg_scan.collect()
         
-        # Cast columns to ensure reliable deduplication
         full_pg = full_pg.with_columns([
             pl.col("season").cast(pl.Int32),
             pl.col("week").cast(pl.Int32),
@@ -71,7 +71,6 @@ def verify_parity_strict():
             pl.col("team").cast(pl.Utf8),
         ])
         
-        # Dedup to ensure no double counting in aggregation
         full_pg = full_pg.unique(subset=["season", "week", "player_id"])
         
         # Team Context
@@ -93,13 +92,11 @@ def verify_parity_strict():
         logger.error(f"Failed to rebuild context history: {e}")
         return
 
-    # Helper to normalize TD-rate and offense-context share features so
-    # both train and predict use the exact same definitions.
     def _normalize_td_and_offense_shares(df: pl.DataFrame) -> pl.DataFrame:
+        """Normalize TD-rate and offense-context share features."""
         if df.is_empty():
             return df
 
-        # Rebuild team/position TD-rate features from canonical history.
         drop_td_cols = [
             c for c in df.columns if c.startswith("team_pos_") or c.startswith("opp_pos_")
         ]
@@ -107,36 +104,22 @@ def verify_parity_strict():
             df = df.drop(drop_td_cols)
         df = attach_td_rate_history_features(df)
 
-        # Recompute offense-context player shares using the same formulas
-        # as inference, applied symmetrically.
         cols = set(df.columns)
         share_exprs: list[pl.Expr] = []
 
-        if {
-            "1g_red_zone_target_per_game",
-            "off_ctx_team_red_zone_targets_prev",
-        }.issubset(cols):
+        if {"1g_red_zone_target_per_game", "off_ctx_team_red_zone_targets_prev"}.issubset(cols):
             share_exprs.append(
                 pl.when(pl.col("off_ctx_team_red_zone_targets_prev") > 0)
-                .then(
-                    pl.col("1g_red_zone_target_per_game")
-                    / pl.col("off_ctx_team_red_zone_targets_prev")
-                )
+                .then(pl.col("1g_red_zone_target_per_game") / pl.col("off_ctx_team_red_zone_targets_prev"))
                 .otherwise(0.0)
                 .clip(0.0, 1.5)
                 .cast(pl.Float32)
                 .alias("off_ctx_player_red_zone_share_prev")
             )
-        if {
-            "3g_red_zone_target_per_game",
-            "off_ctx_team_red_zone_targets_l3",
-        }.issubset(cols):
+        if {"3g_red_zone_target_per_game", "off_ctx_team_red_zone_targets_l3"}.issubset(cols):
             expr = (
                 pl.when(pl.col("off_ctx_team_red_zone_targets_l3") > 0)
-                .then(
-                    pl.col("3g_red_zone_target_per_game")
-                    / pl.col("off_ctx_team_red_zone_targets_l3")
-                )
+                .then(pl.col("3g_red_zone_target_per_game") / pl.col("off_ctx_team_red_zone_targets_l3"))
                 .otherwise(0.0)
                 .clip(0.0, 1.5)
                 .cast(pl.Float32)
@@ -144,31 +127,19 @@ def verify_parity_strict():
             share_exprs.append(expr.alias("off_ctx_player_red_zone_share_l3"))
             share_exprs.append(expr.alias("off_ctx_player_red_zone_share"))
 
-        if {
-            "1g_goal_to_go_carry_per_game",
-            "off_ctx_team_goal_to_go_carries_prev",
-        }.issubset(cols):
+        if {"1g_goal_to_go_carry_per_game", "off_ctx_team_goal_to_go_carries_prev"}.issubset(cols):
             share_exprs.append(
                 pl.when(pl.col("off_ctx_team_goal_to_go_carries_prev") > 0)
-                .then(
-                    pl.col("1g_goal_to_go_carry_per_game")
-                    / pl.col("off_ctx_team_goal_to_go_carries_prev")
-                )
+                .then(pl.col("1g_goal_to_go_carry_per_game") / pl.col("off_ctx_team_goal_to_go_carries_prev"))
                 .otherwise(0.0)
                 .clip(0.0, 1.5)
                 .cast(pl.Float32)
                 .alias("off_ctx_player_goal_to_go_share_prev")
             )
-        if {
-            "3g_goal_to_go_carry_per_game",
-            "off_ctx_team_goal_to_go_carries_l3",
-        }.issubset(cols):
+        if {"3g_goal_to_go_carry_per_game", "off_ctx_team_goal_to_go_carries_l3"}.issubset(cols):
             expr_goal = (
                 pl.when(pl.col("off_ctx_team_goal_to_go_carries_l3") > 0)
-                .then(
-                    pl.col("3g_goal_to_go_carry_per_game")
-                    / pl.col("off_ctx_team_goal_to_go_carries_l3")
-                )
+                .then(pl.col("3g_goal_to_go_carry_per_game") / pl.col("off_ctx_team_goal_to_go_carries_l3"))
                 .otherwise(0.0)
                 .clip(0.0, 1.5)
                 .cast(pl.Float32)
@@ -182,11 +153,9 @@ def verify_parity_strict():
         return df
 
     # 2. Run Training Pipeline (Feature Matrix)
-    # -----------------------------------------
     logger.info("Running Training Pipeline...")
-    cutoff_hours = 1.0 
+    cutoff_hours = 1.0
     
-    # Delete temp file to ensure fresh generation
     temp_out = Path("tests/temp_train_strict.parquet")
     if temp_out.exists():
         temp_out.unlink()
@@ -206,21 +175,17 @@ def verify_parity_strict():
         logger.error("Training DF is empty! Cannot verify.")
         return
 
-    # Filter train_df to target date ONLY (it loads full history by default)
     train_df = train_df.filter(pl.col("game_date").cast(pl.Date) == target_date)
     logger.info(f"Filtered Training DF Rows: {len(train_df)}")
-
-    # Normalize TD-rate and offense-context shares on training slice.
     train_df = _normalize_td_and_offense_shares(train_df)
 
-    # 2. Run Prediction Pipeline
-    # --------------------------
-    logger.info("Running Prediction Pipeline...")
+    # 3. Run Prediction Pipeline (Using UNIFIED feature builder)
+    logger.info("Running Prediction Pipeline with UNIFIED feature builder...")
     
     raw_pg_path = f"data/processed/player_game_by_week/season=2024/week=10/part.parquet"
     if not os.path.exists(raw_pg_path):
-            logger.error(f"Raw data not found at {raw_pg_path}")
-            return
+        logger.error(f"Raw data not found at {raw_pg_path}")
+        return
             
     raw_pg = pl.read_parquet(raw_pg_path)
     raw_pg = raw_pg.filter(pl.col("game_date").cast(pl.Date) == target_date)
@@ -229,74 +194,46 @@ def verify_parity_strict():
     train_keys = train_df.select(["player_id", "game_id"]).unique()
     raw_pg = raw_pg.join(train_keys, on=["player_id", "game_id"], how="inner")
     
-    # Identify available PS columns to pass through to scaffold
-    # Exclude ps_hist_ columns as they cause duplicates during rename in prediction pipeline
+    # Build scaffold from raw data
     ps_cols = [c for c in raw_pg.columns if c.startswith("ps_") and not c.startswith("ps_hist_")]
-    
-    # Identify metadata columns (age, etc) to pass through
     meta_cols = ["age", "birth_date", "college", "draft_club", "draft_number"]
     meta_cols = [c for c in meta_cols if c in raw_pg.columns]
     
     base_cols = [
-        "player_id",
-        "player_name",
-        "position",
-        "team",
-        "opponent",
-        "season",
-        "week",
-        "game_id",
-        "game_date",
-        "home_team",
-        "away_team",
-        # Include roof so that weather context flags (especially
-        # weather_bad_passing_flag) see the same indoor/outdoor
-        # metadata in both training and prediction.
-        "roof",
+        "player_id", "player_name", "position", "team", "opponent",
+        "season", "week", "game_id", "game_date", "home_team", "away_team", "roof",
     ]
     
-    logger.info(f"Passed Meta Cols: {meta_cols}")
-    
-    # Map to scaffold
     pred_scaffold = raw_pg.select(
-        [pl.col(c) for c in base_cols] + 
+        [pl.col(c) for c in base_cols if c in raw_pg.columns] + 
         [pl.col(c) for c in ps_cols] +
         [pl.col(c) for c in meta_cols] +
         [pl.lit("REG").alias("season_type")]
-    ).to_pandas()
+    )
     
     # Add scaffold extras
-    pred_scaffold["depth_chart_order"] = 1
-    pred_scaffold["is_home"] = (pred_scaffold["team"] == pred_scaffold["home_team"]).astype(int)
-    pred_scaffold["game_start_hour_utc"] = 18
-    pred_scaffold["game_day_of_week"] = 6
-    
-    # Match 21:25 UTC for NYJ/ARI (4:25 ET) - Hardcoded for this test target
-    # Ideally this comes from a schedule lookup
-    pred_scaffold["game_start_utc"] = pd.to_datetime("2024-11-10 21:25:00").tz_localize("UTC")
+    pred_scaffold = pred_scaffold.with_columns([
+        pl.lit(1).cast(pl.Int16).alias("depth_chart_order"),
+        pl.when(pl.col("team") == pl.col("home_team")).then(1).otherwise(0).alias("is_home"),
+        pl.lit(18).cast(pl.Int8).alias("game_start_hour_utc"),
+        pl.lit(6).cast(pl.Int8).alias("game_day_of_week"),
+        pl.lit(datetime(2024, 11, 10, 21, 25, 0)).cast(pl.Datetime("ms", "UTC")).alias("game_start_utc"),
+    ])
     
     logger.info(f"Prediction Scaffold Rows: {len(pred_scaffold)}")
-    if "age" in pred_scaffold.columns:
-        logger.info(f"Scaffold has age: {pred_scaffold['age'].notna().sum()} non-nulls")
     
     with decision_cutoff_override(cutoff_hours=cutoff_hours):
-        pred_out_obj = _compute_features(pred_scaffold)
-        
-    if isinstance(pred_out_obj, pd.DataFrame):
-        pred_out = pl.from_pandas(pred_out_obj)
-    else:
-        pred_out = pred_out_obj
-
-    # Apply the same normalization to prediction features.
+        # Use the UNIFIED feature builder
+        pred_out = build_features(pred_scaffold, is_inference=True, seasons=[2024])
+        pred_out = attach_injury_features(pred_out)
+    
     pred_out = _normalize_td_and_offense_shares(pred_out)
 
-    # 3. Compare Results
-    # ------------------
+    # 4. Compare Results
     logger.info("Comparing Columns and Values...")
     
     train_cols_all = set(train_df.columns)
     
-    # Define columns to IGNORE (targets, leakage, metadata not generated by pred)
     IGNORE_COLS = {
         # Metadata/Identifiers
         "player_name", "player_display_name", "first_name", "last_name", "football_name",
@@ -305,11 +242,11 @@ def verify_parity_strict():
         "height", "weight", "uniform_number", "jersey_number",
         "age", "headshot_url", "status_description_abbr", "status_short_description",
         "team_abbr", "opponent_abbr", "game_type",
-        "game_day_of_week", "game_start_hour_utc", # scaffold differences usually
-        "season_type", "roof_type", "surface", "grass", "temp", "wind", # weather/stadium details
+        "game_day_of_week", "game_start_hour_utc",
+        "season_type", "roof_type", "surface", "grass", "temp", "wind",
         "is_home", "depth_chart_order",
         
-        # Leakage / Targets (Outcomes of the game)
+        # Leakage / Targets
         "passing_yards", "rushing_yards", "receiving_yards",
         "pass_attempt", "carry", "target", "reception", "completion",
         "passing_td", "rushing_td_count", "receiving_td_count",
@@ -332,28 +269,14 @@ def verify_parity_strict():
         "ps_targets_slot_share", "ps_targets_wide_share", "ps_targets_inline_share", "ps_targets_backfield_share",
         "ps_total_touches", "ps_scripted_touches", "ps_scripted_touch_share",
         "ps_team_dropbacks", "ps_tracking_team_dropbacks", "ps_tracking_has_game_data",
-        "ps_game_route_participation_plays", "ps_game_route_participation_pct",
-        "ps_game_targets_total", "ps_game_targets_slot_count", "ps_game_targets_wide_count",
-        "ps_game_targets_inline_count", "ps_game_targets_backfield_count",
-        "ps_game_targets_slot_share", "ps_game_targets_wide_share",
-        "ps_game_targets_inline_share", "ps_game_targets_backfield_share",
-        "ps_game_total_touches", "ps_game_scripted_touches", "ps_game_scripted_touch_share",
-        "ps_game_tracking_team_dropbacks", "ps_game_tracking_has_game_data",
-        "ps_game_team_dropbacks",
-        
-        # Historical columns that might be present in raw data but not features
-        "ps_hist_route_participation_pct_prev", "ps_hist_route_participation_pct_l3",
-        "ps_hist_route_participation_plays_prev", "ps_hist_route_participation_plays_l3",
-        # ... add all ps_hist_ if we prefer 1g_ps_ ...
         
         # Internal / Misc
         "decision_cutoff_ts_missing", "decision_horizon_hours",
-        "forecast_snapshot_ts_missing", "odds_snapshot_ts", # snapshots vary by run
-        "team_ctx_data_as_of", "off_ctx_data_as_of", "opp_ctx_data_as_of", # data age varies
-        "game_start_utc", # fixed in scaffold but might still drift?
-        "decision_cutoff_ts", # calculated differently in train/pred
+        "forecast_snapshot_ts_missing", "odds_snapshot_ts",
+        "team_ctx_data_as_of", "off_ctx_data_as_of", "opp_ctx_data_as_of",
+        "game_start_utc", "decision_cutoff_ts",
         
-        # Odds columns (API failures in test env)
+        # Odds columns
         "total_line", "spread_line", "moneyline",
         "total_book_count", "spread_book_count", "moneyline_book_count",
         "market_anytime_td_book_count", "market_anytime_td_book_count_24h", 
@@ -361,14 +284,13 @@ def verify_parity_strict():
         "implied_total", "team_implied_total",
     }
     
-    # Dynamic ignore of ps_hist_ if 1g_ps_ exists (preference)
+    # Dynamic ignore of ps_hist_ if 1g_ps_ exists
     has_rolling_ps = any(c.startswith("1g_ps_") for c in train_cols_all)
     if has_rolling_ps:
         ps_hist_cols = [c for c in train_cols_all if c.startswith("ps_hist_")]
         IGNORE_COLS.update(ps_hist_cols)
 
-    # Restrict comparison strictly to the feature sets used by the flat and
-    # structured anytime TD models, based on training.yaml.
+    # Load feature config to focus on actual model features
     cfg_path = project_root / "config" / "training.yaml"
     with cfg_path.open("r") as fp:
         train_cfg = yaml.safe_load(fp)
@@ -411,7 +333,7 @@ def verify_parity_strict():
         pred_out, 
         on=["player_id", "game_id"], 
         suffix="_pred",
-        how="inner"  # Compare only matching rows
+        how="inner"
     )
     
     logger.info(f"Comparison Rows (Matched): {len(comparison)}")
@@ -446,17 +368,6 @@ def verify_parity_strict():
     else:
         logger.error("❌ PARITY FAILED")
         
-        # DEBUG: Inspect Pred output for Rodgers if mismatch
-        rodgers_pred = pred_out.filter(pl.col("player_id") == "00-0023459")
-        if not rodgers_pred.is_empty():
-            logger.info(f"Pred Row (Rodgers):")
-            cols = ["drive_hist_total_yards_prev", "drive_hist_count_prev", "age"]
-            present = [c for c in cols if c in rodgers_pred.columns]
-            if present:
-                logger.info(rodgers_pred.select(present))
-            else:
-                logger.info("Rodgers row found but target columns missing.")
-        
         if missing_in_pred:
             logger.error(f"MISSING FEATURES ({len(missing_in_pred)}):")
             for c in missing_in_pred[:20]:
@@ -468,9 +379,7 @@ def verify_parity_strict():
             for m in mismatches[:50]:
                 logger.error(f"  {m['feature']}: MaxDiff={m['max_diff']:.4f}, MeanDiff={m['mean_diff']:.4f}")
                 
-                # Debug: Print player/game with max diff for top mismatch
                 if m == mismatches[0]:
-                    # Find row with max diff
                     col = m['feature']
                     c_train = comparison.get_column(col).cast(pl.Float32).fill_null(0.0)
                     c_pred = comparison.get_column(col + "_pred").cast(pl.Float32).fill_null(0.0)
@@ -479,6 +388,7 @@ def verify_parity_strict():
                     row = comparison.row(max_idx, named=True)
                     logger.error(f"    MaxDiff Row: Player={row['player_id']}, Game={row['game_id']}")
                     logger.error(f"    Train={row[col]}, Pred={row[col + '_pred']}")
+
 
 if __name__ == "__main__":
     verify_parity_strict()

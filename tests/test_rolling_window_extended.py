@@ -4,12 +4,19 @@ import pytest, polars as pl, pandas as pd, numpy as np, random
 from datetime import date, timedelta, datetime
 from pathlib import Path
 
-from utils.feature import rolling_window as rwmod
+from utils.feature.rolling import rolling_window as rwmod
 
 pytestmark = pytest.mark.mlb
-from utils.feature.pitch_level import RAW_ROOT, PITCH_DIR
-from utils.feature.pa_level   import PITCH_SRC, PA_DIR
-from utils.feature.game_level import PA_SRC,   GAME_DIR
+# MLB-specific imports - these modules don't exist in NFL project
+# from utils.feature.pitch_level import RAW_ROOT, PITCH_DIR
+# from utils.feature.pa_level   import PITCH_SRC, PA_DIR
+# from utils.feature.builders.game_level import PA_SRC,   GAME_DIR
+RAW_ROOT = None
+PITCH_DIR = None
+PITCH_SRC = None
+PA_DIR = None
+PA_SRC = None
+GAME_DIR = None
 from pipeline.feature import build_feature_matrix, FINAL_OUT
 
 

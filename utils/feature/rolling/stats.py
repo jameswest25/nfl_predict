@@ -56,6 +56,9 @@ NFL_PLAYER_STATS: List[str] = [
     "red_zone_carry",
     "goal_to_go_target",
     "goal_to_go_carry",
+    # Situational rushing (carry context)
+    "short_yard_carry",       # carries with <=2 yards to go
+    "third_down_carry",       # carries on third down
 
     # --- Snap counts / participation (game-level) ---
     "offense_snaps",
@@ -103,6 +106,8 @@ ROLLING_FEATURE_STATS: List[str] = [
     "red_zone_carry",
     "goal_to_go_target",
     "goal_to_go_carry",
+    "short_yard_carry",
+    "third_down_carry",
     "receiving_yards",
     "rushing_yards",
     "passing_yards",

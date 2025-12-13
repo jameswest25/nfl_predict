@@ -1,6 +1,6 @@
 import polars as pl
 
-from utils.feature.labels import compute_td_labels, get_label_spec
+from utils.feature.core.labels import compute_td_labels, get_label_spec
 
 
 def _lookup(frame: pl.DataFrame, player_id: str) -> dict:
