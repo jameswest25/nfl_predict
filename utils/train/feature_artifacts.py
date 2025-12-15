@@ -69,7 +69,18 @@ def fit_feature_artifacts(df_train: pd.DataFrame, problem_config: dict) -> Featu
             except Exception as e:
                 logger.warning(f"Failed to convert {col} to numeric datetime: {e}")
 
-    num_cols = final_X.select_dtypes(include=np.number).columns
+    # IMPORTANT: XGBoost categorical support expects string categories.
+    # Also: avoid treating bool/boolean columns as categoricals (xgboost can crash
+    # when categories are booleans). Force them to numeric 0/1 instead.
+    for col in list(final_X.columns):
+        try:
+            if pd.api.types.is_bool_dtype(final_X[col]) or str(final_X[col].dtype).lower() == "boolean":
+                # Nullable boolean -> Int8 preserves missing; plain bool becomes 0/1.
+                final_X[col] = final_X[col].astype("Int8")
+        except Exception:
+            continue
+
+    num_cols = final_X.select_dtypes(include=[np.number]).columns
     cat_cols = list(final_X.columns.difference(num_cols))
     category_levels: Dict[str, List[str]] = {}
     for col in cat_cols:
@@ -77,7 +88,8 @@ def fit_feature_artifacts(df_train: pd.DataFrame, problem_config: dict) -> Featu
         categories = series.astype("category").cat.categories.tolist()
         if not categories:
             categories = ["__missing__"]
-        category_levels[col] = categories
+        # Force categories to strings for xgboost's categorical backend.
+        category_levels[col] = [str(c) for c in categories]
 
     return FeatureArtifacts(
         feature_columns=feature_columns,
@@ -136,6 +148,8 @@ def apply_feature_artifacts(
         try:
             if "__missing__" in levels:
                 X[col] = X[col].fillna("__missing__")
+            # Keep categorical domain as strings (xgboost categorical backend expects this).
+            X[col] = X[col].astype(str)
             X[col] = pd.Categorical(X[col], categories=levels)
         except Exception:
             pass

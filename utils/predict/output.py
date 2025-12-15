@@ -61,47 +61,116 @@ def inject_composed_features(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return df
 
-    # Ensure availability composites
-    _ensure_availability_composites(df)
-
-    # Helper for safe multiplication
-    def _safe_mul(a: str, b: str, out_col: str):
-        if a in df.columns and b in df.columns:
-            df[out_col] = df[a] * df[b]
-
     def _select_column(candidates: list[str]) -> str | None:
         for name in candidates:
             if name in df.columns:
                 return name
         return None
 
-    # Availability x usage → expected opportunities
-    _safe_mul("pred_availability", "pred_usage_targets", "expected_targets")
-    _safe_mul("pred_availability_raw", "pred_usage_targets", "expected_targets_raw")
-    _safe_mul("pred_availability", "pred_usage_carries", "expected_carries")
-    _safe_mul("pred_availability_raw", "pred_usage_carries", "expected_carries_raw")
-
     # Team pace based expectations
+    # Prefer a learned pace model if present, otherwise fall back to parity-safe
+    # pace proxies produced by the unified feature builder (e.g., team_pace_l3).
+    team_pace_series = None
+    pace_origin = None  # "pred" | "l3" | "prev" | None
     if "pred_team_pace" in df.columns:
-        team_pace = pd.to_numeric(df["pred_team_pace"], errors="coerce").clip(lower=0.0)
-        df["expected_team_plays"] = team_pace
-        
-        pass_rate_col = _select_column([
-            "team_ctx_pass_rate_prev", "team_ctx_pass_rate_l3", "team_ctx_pass_rate_l5",
-        ])
+        team_pace_series = pd.to_numeric(df["pred_team_pace"], errors="coerce").clip(lower=0.0)
+        pace_origin = "pred"
+    else:
+        pace_col = _select_column(
+            [
+                "team_pace_l3",
+                "team_pace_prev",
+                "team_ctx_offensive_plays_l3",
+                "team_ctx_offensive_plays_prev",
+            ]
+        )
+        if pace_col:
+            team_pace_series = pd.to_numeric(df[pace_col], errors="coerce").clip(lower=0.0)
+            if str(pace_col).endswith("_l3"):
+                pace_origin = "l3"
+            elif str(pace_col).endswith("_prev"):
+                pace_origin = "prev"
+
+    if team_pace_series is not None:
+        df["expected_team_plays"] = team_pace_series
+        # Avoid mixing windows (e.g., pace_l3 with pass_rate_prev).
+        if pace_origin == "prev":
+            pass_rate_col = _select_column(["team_ctx_pass_rate_prev", "team_pass_rate_prev"])
+        else:
+            # Default to l3 when using l3 pace or learned pace.
+            pass_rate_col = _select_column(["team_ctx_pass_rate_l3", "team_pass_rate_l3", "team_ctx_pass_rate_prev", "team_pass_rate_prev"])
         if pass_rate_col:
-            pass_rate = (
-                pd.to_numeric(df[pass_rate_col], errors="coerce")
-                .fillna(0.5).clip(lower=0.0, upper=1.0)
+            pass_rate = pd.to_numeric(df[pass_rate_col], errors="coerce").clip(lower=0.0, upper=1.0)
+            df["expected_team_pass_plays"] = team_pace_series * pass_rate
+            df["expected_team_rush_plays"] = team_pace_series * (1.0 - pass_rate)
+
+    # Availability x team volume x usage share → expected opportunities (unit-consistent)
+    if "pred_availability_active" in df.columns:
+        avail = (
+            pd.to_numeric(df["pred_availability_active"], errors="coerce")
+            .clip(lower=0.0, upper=1.0)
+        )
+        avail_raw = None
+        if "pred_availability_active_raw" in df.columns:
+            avail_raw = (
+                pd.to_numeric(df["pred_availability_active_raw"], errors="coerce")
+                .clip(lower=0.0, upper=1.0)
             )
-            df["expected_team_pass_plays"] = team_pace * pass_rate
-            df["expected_team_rush_plays"] = team_pace * (1.0 - pass_rate)
+
+        if "expected_team_pass_plays" in df.columns and "pred_usage_targets" in df.columns:
+            share_tgt = (
+                pd.to_numeric(df["pred_usage_targets"], errors="coerce")
+                .clip(lower=0.0, upper=1.0)
+            )
+            team_pass = pd.to_numeric(df["expected_team_pass_plays"], errors="coerce")
+            df["expected_targets_raw"] = team_pass * share_tgt
+            df["expected_targets"] = df["expected_targets_raw"] * avail
+            if avail_raw is not None:
+                df["expected_targets_raw_unclipped"] = df["expected_targets_raw"] * avail_raw
+
+        if "expected_team_rush_plays" in df.columns and "pred_usage_carries" in df.columns:
+            share_car = (
+                pd.to_numeric(df["pred_usage_carries"], errors="coerce")
+                .clip(lower=0.0, upper=1.0)
+            )
+            team_rush = pd.to_numeric(df["expected_team_rush_plays"], errors="coerce")
+            df["expected_carries_raw"] = team_rush * share_car
+            df["expected_carries"] = df["expected_carries_raw"] * avail
+            if avail_raw is not None:
+                df["expected_carries_raw_unclipped"] = df["expected_carries_raw"] * avail_raw
+
+    # MoE-composed expectations (self-consistent MoE chain)
+    if "pred_availability_active_moe" in df.columns:
+        avail_moe = (
+            pd.to_numeric(df["pred_availability_active_moe"], errors="coerce")
+            .clip(lower=0.0, upper=1.0)
+        )
+        if "expected_team_pass_plays" in df.columns and "pred_usage_targets_moe" in df.columns:
+            share_tgt_moe = (
+                pd.to_numeric(df["pred_usage_targets_moe"], errors="coerce")
+                .clip(lower=0.0, upper=1.0)
+            )
+            team_pass = pd.to_numeric(df["expected_team_pass_plays"], errors="coerce")
+            df["expected_targets_raw_moe"] = team_pass * share_tgt_moe
+            df["expected_targets_moe"] = df["expected_targets_raw_moe"] * avail_moe
+        if "expected_team_rush_plays" in df.columns and "pred_usage_carries_moe" in df.columns:
+            share_car_moe = (
+                pd.to_numeric(df["pred_usage_carries_moe"], errors="coerce")
+                .clip(lower=0.0, upper=1.0)
+            )
+            team_rush = pd.to_numeric(df["expected_team_rush_plays"], errors="coerce")
+            df["expected_carries_raw_moe"] = team_rush * share_car_moe
+            df["expected_carries_moe"] = df["expected_carries_raw_moe"] * avail_moe
 
     # Combined opportunities
     if "expected_targets" in df.columns and "expected_carries" in df.columns:
         df["expected_opportunities"] = df["expected_targets"] + df["expected_carries"]
     if "expected_targets_raw" in df.columns and "expected_carries_raw" in df.columns:
         df["expected_opportunities_raw"] = df["expected_targets_raw"] + df["expected_carries_raw"]
+    if "expected_targets_moe" in df.columns and "expected_carries_moe" in df.columns:
+        df["expected_opportunities_moe"] = df["expected_targets_moe"] + df["expected_carries_moe"]
+    if "expected_targets_raw_moe" in df.columns and "expected_carries_raw_moe" in df.columns:
+        df["expected_opportunities_raw_moe"] = df["expected_targets_raw_moe"] + df["expected_carries_raw_moe"]
 
     # TD signal from efficiency
     if "pred_efficiency_tds" in df.columns and "expected_opportunities" in df.columns:
@@ -138,32 +207,6 @@ def inject_composed_features(df: pd.DataFrame) -> pd.DataFrame:
     _compute_structural_td_expectations(df)
 
     return df
-
-
-def _ensure_availability_composites(frame: pd.DataFrame) -> None:
-    """Ensure availability composite features are computed."""
-    has_active = "pred_availability_active" in frame.columns
-    has_share = "pred_availability_snapshare" in frame.columns
-    
-    if not (has_active and has_share):
-        return
-    
-    active = pd.to_numeric(frame["pred_availability_active"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
-    share = pd.to_numeric(frame["pred_availability_snapshare"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
-    combined = (active * share).astype(np.float32)
-    
-    if "pred_availability" not in frame.columns:
-        frame["pred_availability"] = combined
-    
-    if "pred_availability_raw" not in frame.columns:
-        if "pred_availability_active_raw" in frame.columns:
-            raw_active = (
-                pd.to_numeric(frame["pred_availability_active_raw"], errors="coerce")
-                .fillna(0.0).clip(0.0, 1.0)
-            )
-            frame["pred_availability_raw"] = (raw_active * share).astype(np.float32)
-        else:
-            frame["pred_availability_raw"] = combined
 
 
 def _compute_red_zone_expectations(df: pd.DataFrame, _select_column) -> None:
@@ -236,6 +279,53 @@ def _compute_structural_td_expectations(df: pd.DataFrame) -> None:
         expected_carries = pd.to_numeric(df["expected_carries"], errors="coerce").fillna(0.0).clip(lower=0.0)
         df["expected_td_from_carries"] = (td_rate_rush * expected_carries).astype(np.float32)
 
+    # Poisson structural conversion: P(TD>=1) = 1 - exp(-lambda)
+    total_td = None
+    if "expected_td_from_targets" in df.columns and "expected_td_from_carries" in df.columns:
+        total_td = (
+            pd.to_numeric(df["expected_td_from_targets"], errors="coerce").fillna(0.0).clip(lower=0.0)
+            + pd.to_numeric(df["expected_td_from_carries"], errors="coerce").fillna(0.0).clip(lower=0.0)
+        )
+    elif "expected_td_from_targets" in df.columns:
+        total_td = pd.to_numeric(df["expected_td_from_targets"], errors="coerce").fillna(0.0).clip(lower=0.0)
+    elif "expected_td_from_carries" in df.columns:
+        total_td = pd.to_numeric(df["expected_td_from_carries"], errors="coerce").fillna(0.0).clip(lower=0.0)
+
+    if total_td is not None:
+        df["expected_td_count_structural"] = total_td.astype(np.float32)
+        df["expected_td_prob_structural"] = (1.0 - np.exp(-total_td.to_numpy())).astype(np.float32)
+
+    # MoE structural expectations (self-consistent MoE chain)
+    td_rate_rec_moe = None
+    if "pred_td_conv_rec_moe" in df.columns:
+        td_rate_rec_moe = pd.to_numeric(df["pred_td_conv_rec_moe"], errors="coerce").clip(0.0, 1.0)
+        df["expected_td_rate_per_target_moe"] = td_rate_rec_moe.astype(np.float32)
+    td_rate_rush_moe = None
+    if "pred_td_conv_rush_moe" in df.columns:
+        td_rate_rush_moe = pd.to_numeric(df["pred_td_conv_rush_moe"], errors="coerce").clip(0.0, 1.0)
+        df["expected_td_rate_per_carry_moe"] = td_rate_rush_moe.astype(np.float32)
+
+    if td_rate_rec_moe is not None and "expected_targets_moe" in df.columns:
+        expected_targets_moe = pd.to_numeric(df["expected_targets_moe"], errors="coerce").fillna(0.0).clip(lower=0.0)
+        df["expected_td_from_targets_moe"] = (td_rate_rec_moe * expected_targets_moe).astype(np.float32)
+    if td_rate_rush_moe is not None and "expected_carries_moe" in df.columns:
+        expected_carries_moe = pd.to_numeric(df["expected_carries_moe"], errors="coerce").fillna(0.0).clip(lower=0.0)
+        df["expected_td_from_carries_moe"] = (td_rate_rush_moe * expected_carries_moe).astype(np.float32)
+
+    total_td_moe = None
+    if "expected_td_from_targets_moe" in df.columns and "expected_td_from_carries_moe" in df.columns:
+        total_td_moe = (
+            pd.to_numeric(df["expected_td_from_targets_moe"], errors="coerce").fillna(0.0).clip(lower=0.0)
+            + pd.to_numeric(df["expected_td_from_carries_moe"], errors="coerce").fillna(0.0).clip(lower=0.0)
+        )
+    elif "expected_td_from_targets_moe" in df.columns:
+        total_td_moe = pd.to_numeric(df["expected_td_from_targets_moe"], errors="coerce").fillna(0.0).clip(lower=0.0)
+    elif "expected_td_from_carries_moe" in df.columns:
+        total_td_moe = pd.to_numeric(df["expected_td_from_carries_moe"], errors="coerce").fillna(0.0).clip(lower=0.0)
+    if total_td_moe is not None:
+        df["expected_td_count_structural_moe"] = total_td_moe.astype(np.float32)
+        df["expected_td_prob_structural_moe"] = (1.0 - np.exp(-total_td_moe.to_numpy())).astype(np.float32)
+
 
 def format_output(
     features: pd.DataFrame,
@@ -302,9 +392,11 @@ def format_output(
 
     out["prediction"] = picks.astype(int)
     out["model_threshold"] = float(threshold)
-    # implied odds for the primary published probability (structured global)
+    # implied odds for the primary ordering probability
+    # (defaults to MoE when available; otherwise falls back to global)
+    implied_prob_col = "prob_anytime_td_moe" if "prob_anytime_td_moe" in out.columns else "prob_anytime_td_global"
     out["implied_decimal_odds"] = np.where(
-        out["prob_anytime_td_global"] > 0, 1.0 / out["prob_anytime_td_global"], np.nan
+        out[implied_prob_col] > 0, 1.0 / out[implied_prob_col], np.nan
     )
 
     if include_debug_prediction_columns:
@@ -340,9 +432,11 @@ def format_output(
     remaining = [c for c in out.columns if c not in ordered]
     out = out[ordered + remaining]
 
-    # Sort by the structured-global probability (the main published signal)
+    # Sort by MoE structured probability (user preference).
+    # Keep deterministic tie-breakers for stable output.
+    sort_col = "prob_anytime_td_moe" if "prob_anytime_td_moe" in out.columns else "prob_anytime_td_global"
     out.sort_values(
-        ["prob_anytime_td_global", "game_date", "team", "player_name"],
+        [sort_col, "game_date", "team", "player_name"],
         ascending=[False, True, True, True],
         inplace=True,
     )

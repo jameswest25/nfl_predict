@@ -128,7 +128,7 @@ def _latest_model_path(problem: str) -> Path:
     raise FileNotFoundError(f"No model directory found for {problem}.")
 
 
-def _metrics_path(problem: str) -> Path:
+def _metrics_path(problem: str) -> Path | None:
     """Find the metrics file for a problem."""
     cutoff_label = _active_cutoff_label()
     names_to_try = [problem]
@@ -144,26 +144,41 @@ def _metrics_path(problem: str) -> Path:
             runs = [d for d in runs if f"cutoff_{cutoff_label}" in d.name]
         if not runs:
             continue
-        latest = max(runs, key=lambda p: p.stat().st_mtime)
-        path = latest / "metrics.yaml"
-        if path.exists():
-            if name != problem:
-                logger.warning(
-                    "Using legacy metrics directory for %s located at %s",
-                    problem, latest
-                )
-            return path
-    return Path()
+
+        # Some runs may only contain MoE diagnostics (e.g., moe_metrics.yaml) and
+        # not the canonical metrics.yaml. Select the most recent run that actually
+        # has a metrics.yaml to avoid returning an invalid path.
+        candidates: list[Path] = []
+        for run in runs:
+            path = run / "metrics.yaml"
+            if path.is_file():
+                candidates.append(path)
+        if not candidates:
+            continue
+        best = max(candidates, key=lambda p: p.stat().st_mtime)
+        if name != problem:
+            logger.warning(
+                "Using legacy metrics directory for %s located at %s",
+                problem, best.parent
+            )
+        return best
+    return None
 
 
 def load_threshold(problem: str) -> float:
     """Load decision threshold for a classification problem."""
     metrics_path = _metrics_path(problem)
-    if not metrics_path.exists():
-        return 0.5
+    if metrics_path is None or (not metrics_path.is_file()):
+        cutoff_label = _active_cutoff_label()
+        raise FileNotFoundError(
+            f"Missing metrics.yaml for '{problem}' (cutoff_label={cutoff_label}). "
+            f"Expected under {METRICS_DIR}/{problem}/xgboost/<run_id>/metrics.yaml"
+        )
     with metrics_path.open("r") as fp:
         metrics = yaml.safe_load(fp)
-    return float(metrics.get("decision_threshold", 0.5))
+    if "decision_threshold" not in metrics:
+        raise KeyError(f"metrics.yaml for '{problem}' missing decision_threshold: {metrics_path}")
+    return float(metrics["decision_threshold"])
 
 
 def prepare_feature_matrix(
@@ -294,22 +309,53 @@ def predict_moe(features: pd.DataFrame, problem_name: str) -> np.ndarray:
     if not models:
         raise ValueError(f"No MoE models found for {problem_name}")
     
-    # Prepare features using the SAME categorical/date normalization as global inference.
-    # This is critical for MoE parity: converting strings to numeric directly would coerce
-    # them to NaN and destroy signal (team/opponent/position/etc).
+    # Prepare features (structural).
+    #
+    # Preferred behavior: use the MoE artifacts themselves (category_levels,
+    # categorical_features, datetime normalization) so MoE inference is
+    # self-contained and does not depend on global artifacts.
+    #
+    # Backward-compatibility: older MoE artifacts may not include categorical
+    # metadata; in that case, we fall back to global artifacts for the same
+    # problem, and finally to direct projection.
+    X = None
     try:
-        global_artifacts = load_artifacts(problem_name)
-        X_full, _ = prepare_feature_matrix(features, global_artifacts)
-        X = X_full.reindex(columns=feature_columns, fill_value=np.nan)
+        if artifacts.get("category_levels") is not None or artifacts.get("categorical_features") is not None:
+            X_full, _ = prepare_feature_matrix(features, artifacts)
+            X = X_full.reindex(columns=feature_columns, fill_value=np.nan)
+        else:
+            raise KeyError("moe artifacts missing categorical metadata")
     except Exception:
-        # Fallback to minimal column projection if global artifacts are unavailable
-        X = features.reindex(columns=feature_columns, fill_value=np.nan).copy()
+        try:
+            global_artifacts = load_artifacts(problem_name)
+            X_full, _ = prepare_feature_matrix(features, global_artifacts)
+            missing_from_global = [c for c in feature_columns if c not in X_full.columns]
+            if missing_from_global:
+                logger.warning(
+                    "MoE feature schema for %s contains %d/%d columns not present in global artifacts. "
+                    "Falling back to direct feature projection (avoids all-NaN inputs).",
+                    problem_name,
+                    len(missing_from_global),
+                    len(feature_columns),
+                )
+                X = features.reindex(columns=feature_columns, fill_value=np.nan).copy()
+            else:
+                X = X_full.reindex(columns=feature_columns, fill_value=np.nan)
+        except Exception as exc:
+            logger.warning(
+                "MoE feature preparation failed for %s (%s). Falling back to direct projection.",
+                problem_name,
+                exc,
+            )
+            X = features.reindex(columns=feature_columns, fill_value=np.nan).copy()
 
     # Ensure any categorical columns are numeric codes for XGBoost.
     for col in X.columns:
         if str(X[col].dtype) == "category":
             X[col] = X[col].cat.codes
         elif X[col].dtype == "object":
+            # Mirror training-time MoE preprocessing: object columns were coerced to numeric.
+            # NOTE: this loses string signal; prefer modeling those columns as categorical in GLOBAL.
             X[col] = pd.to_numeric(X[col], errors="coerce")
     # IMPORTANT: do NOT impute missing values with 0. XGBoost handles missing values.
     

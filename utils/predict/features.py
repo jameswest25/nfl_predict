@@ -68,6 +68,7 @@ from utils.feature.enrichment.asof import (
     get_decision_cutoff_hours,
     get_fallback_cutoff_hours,
 )
+from utils.general.constants import format_cutoff_label
 from utils.general.paths import (
     PROJ_ROOT,
     PLAYER_DRIVE_BY_WEEK_DIR as PLAYER_DRIVE_DIR,
@@ -238,18 +239,60 @@ def _add_team_context_features(
             team_history = team_history.with_columns(
                 pl.col("game_date").cast(pl.Datetime("ms"))
             )
+        # In inference, ensure the history file covers the requested seasons/weeks.
+        if is_inference and not df.is_empty() and {"season", "week"} <= set(df.columns):
+            try:
+                req_max_season = int(df.select(pl.max("season")).item())
+                req_max_week = int(df.filter(pl.col("season") == req_max_season).select(pl.max("week")).item())
+                have_max_season = int(team_history.select(pl.max("season")).item()) if team_history.height else -1
+                have_max_week = (
+                    int(team_history.filter(pl.col("season") == have_max_season).select(pl.max("week")).item())
+                    if team_history.height and have_max_season >= 0
+                    else -1
+                )
+                if have_max_season < req_max_season or (have_max_season == req_max_season and have_max_week < req_max_week):
+                    logger.warning(
+                        "Team context history appears stale (have max %sW%s, need %sW%s). Recomputing history.",
+                        have_max_season,
+                        have_max_week,
+                        req_max_season,
+                        req_max_week,
+                    )
+                    # Rebuild from scratch using the processed player-game-by-week store.
+                    if PLAYER_GAME_DIR.exists():
+                        scan = pl.scan_parquet(
+                            str(PLAYER_GAME_DIR / "season=*/week=*/part.parquet"),
+                            glob=True,
+                            hive_partitioning=True,
+                            missing_columns="insert",
+                            extra_columns="ignore",
+                        )
+                        # compute over all available history; this is the safest parity option
+                        base_df = scan.collect(streaming=True)
+                        team_history = compute_team_context_history(base_df)
+                        history_path.parent.mkdir(parents=True, exist_ok=True)
+                        team_history.write_parquet(history_path, compression="zstd")
+                        # Reload to ensure consistent dtypes for join
+                        team_history = pl.read_parquet(str(history_path)).with_columns(
+                            pl.col("game_date").cast(pl.Datetime("ms"))
+                        )
+                    else:
+                        logger.warning("Cannot rebuild team context history: PLAYER_GAME_DIR missing at %s", PLAYER_GAME_DIR)
+            except Exception as exc:
+                logger.warning("Unable to validate/rebuild team context history: %s", exc)
     else:
         logger.warning(
             "Team context history file missing at %s; computing from scratch.",
             history_path,
         )
     
-    # For inference, we don't join on date (using pre-computed history)
+    # For inference, join as-of on date so we can support future weeks that
+    # are not present in the historical table (use latest prior game context).
     # For training, we return the history to be persisted
     if is_inference:
         df = add_team_context_features(
             df,
-            join_on_date=False,
+            join_on_date=True,
             history=team_history,
             cutoff_column=None,
         )
@@ -1064,13 +1107,24 @@ def _load_and_attach_snap_history(df: pl.DataFrame) -> pl.DataFrame:
     # historical data from training output which has the same filtering applied.
     
     # Check for training output in priority order:
-    # 1. Test-specific output (tests/temp_train_strict.parquet) 
-    # 2. Main training output (data/processed/final/processed.parquet)
-    # 3. Fallback to raw parquets (no parity guarantee)
-    candidate_paths = [
-        PROJ_ROOT / "tests" / "temp_train_strict.parquet",  # Parity test output
-        PROJ_ROOT / "data" / "processed" / "final" / "processed.parquet",  # Main training output
-    ]
+    # 1) Cutoff-specific processed parquet (strict parity with training horizon)
+    # 2) Default processed parquet (fallback)
+    # 3) Fallback to raw parquets (no parity guarantee)
+    cutoff_label = "default"
+    try:
+        cutoff_label = format_cutoff_label(float(get_decision_cutoff_hours()))
+    except Exception:
+        cutoff_label = "default"
+
+    candidate_paths = []
+    # Parity test output (if present)
+    candidate_paths.append(PROJ_ROOT / "tests" / "temp_train_strict.parquet")
+    # Prefer cutoff-suffixed feature matrix when available (e.g. processed_h090m.parquet)
+    if cutoff_label != "default":
+        candidate_paths.append(
+            PROJ_ROOT / "data" / "processed" / "final" / f"processed_{cutoff_label}.parquet"
+        )
+    candidate_paths.append(PROJ_ROOT / "data" / "processed" / "final" / "processed.parquet")
     
     training_output_path = None
     for path in candidate_paths:
@@ -1101,6 +1155,198 @@ def _load_and_attach_snap_history(df: pl.DataFrame) -> pl.DataFrame:
         return df
     
     avail_schema = hist_scan.collect_schema().names()
+
+    # ---------------------------------------------------------------------
+    # Inference parity: attach "time since last game" features.
+    #
+    # Training computes these deltas because the training matrix contains
+    # multiple rows per player and can shift() within-player. In inference,
+    # we typically have a single row per player for the upcoming game, so
+    # those deltas would be null unless we explicitly join against history.
+    #
+    # This matters for "season reset" behavior (players returning after long
+    # gaps) and avoids MoE overweighting stale prior usage.
+    # ---------------------------------------------------------------------
+    try:
+        if {"player_id", "game_start_utc"} <= set(df.columns) and {"player_id", "game_start_utc"} <= set(avail_schema):
+            last_game = (
+                hist_scan
+                .select(
+                    [
+                        pl.col("player_id").cast(pl.Utf8),
+                        pl.col("game_start_utc").cast(pl.Datetime("ms")).alias("hist_game_start_utc"),
+                    ]
+                )
+                .filter(pl.col("player_id").is_in(target_players))
+                .drop_nulls("hist_game_start_utc")
+                .sort(["player_id", "hist_game_start_utc"])
+                .collect(streaming=True)
+            )
+            if not last_game.is_empty():
+                # As-of join to pull most recent prior game per player
+                right = last_game.sort(["player_id", "hist_game_start_utc"])
+                left = (
+                    df.with_columns(
+                        [
+                            pl.col("player_id").cast(pl.Utf8),
+                            pl.col("game_start_utc").cast(pl.Datetime("ms")).alias("__cur_game_start_utc"),
+                        ]
+                    )
+                    .sort(["player_id", "__cur_game_start_utc"])
+                )
+                joined = left.join_asof(
+                    right,
+                    left_on="__cur_game_start_utc",
+                    right_on="hist_game_start_utc",
+                    by="player_id",
+                    strategy="backward",
+                )
+                joined = joined.with_columns(
+                    [
+                        (pl.col("__cur_game_start_utc") - pl.col("hist_game_start_utc"))
+                        .dt.total_minutes()
+                        .cast(pl.Float32)
+                        .alias("roster_minutes_since_last_game"),
+                    ]
+                ).with_columns(
+                    [
+                        (pl.col("roster_minutes_since_last_game") / 60.0)
+                        .cast(pl.Float32)
+                        .alias("roster_hours_since_last_game"),
+                        (pl.col("roster_minutes_since_last_game") / 60.0 / 24.0)
+                        .cast(pl.Float32)
+                        .alias("rest_days_since_last_game"),
+                    ]
+                ).drop(["__cur_game_start_utc"])
+
+                # Only overwrite if these columns are missing on the scaffold.
+                for c in ("roster_minutes_since_last_game", "roster_hours_since_last_game", "rest_days_since_last_game"):
+                    if c not in df.columns and c in joined.columns:
+                        df = joined
+                    else:
+                        # keep existing, but ensure joined doesn't add duplicates
+                        df = df
+    except Exception as exc:
+        logger.warning("Failed to attach roster gap features from history: %s", exc)
+
+    # ---------------------------------------------------------------------
+    # Inference parity: attach pre-snap history (ps_hist_) features from history.
+    #
+    # Training has these populated for historical rows (processed_<cutoff>.parquet),
+    # but inference rows (future games) will be null unless we explicitly as-of join
+    # to the most recent prior game for each player.
+    #
+    # This is critical for MoE/global models that include `ps_hist_` feature prefixes.
+    # ---------------------------------------------------------------------
+    try:
+        if {"player_id", "game_start_utc"} <= set(df.columns) and {"player_id", "game_start_utc"} <= set(avail_schema):
+            ps_cols = [c for c in avail_schema if str(c).startswith("ps_hist_")]
+            if ps_cols:
+                ps_hist = (
+                    hist_scan.select(
+                        [
+                            pl.col("player_id").cast(pl.Utf8),
+                            pl.col("game_start_utc").cast(pl.Datetime("ms")).alias("hist_game_start_utc"),
+                            *[pl.col(c) for c in ps_cols],
+                        ]
+                    )
+                    .filter(pl.col("player_id").is_in(target_players))
+                    .drop_nulls("hist_game_start_utc")
+                    .sort(["player_id", "hist_game_start_utc"])
+                    .collect(streaming=True)
+                )
+                if not ps_hist.is_empty():
+                    right = ps_hist.sort(["player_id", "hist_game_start_utc"])
+                    left = (
+                        df.with_columns(
+                            [
+                                pl.col("player_id").cast(pl.Utf8),
+                                pl.col("game_start_utc").cast(pl.Datetime("ms")).alias("__cur_game_start_utc"),
+                            ]
+                        )
+                        .sort(["player_id", "__cur_game_start_utc"])
+                    )
+                    joined = left.join_asof(
+                        right,
+                        left_on="__cur_game_start_utc",
+                        right_on="hist_game_start_utc",
+                        by="player_id",
+                        strategy="backward",
+                        suffix="_hist",
+                    )
+                    # Coalesce ps_hist columns into the scaffold (do not overwrite non-null values).
+                    coalesced_exprs: list[pl.Expr] = []
+                    drop_cols: list[str] = ["__cur_game_start_utc", "hist_game_start_utc"]
+                    for c in ps_cols:
+                        hist_c = f"{c}_hist"
+                        if hist_c in joined.columns:
+                            coalesced_exprs.append(pl.coalesce([pl.col(c), pl.col(hist_c)]).alias(c) if c in joined.columns else pl.col(hist_c).alias(c))
+                            drop_cols.append(hist_c)
+                    if coalesced_exprs:
+                        joined = joined.with_columns(coalesced_exprs)
+                    # Drop helper and hist duplicates
+                    drop_cols = [c for c in drop_cols if c in joined.columns]
+                    if drop_cols:
+                        joined = joined.drop(drop_cols)
+                    df = joined
+    except Exception as exc:
+        logger.warning("Failed to attach ps_hist_* features from history: %s", exc)
+
+    # ---------------------------------------------------------------------
+    # Inference parity: backfill depth chart metadata from history when missing.
+    #
+    # For future slates, current-week depth chart fields can be absent in the
+    # scaffold. Training rows usually have these populated. Use the most recent
+    # prior game as a safe fallback (no leakage; strictly historical).
+    # ---------------------------------------------------------------------
+    try:
+        if {"player_id", "game_start_utc"} <= set(df.columns) and {"player_id", "game_start_utc"} <= set(avail_schema):
+            # Prefer last *non-null* depth_chart_order to avoid propagating nulls forward.
+            if "depth_chart_order" in avail_schema:
+                dc_hist = (
+                    hist_scan.select(
+                        [
+                            pl.col("player_id").cast(pl.Utf8),
+                            pl.col("game_start_utc").cast(pl.Datetime("ms")).alias("hist_game_start_utc"),
+                            pl.col("depth_chart_order"),
+                        ]
+                    )
+                    .filter(pl.col("player_id").is_in(target_players))
+                    .drop_nulls(["hist_game_start_utc", "depth_chart_order"])
+                    .sort(["player_id", "hist_game_start_utc"])
+                    .collect(streaming=True)
+                )
+                if not dc_hist.is_empty():
+                    right = dc_hist.sort(["player_id", "hist_game_start_utc"])
+                    left = (
+                        df.with_columns(
+                            [
+                                pl.col("player_id").cast(pl.Utf8),
+                                pl.col("game_start_utc").cast(pl.Datetime("ms")).alias("__cur_game_start_utc"),
+                            ]
+                        )
+                        .sort(["player_id", "__cur_game_start_utc"])
+                    )
+                    joined = left.join_asof(
+                        right,
+                        left_on="__cur_game_start_utc",
+                        right_on="hist_game_start_utc",
+                        by="player_id",
+                        strategy="backward",
+                        suffix="_hist",
+                    )
+                    if "depth_chart_order_hist" in joined.columns:
+                        joined = joined.with_columns(
+                            pl.coalesce([pl.col("depth_chart_order"), pl.col("depth_chart_order_hist")]).alias("depth_chart_order")
+                        ).drop([c for c in ("__cur_game_start_utc", "hist_game_start_utc", "depth_chart_order_hist") if c in joined.columns])
+                    df = joined
+
+            # depth_chart_position is usually present; if missing, backfill from last row (not necessarily non-null constrained)
+            if "depth_chart_position" in avail_schema and "depth_chart_position" in df.columns:
+                # only fill if currently null
+                pass
+    except Exception as exc:
+        logger.warning("Failed to backfill depth chart columns from history: %s", exc)
     
     # PARITY FIX: If training output has pre-computed rolling features, use them directly
     # instead of recomputing. This ensures exact parity with training.

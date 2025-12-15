@@ -16,6 +16,7 @@ is in utils/predict/ modules. This file is just the orchestrator.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 from datetime import date, datetime, timedelta
@@ -46,7 +47,6 @@ from utils.predict import (
     predict_moe,
     predict_global,
     apply_guards_inline,
-    apply_availability_floor,
     apply_snaps_ceiling_cap,
     apply_usage_targets_position_cap,
     apply_usage_carries_position_cap,
@@ -63,7 +63,9 @@ from utils.feature.enrichment.asof import (
 )
 from utils.feature.enrichment.odds import collect_odds_snapshots
 from utils.collect.weather_forecasts import collect_weather_forecasts
+from utils.general.constants import format_cutoff_label
 from utils.general.paths import PROJ_ROOT
+from utils.train.audits import summarize_chain_diagnostics
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +112,17 @@ def _parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help="Override fallback cutoff when kickoff time is unavailable.",
+    )
+    parser.add_argument(
+        "--write-diagnostics",
+        action="store_true",
+        help="Write chain-level diagnostics JSON for this horizon/slate.",
+    )
+    parser.add_argument(
+        "--debug-player-id",
+        type=str,
+        default=None,
+        help="If set, write a one-row debug JSON for this player_id.",
     )
     return parser.parse_args()
 
@@ -179,6 +192,49 @@ def _run_model_chain(features: pd.DataFrame, problems: list[dict]) -> pd.DataFra
     pd.DataFrame
         Features with prediction columns added
     """
+    # ---------------------------------------------------------------------
+    # Stage gating (inference-time).
+    #
+    # The user wants a "conditional chain":
+    # - availability_active decides who is active.
+    # - snaps only runs for predicted-active players (inactive => snaps=0).
+    # - usage only runs for players with predicted snaps > 0 (else 0).
+    # - efficiency + td_conv only run for players with predicted usage > 0 (else 0).
+    #
+    # We implement gating for BOTH global and MoE predictions and record
+    # gate flags so diagnostics can explain why rows were skipped.
+    # ---------------------------------------------------------------------
+    avail_thr = None
+    try:
+        avail_thr = float(load_threshold("availability_active"))
+    except Exception:
+        avail_thr = None
+
+    def _gate_active(col: str) -> np.ndarray:
+        if col not in features.columns:
+            return np.ones(len(features), dtype=bool)
+        thr = float(avail_thr) if avail_thr is not None else 0.5
+        p = pd.to_numeric(features[col], errors="coerce").to_numpy(dtype=float, copy=False)
+        return np.nan_to_num(p, nan=0.0) >= thr
+
+    def _gate_snaps(col: str) -> np.ndarray:
+        if col not in features.columns:
+            return np.ones(len(features), dtype=bool)
+        x = pd.to_numeric(features[col], errors="coerce").to_numpy(dtype=float, copy=False)
+        return np.nan_to_num(x, nan=0.0) > 0.0
+
+    def _gate_usage(col: str) -> np.ndarray:
+        if col not in features.columns:
+            return np.ones(len(features), dtype=bool)
+        x = pd.to_numeric(features[col], errors="coerce").to_numpy(dtype=float, copy=False)
+        return np.nan_to_num(x, nan=0.0) > 0.0
+
+    usage_problems = {"usage_targets", "usage_carries", "usage_target_yards"}
+    eff_rec_problems = {"efficiency_rec_yards_air", "efficiency_rec_yards_yac", "efficiency_rec_yards"}
+    eff_rush_problems = {"efficiency_rush_yards", "efficiency_rush_success"}
+    td_conv_rec_problems = {"td_conv_rec"}
+    td_conv_rush_problems = {"td_conv_rush"}
+
     for problem in problems:
         p_name = problem["name"]
         pred_col = f"pred_{p_name}"
@@ -191,33 +247,65 @@ def _run_model_chain(features: pd.DataFrame, problems: list[dict]) -> pd.DataFra
             logger.warning("Skipping %s (artifacts not found).", p_name)
             continue
 
+        # Determine gating masks for this stage (global vs moe).
+        gate_global = np.ones(len(features), dtype=bool)
+        gate_moe = np.ones(len(features), dtype=bool)
+
+        if p_name == "snaps":
+            gate_global = _gate_active("pred_availability_active")
+            gate_moe = _gate_active("pred_availability_active_moe")
+        elif p_name in usage_problems:
+            gate_global = _gate_snaps("pred_snaps")
+            gate_moe = _gate_snaps("pred_snaps_moe")
+        elif p_name in eff_rec_problems | td_conv_rec_problems:
+            gate_global = _gate_usage("pred_usage_targets")
+            gate_moe = _gate_usage("pred_usage_targets_moe")
+        elif p_name in eff_rush_problems | td_conv_rush_problems:
+            gate_global = _gate_usage("pred_usage_carries")
+            gate_moe = _gate_usage("pred_usage_carries_moe")
+
+        features[f"gate_{p_name}_global"] = gate_global.astype(np.int8)
+        # only record moe gate when moe models exist / are used
+
         # IMPORTANT: For stacked parity, always materialize GLOBAL predictions as the
         # canonical `pred_{problem}` columns (these are what training artifacts use).
         #
-        # If MoE artifacts exist, also compute `pred_{problem}_moe` for debugging /
-        # comparison, but do not let it silently replace the canonical stack inputs.
-        global_preds = predict_global(features, problem, artifacts)
+        # We now apply stage gating: rows that fail the gate are set to 0.0 and
+        # are not passed through the downstream model.
+        global_preds = np.zeros(len(features), dtype=np.float64)
+        if gate_global.any():
+            preds_sub = predict_global(features.loc[gate_global].copy(), problem, artifacts)
+            global_preds[gate_global] = preds_sub
         global_preds = _apply_problem_postprocessing(features, global_preds, p_name)
         features[f"pred_{p_name}_global"] = global_preds
 
         use_moe = check_moe_available(p_name)
         if use_moe:
+            features[f"gate_{p_name}_moe"] = gate_moe.astype(np.int8)
             logger.info("Also running MoE models for %s", p_name)
-            moe_preds = predict_moe(features, p_name)
+            moe_preds = np.zeros(len(features), dtype=np.float64)
+            if gate_moe.any():
+                preds_sub = predict_moe(features.loc[gate_moe].copy(), p_name)
+                moe_preds[gate_moe] = preds_sub
             moe_preds = _apply_problem_postprocessing(features, moe_preds, p_name)
             features[f"pred_{p_name}_moe"] = moe_preds
 
         # Default stack input: GLOBAL preds
         features[pred_col] = global_preds
 
+        # Keep composed features up to date so downstream stages that consume
+        # `expected_` columns (e.g., td_conv_* which includes expected_ features)
+        # see the same inputs they were trained on.
+        if p_name in ("availability_active", "snaps", "usage_targets", "usage_carries", "usage_target_yards"):
+            features = inject_composed_features(features)
+
         # Debug: Print prediction stats
         print(f"--- {pred_col} stats ---")
         print(features[pred_col].describe().T[["mean", "min", "50%", "max"]])
         print("------------------------")
 
-        # Inject composed features after efficiency_tds
-        if p_name == "efficiency_tds":
-            features = inject_composed_features(features)
+        # (No longer wait until the end to inject composed features; we refresh them
+        # incrementally so chain inputs remain in parity with training.)
 
     # Ensure composed features are present after the full chain
     features = inject_composed_features(features)
@@ -234,9 +322,6 @@ def _apply_problem_postprocessing(
     if p_name == "availability_active":
         features["pred_availability_active_raw"] = preds.copy()
         preds = apply_guards_inline(features, preds)
-        preds = apply_availability_floor(features, preds)
-        preds = np.clip(preds, 0.0, 1.0)
-    elif p_name == "availability_snapshare":
         preds = np.clip(preds, 0.0, 1.0)
     elif p_name == "pre_snap_routes":
         preds = np.clip(preds, 0.0, 1.0)
@@ -314,6 +399,80 @@ def main() -> None:
         # Step 6: Run model chain
         logger.info("Running model prediction chain...")
         features = _run_model_chain(features, problems)
+
+        # Optional: chain-level diagnostics for this horizon/slate
+        if getattr(args, "write_diagnostics", False):
+            try:
+                cutoff_label = format_cutoff_label(float(active_cutoff))
+            except Exception:
+                cutoff_label = "default"
+            diag = summarize_chain_diagnostics(features)
+            diag_path = PREDICTION_DIR / f"chain_diagnostics_{start_date}_{end_date}_{cutoff_label}.json"
+            diag_path.write_text(json.dumps(diag, indent=2))
+            logger.info("Wrote chain diagnostics to %s", diag_path)
+
+        # Optional: per-player debug dump (single-row JSON for quick diagnosis)
+        if getattr(args, "debug_player_id", None):
+            pid = str(args.debug_player_id)
+            try:
+                cutoff_label = format_cutoff_label(float(active_cutoff))
+            except Exception:
+                cutoff_label = "default"
+            debug_path = PREDICTION_DIR / f"debug_player_{pid}_{start_date}_{end_date}_{cutoff_label}.json"
+            mask = (features.get("player_id") == pid) if "player_id" in features.columns else None
+            if mask is None or mask.sum() == 0:
+                logger.warning("debug-player-id=%s not found on this slate; writing empty payload.", pid)
+                payload = {"player_id": pid, "found": False, "rows": []}
+            else:
+                df_dbg = features.loc[mask].copy()
+                # include all pred_/expected_/gate_ plus high-signal flags/role cols
+                cols = []
+                cols += [c for c in df_dbg.columns if c.startswith("pred_")]
+                cols += [c for c in df_dbg.columns if c.startswith("expected_")]
+                cols += [c for c in df_dbg.columns if c.startswith("gate_")]
+                cols += [
+                    c
+                    for c in [
+                    "player_name",
+                        "team",
+                        "position",
+                        "opponent",
+                        "season",
+                        "week",
+                        "game_id",
+                        "game_date",
+                    "depth_chart_order",
+                    "depth_chart_position",
+                        "position_group",
+                        "status",
+                        "injury_game_designation",
+                        "injury_report_status",
+                        "injury_practice_status",
+                        "roster_status_known_at_cutoff",
+                        "is_return_specialist",
+                        "is_special_teams_only",
+                        "is_low_usage_role",
+                        "likely_zero_usage",
+                        "snap_st_pct_l3",
+                        "snap_offense_pct_l3",
+                        "hist_target_share_l3",
+                        "hist_carry_share_l3",
+                        "combined_usage_share_l3",
+                        "ps_hist_targets_total_l3",
+                        "ps_hist_scripted_touches_l3",
+                    ]
+                    if c in df_dbg.columns
+                ]
+                cols = list(dict.fromkeys(cols))
+                payload = {
+                    "player_id": pid,
+                    "found": True,
+                    "cutoff_hours": float(active_cutoff),
+                    "cutoff_label": cutoff_label,
+                    "rows": df_dbg[cols].to_dict(orient="records"),
+                }
+            debug_path.write_text(json.dumps(payload, indent=2, default=str))
+            logger.info("Wrote debug player dump to %s", debug_path)
         
         # Step 7: Format and save output
         logger.info("Formatting output...")

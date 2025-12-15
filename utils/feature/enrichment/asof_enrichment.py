@@ -99,6 +99,28 @@ def attach_asof_metadata(
     ]
     if missing_flag_exprs:
         df = df.with_columns(missing_flag_exprs)
+
+    # Add "known_at_cutoff" flags (horizon semantics observability).
+    if "decision_cutoff_ts" in df.columns:
+        known_exprs: list[pl.Expr] = []
+        for snap_col in (
+            "injury_snapshot_ts",
+            "roster_snapshot_ts",
+            "odds_snapshot_ts",
+            "forecast_snapshot_ts",
+        ):
+            if snap_col in df.columns:
+                known_exprs.append(
+                    (
+                        pl.col(snap_col).is_not_null()
+                        & pl.col("decision_cutoff_ts").is_not_null()
+                        & (pl.col(snap_col) <= pl.col("decision_cutoff_ts"))
+                    )
+                    .cast(pl.Int8)
+                    .alias(f"{snap_col}_known_at_cutoff")
+                )
+        if known_exprs:
+            df = df.with_columns(known_exprs)
     
     # Optionally drop rows missing full snapshots
     if drop_missing_snapshots:

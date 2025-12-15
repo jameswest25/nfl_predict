@@ -127,6 +127,20 @@ def add_expected_snap_features(df: pl.DataFrame) -> pl.DataFrame:
                 .cast(pl.Float32)
                 .alias("expected_snaps_prev")
             )
+
+    # Return-specialist flag (deterministic; no imputation).
+    # High ST snap share + very low offensive snap share suggests return role.
+    if {"snap_st_pct_l3", "snap_offense_pct_l3"} <= cols and "is_return_specialist" not in cols:
+        exprs.append(
+            (
+                pl.col("snap_st_pct_l3").is_not_null()
+                & pl.col("snap_offense_pct_l3").is_not_null()
+                & (pl.col("snap_st_pct_l3") >= 0.25)
+                & (pl.col("snap_offense_pct_l3") <= 0.15)
+            )
+            .cast(pl.Int8)
+            .alias("is_return_specialist")
+        )
     
     # Expected red zone snaps
     rz_cols = {"team_ctx_offensive_plays_l3", "team_ctx_red_zone_play_rate_l3", 

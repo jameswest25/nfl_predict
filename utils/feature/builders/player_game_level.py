@@ -889,20 +889,27 @@ def _append_zero_usage_players(
             [
                 pl.when(pl.col("roster_status_snapshot_ts").is_not_null())
                 .then(pl.col("status_snap"))
-                .otherwise(pl.col("status"))
+                # IMPORTANT: if we do NOT have a pre-cutoff roster snapshot for this
+                # player/game, we must not fall back to the "current roster" status,
+                # because it can contain post-cutoff information (leakage).
+                .otherwise(pl.lit(None).cast(pl.Utf8))
                 .alias("status"),
                 pl.when(pl.col("roster_status_snapshot_ts").is_not_null())
                 .then(pl.col("status_abbr_snap"))
-                .otherwise(pl.col("status_abbr"))
+                .otherwise(pl.lit(None).cast(pl.Utf8))
                 .alias("status_abbr"),
                 pl.when(pl.col("roster_status_snapshot_ts").is_not_null())
                 .then(pl.col("status_detail_snap"))
-                .otherwise(pl.col("status_detail"))
+                .otherwise(pl.lit(None).cast(pl.Utf8))
                 .alias("status_detail"),
                 pl.when(pl.col("roster_status_snapshot_ts").is_not_null())
                 .then(pl.col("depth_chart_order_snap"))
-                .otherwise(pl.col("depth_chart_order"))
+                .otherwise(pl.lit(None).cast(pl.Int32))
                 .alias("depth_chart_order"),
+                pl.col("roster_status_snapshot_ts")
+                .is_not_null()
+                .cast(pl.Int8)
+                .alias("roster_status_known_at_cutoff"),
             ]
         ).drop(
             [
@@ -915,7 +922,10 @@ def _append_zero_usage_players(
         )
     else:
         roster_game = roster_game.with_columns(
-            pl.lit(None).cast(pl.Datetime("ms", "UTC")).alias("roster_status_snapshot_ts")
+            [
+                pl.lit(None).cast(pl.Datetime("ms", "UTC")).alias("roster_status_snapshot_ts"),
+                pl.lit(0).cast(pl.Int8).alias("roster_status_known_at_cutoff"),
+            ]
         )
 
     window_weeks = (

@@ -102,6 +102,7 @@ from utils.train.conformal_composite import (
 )
 from utils.feature.core.leak_guard import DEFAULT_LEAK_POLICY, enforce_leak_guard
 from utils.feature.core.targets import require_target_column
+from utils.train.audits import audit_horizon_knownness, audit_td_conv_labels, summarize_chain_diagnostics
 
 # Ignore specific, noisy warnings from dependencies
 warnings.filterwarnings(
@@ -574,19 +575,7 @@ class ModelTrainer:
             # Create masks for this position
             train_mask = (df_train["position_group"] == pos).values
             test_mask = (df_test["position_group"] == pos).values
-            
-            n_train = train_mask.sum()
-            n_test = test_mask.sum()
-            
-            if n_train < min_rows:
-                logger.warning(
-                    f"[MoE] Skipping {pos} for {problem_name}: only {n_train} training samples "
-                    f"(min_rows={min_rows})"
-                )
-                continue
-            
-            logger.info(f"[MoE] Training {problem_name}.{pos}: {n_train} train, {n_test} test samples")
-            
+
             # Subset data
             X_train_pos = X_train.loc[train_mask].copy()
             if X_train_pos.columns.duplicated().any():
@@ -595,6 +584,35 @@ class ModelTrainer:
                 X_train_pos = X_train_pos.loc[:, ~X_train_pos.columns.duplicated()].copy()
             y_train_pos = y_train.loc[train_mask].copy()
             sw_pos = sample_weight.loc[train_mask] if sample_weight is not None else None
+
+            # Stage-gating support via sample_weight:
+            # If sw_pos contains all zeros, XGBoost can error with NaN base_score.
+            # Filter out zero-weight rows before checking min_rows / fitting.
+            if sw_pos is not None:
+                sw_num = pd.to_numeric(sw_pos, errors="coerce").fillna(0.0).to_numpy()
+                keep = sw_num > 0.0
+                if keep.sum() == 0:
+                    logger.warning(
+                        "[MoE] Skipping %s for %s: all training rows gated out (weight=0).",
+                        pos,
+                        problem_name,
+                    )
+                    continue
+                X_train_pos = X_train_pos.loc[X_train_pos.index[keep]].copy()
+                y_train_pos = y_train_pos.loc[y_train_pos.index[keep]].copy()
+                sw_pos = sw_pos.loc[sw_pos.index[keep]].copy()
+
+            n_train = int(len(X_train_pos))
+            n_test = int(test_mask.sum())
+
+            if n_train < min_rows:
+                logger.warning(
+                    f"[MoE] Skipping {pos} for {problem_name}: only {n_train} training samples "
+                    f"(min_rows={min_rows})"
+                )
+                continue
+
+            logger.info(f"[MoE] Training {problem_name}.{pos}: {n_train} train, {n_test} test samples")
             
             # Convert categorical columns to numeric for XGBoost
             for col in X_train_pos.columns:
@@ -750,7 +768,36 @@ class ModelTrainer:
             joblib.dump(model, model_path)
             logger.info(f"[MoE] Saved {problem_name}.{pos} model to {model_path}")
         
-        # Also save MoE inference artifacts
+        # Also save MoE inference artifacts.
+        #
+        # IMPORTANT (structural):
+        # MoE inference must be able to prepare features WITHOUT depending on
+        # the global artifacts for this problem. That means persisting the same
+        # categorical metadata used to build MoE training matrices.
+        #
+        # (Today, most MoE problems reuse the global categorical mapping because
+        # X_train contains categoricals already; but the MoE artifacts should
+        # still carry this mapping so inference is self-contained.)
+        task_type = None
+        output_mode = None
+        try:
+            for p in (self.config.get("problems", []) or []):
+                if str(p.get("name")) == str(problem_name):
+                    task_type = p.get("task_type")
+                    output_mode = p.get("output_mode")
+                    break
+        except Exception:
+            pass
+
+        if output_mode is None and task_type:
+            try:
+                if str(task_type).lower() in ("classification", "binary", "multiclass"):
+                    output_mode = "probability"
+                else:
+                    output_mode = "value"
+            except Exception:
+                pass
+
         moe_artifacts = {
             "feature_columns": (
                 list(feature_columns_override)
@@ -759,6 +806,12 @@ class ModelTrainer:
             ),
             "positions": list(position_models.keys()),
             "fallback_position": fallback_position,  # From config
+            # Match global artifact payload shape so inference can be consistent.
+            "imputation_values": (self.imputation_values.get(problem_name, {}) if hasattr(self, "imputation_values") else {}),
+            "category_levels": (self.category_levels.get(problem_name, {}) if hasattr(self, "category_levels") else {}),
+            "categorical_features": (self.categorical_features.get(problem_name, []) if hasattr(self, "categorical_features") else []),
+            "task_type": task_type,
+            "output_mode": output_mode,
         }
         # Horizon-safe legacy artifact name (avoid mixing cutoffs).
         cutoff_label = getattr(self, "cutoff_label", "default")
@@ -990,38 +1043,6 @@ class ModelTrainer:
         if df is None or df.empty:
             return df
 
-        def _ensure_availability_composites(frame: pd.DataFrame) -> None:
-            if (
-                "pred_availability" in frame.columns
-                and "pred_availability_raw" in frame.columns
-            ):
-                return
-            has_active = "pred_availability_active" in frame.columns
-            has_share = "pred_availability_snapshare" in frame.columns
-            if not (has_active and has_share):
-                return
-            active = pd.to_numeric(frame["pred_availability_active"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
-            share = pd.to_numeric(frame["pred_availability_snapshare"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
-            combined = (active * share).astype(np.float32)
-            if "pred_availability" not in frame.columns:
-                frame["pred_availability"] = combined
-            if "pred_availability_raw" not in frame.columns:
-                if "pred_availability_active_raw" in frame.columns:
-                    raw_active = (
-                        pd.to_numeric(frame["pred_availability_active_raw"], errors="coerce")
-                        .fillna(0.0)
-                        .clip(0.0, 1.0)
-                    )
-                    frame["pred_availability_raw"] = (raw_active * share).astype(np.float32)
-                else:
-                    frame["pred_availability_raw"] = combined
-
-        _ensure_availability_composites(df)
-
-        def _safe_mul(a: str, b: str, out_col: str):
-            if a in df.columns and b in df.columns and out_col not in df.columns:
-                df[out_col] = df[a] * df[b]
-
         def _select_column(candidates: list[str]) -> str | None:
             for name in candidates:
                 if name in df.columns:
@@ -1037,34 +1058,65 @@ class ModelTrainer:
             "team_pass_rate_l3",
                 ]
         pass_rate_col = _select_column(pass_rate_candidates)
-        default_pass_rate = 0.55
-        if len(df):
-            if pass_rate_col:
-                pass_rate_series = (
-                    pd.to_numeric(df[pass_rate_col], errors="coerce")
-                    .fillna(default_pass_rate)
-                    .clip(0.0, 1.0)
-                )
-            else:
-                pass_rate_series = pd.Series(default_pass_rate, index=df.index, dtype=np.float32)
-        else:
-            pass_rate_series = pd.Series([], dtype=np.float32)
-        rush_rate_series = (1.0 - pass_rate_series).clip(0.0, 1.0)
+        pass_rate_series: pd.Series | None = None
+        rush_rate_series: pd.Series | None = None
+        if pass_rate_col:
+            pass_rate_series = pd.to_numeric(df[pass_rate_col], errors="coerce").clip(0.0, 1.0)
+            rush_rate_series = (1.0 - pass_rate_series).clip(0.0, 1.0)
 
         # Team-level expected plays from pace model
+        team_pace_series: pd.Series | None = None
+        pace_origin: str | None = None  # "pred" | "l3" | "prev" | None
         if "pred_team_pace" in df.columns:
-            team_pace = pd.to_numeric(df["pred_team_pace"], errors="coerce").clip(lower=0.0)
-            df["expected_team_plays"] = team_pace
-            if len(team_pace) and len(pass_rate_series) == len(team_pace):
-                df["expected_team_pass_plays"] = (team_pace * pass_rate_series).astype(np.float32)
-                df["expected_team_rush_plays"] = (team_pace * rush_rate_series).astype(np.float32)
+            team_pace_series = pd.to_numeric(df["pred_team_pace"], errors="coerce").clip(lower=0.0)
+            pace_origin = "pred"
+        else:
+            pace_col = _select_column(
+                [
+                    "team_pace_l3",
+                    "team_pace_prev",
+                    "team_ctx_offensive_plays_l3",
+                    "team_ctx_offensive_plays_prev",
+                ]
+            )
+            if pace_col:
+                team_pace_series = pd.to_numeric(df[pace_col], errors="coerce").clip(lower=0.0)
+                if str(pace_col).endswith("_l3"):
+                    pace_origin = "l3"
+                elif str(pace_col).endswith("_prev"):
+                    pace_origin = "prev"
+
+        if team_pace_series is not None:
+            df["expected_team_plays"] = team_pace_series.astype(np.float32)
+            if (
+                pass_rate_series is not None
+                and rush_rate_series is not None
+                and len(pass_rate_series) == len(team_pace_series)
+            ):
+                # Avoid mixing windows (e.g., pace_l3 with pass_rate_prev).
+                if pace_origin == "prev":
+                    if pass_rate_col and str(pass_rate_col).endswith("_prev"):
+                        pass_rate_series = pass_rate_series
+                        rush_rate_series = rush_rate_series
+                    else:
+                        alt = _select_column(["team_ctx_pass_rate_prev", "team_pass_rate_prev"])
+                        if alt:
+                            pass_rate_series = pd.to_numeric(df[alt], errors="coerce").clip(0.0, 1.0)
+                            rush_rate_series = (1.0 - pass_rate_series).clip(0.0, 1.0)
+                else:
+                    if pass_rate_col and str(pass_rate_col).endswith("_l3"):
+                        pass_rate_series = pass_rate_series
+                        rush_rate_series = rush_rate_series
+                    else:
+                        alt = _select_column(["team_ctx_pass_rate_l3", "team_pass_rate_l3"])
+                        if alt:
+                            pass_rate_series = pd.to_numeric(df[alt], errors="coerce").clip(0.0, 1.0)
+                            rush_rate_series = (1.0 - pass_rate_series).clip(0.0, 1.0)
+
+                df["expected_team_pass_plays"] = (team_pace_series * pass_rate_series).astype(np.float32)
+                df["expected_team_rush_plays"] = (team_pace_series * rush_rate_series).astype(np.float32)
             else:
-                df["expected_team_pass_plays"] = (
-                    team_pace * default_pass_rate
-                ).astype(np.float32)
-                df["expected_team_rush_plays"] = (
-                    team_pace * (1.0 - default_pass_rate)
-                ).astype(np.float32)
+                logger.warning("Cannot compute expected_team_pass_plays/expected_team_rush_plays (missing pass rate cols).")
 
         # Explicit snaps expectation from stage-1 model or availability fallback
         expected_snaps_series: pd.Series | None = None
@@ -1075,28 +1127,11 @@ class ModelTrainer:
                 .clip(lower=0.0)
             )
             df["expected_snaps"] = expected_snaps_series.astype(np.float32)
-        elif (
-            "pred_availability" in df.columns
-            and "pred_availability_snapshare" in df.columns
-            and "expected_team_plays" in df.columns
-        ):
-            avail = pd.to_numeric(df["pred_availability"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
-            snapshare = pd.to_numeric(df["pred_availability_snapshare"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
-            team_plays = pd.to_numeric(df["expected_team_plays"], errors="coerce").fillna(0.0).clip(lower=0.0)
-            expected_snaps_series = (avail * snapshare * team_plays).astype(np.float32)
-            df["expected_snaps"] = expected_snaps_series
 
         # Raw snaps proxy (used for diagnostics/guard rails)
         expected_snaps_raw_series: pd.Series | None = None
-        if (
-            "pred_availability_raw" in df.columns
-            and "pred_availability_snapshare" in df.columns
-            and "expected_team_plays" in df.columns
-        ):
-            avail_raw = pd.to_numeric(df["pred_availability_raw"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
-            snapshare = pd.to_numeric(df["pred_availability_snapshare"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
-            team_plays = pd.to_numeric(df["expected_team_plays"], errors="coerce").fillna(0.0).clip(lower=0.0)
-            expected_snaps_raw_series = (avail_raw * snapshare * team_plays).astype(np.float32)
+        if "pred_snaps" in df.columns and "expected_snaps" in df.columns:
+            expected_snaps_raw_series = pd.to_numeric(df["expected_snaps"], errors="coerce").fillna(0.0).clip(lower=0.0).astype(np.float32)
             df["expected_snaps_raw"] = expected_snaps_raw_series
 
         if expected_snaps_series is None and "expected_snaps" in df.columns:
@@ -1114,29 +1149,49 @@ class ModelTrainer:
             df["expected_snaps_stable"] = (expected_snaps_series * (1.0 - unc)).astype(np.float32)
 
         # Usage share × expected snaps × team rates = expected counts
-        if expected_snaps_series is not None and "pred_usage_targets" in df.columns:
-            share_tgt = pd.to_numeric(df["pred_usage_targets"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
-            df["expected_targets"] = (
-                share_tgt.astype(np.float32) * expected_snaps_series * pass_rate_series.reindex(df.index, fill_value=default_pass_rate)
-            ).astype(np.float32)
+        avail_series = None
+        if "pred_availability_active" in df.columns:
+            avail_series = pd.to_numeric(df["pred_availability_active"], errors="coerce").clip(0.0, 1.0).astype(np.float32)
+        avail_moe_series = None
+        if "pred_availability_active_moe" in df.columns:
+            avail_moe_series = pd.to_numeric(df["pred_availability_active_moe"], errors="coerce").clip(0.0, 1.0).astype(np.float32)
 
-        if expected_snaps_raw_series is not None and "pred_usage_targets" in df.columns:
-            share_tgt = pd.to_numeric(df["pred_usage_targets"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
-            df["expected_targets_raw"] = (
-                share_tgt.astype(np.float32) * expected_snaps_raw_series * pass_rate_series.reindex(df.index, fill_value=default_pass_rate)
-            ).astype(np.float32)
+        if "expected_team_pass_plays" in df.columns and "pred_usage_targets" in df.columns:
+            share_tgt = pd.to_numeric(df["pred_usage_targets"], errors="coerce").fillna(0.0).clip(0.0, 1.0).astype(np.float32)
+            team_pass = pd.to_numeric(df["expected_team_pass_plays"], errors="coerce")
+            df["expected_targets_raw"] = (team_pass * share_tgt).astype(np.float32)
+            if avail_series is not None:
+                df["expected_targets"] = (df["expected_targets_raw"] * avail_series).astype(np.float32)
+            else:
+                df["expected_targets"] = df["expected_targets_raw"]
 
-        if expected_snaps_series is not None and "pred_usage_carries" in df.columns:
-            share_car = pd.to_numeric(df["pred_usage_carries"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
-            df["expected_carries"] = (
-                share_car.astype(np.float32) * expected_snaps_series * rush_rate_series.reindex(df.index, fill_value=1.0 - default_pass_rate)
-            ).astype(np.float32)
+        if "expected_team_rush_plays" in df.columns and "pred_usage_carries" in df.columns:
+            share_car = pd.to_numeric(df["pred_usage_carries"], errors="coerce").fillna(0.0).clip(0.0, 1.0).astype(np.float32)
+            team_rush = pd.to_numeric(df["expected_team_rush_plays"], errors="coerce")
+            df["expected_carries_raw"] = (team_rush * share_car).astype(np.float32)
+            if avail_series is not None:
+                df["expected_carries"] = (df["expected_carries_raw"] * avail_series).astype(np.float32)
+            else:
+                df["expected_carries"] = df["expected_carries_raw"]
 
-        if expected_snaps_raw_series is not None and "pred_usage_carries" in df.columns:
-            share_car = pd.to_numeric(df["pred_usage_carries"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
-            df["expected_carries_raw"] = (
-                share_car.astype(np.float32) * expected_snaps_raw_series * rush_rate_series.reindex(df.index, fill_value=1.0 - default_pass_rate)
-            ).astype(np.float32)
+        # MoE-composed expectations (self-consistent MoE chain)
+        if "expected_team_pass_plays" in df.columns and "pred_usage_targets_moe" in df.columns:
+            share_tgt_moe = pd.to_numeric(df["pred_usage_targets_moe"], errors="coerce").fillna(0.0).clip(0.0, 1.0).astype(np.float32)
+            team_pass = pd.to_numeric(df["expected_team_pass_plays"], errors="coerce")
+            df["expected_targets_raw_moe"] = (team_pass * share_tgt_moe).astype(np.float32)
+            if avail_moe_series is not None:
+                df["expected_targets_moe"] = (df["expected_targets_raw_moe"] * avail_moe_series).astype(np.float32)
+            else:
+                df["expected_targets_moe"] = df["expected_targets_raw_moe"]
+
+        if "expected_team_rush_plays" in df.columns and "pred_usage_carries_moe" in df.columns:
+            share_car_moe = pd.to_numeric(df["pred_usage_carries_moe"], errors="coerce").fillna(0.0).clip(0.0, 1.0).astype(np.float32)
+            team_rush = pd.to_numeric(df["expected_team_rush_plays"], errors="coerce")
+            df["expected_carries_raw_moe"] = (team_rush * share_car_moe).astype(np.float32)
+            if avail_moe_series is not None:
+                df["expected_carries_moe"] = (df["expected_carries_raw_moe"] * avail_moe_series).astype(np.float32)
+            else:
+                df["expected_carries_moe"] = df["expected_carries_raw_moe"]
 
         if "expected_targets" in df.columns and "expected_targets_raw" not in df.columns:
             df["expected_targets_raw"] = df["expected_targets"]
@@ -1173,6 +1228,27 @@ class ModelTrainer:
         if "expected_targets_raw" in df.columns and "expected_carries_raw" in df.columns:
             df["expected_opportunities_raw"] = df["expected_targets_raw"] + df["expected_carries_raw"]
 
+        if "expected_targets_moe" in df.columns and "expected_carries_moe" in df.columns:
+            group_keys = [k for k in ("season", "week", "team", "game_id") if k in df.columns]
+            if group_keys and {"expected_team_pass_plays", "expected_team_rush_plays"} <= set(df.columns):
+                grouped = df.groupby(group_keys, dropna=False, sort=False)
+                sum_targets_moe = grouped["expected_targets_moe"].transform("sum")
+                sum_carries_moe = grouped["expected_carries_moe"].transform("sum")
+                team_pass = df["expected_team_pass_plays"]
+                team_rush = df["expected_team_rush_plays"]
+                eps = 1e-6
+                tgt_mask = (team_pass > 0.0) & (sum_targets_moe > 0.0)
+                car_mask = (team_rush > 0.0) & (sum_carries_moe > 0.0)
+                scale_tgt_moe = np.ones_like(team_pass, dtype=np.float32)
+                scale_car_moe = np.ones_like(team_rush, dtype=np.float32)
+                scale_tgt_moe[tgt_mask] = (team_pass[tgt_mask] / (sum_targets_moe[tgt_mask] + eps)).clip(0.25, 4.0)
+                scale_car_moe[car_mask] = (team_rush[car_mask] / (sum_carries_moe[car_mask] + eps)).clip(0.25, 4.0)
+                df["expected_targets_moe"] = df["expected_targets_moe"] * scale_tgt_moe
+                df["expected_carries_moe"] = df["expected_carries_moe"] * scale_car_moe
+            df["expected_opportunities_moe"] = df["expected_targets_moe"] + df["expected_carries_moe"]
+        if "expected_targets_raw_moe" in df.columns and "expected_carries_raw_moe" in df.columns:
+            df["expected_opportunities_raw_moe"] = df["expected_targets_raw_moe"] + df["expected_carries_raw_moe"]
+
         if "pred_efficiency_tds" in df.columns and "expected_opportunities" in df.columns:
             df["expected_td_signal"] = df["pred_efficiency_tds"] * df["expected_opportunities"]
         if "pred_efficiency_tds" in df.columns and "expected_opportunities_raw" in df.columns:
@@ -1205,6 +1281,21 @@ class ModelTrainer:
         if td_rate_rush is not None and "expected_carries" in df.columns:
             expected_carries = pd.to_numeric(df["expected_carries"], errors="coerce").fillna(0.0).clip(lower=0.0)
             df["expected_td_from_carries"] = (td_rate_rush * expected_carries).astype(np.float32)
+
+        td_rate_rec_moe = None
+        if "pred_td_conv_rec_moe" in df.columns:
+            td_rate_rec_moe = pd.to_numeric(df["pred_td_conv_rec_moe"], errors="coerce").clip(0.0, 1.0)
+            df["expected_td_rate_per_target_moe"] = td_rate_rec_moe.astype(np.float32)
+        td_rate_rush_moe = None
+        if "pred_td_conv_rush_moe" in df.columns:
+            td_rate_rush_moe = pd.to_numeric(df["pred_td_conv_rush_moe"], errors="coerce").clip(0.0, 1.0)
+            df["expected_td_rate_per_carry_moe"] = td_rate_rush_moe.astype(np.float32)
+        if td_rate_rec_moe is not None and "expected_targets_moe" in df.columns:
+            expected_targets_moe = pd.to_numeric(df["expected_targets_moe"], errors="coerce").fillna(0.0).clip(lower=0.0)
+            df["expected_td_from_targets_moe"] = (td_rate_rec_moe * expected_targets_moe).astype(np.float32)
+        if td_rate_rush_moe is not None and "expected_carries_moe" in df.columns:
+            expected_carries_moe = pd.to_numeric(df["expected_carries_moe"], errors="coerce").fillna(0.0).clip(lower=0.0)
+            df["expected_td_from_carries_moe"] = (td_rate_rush_moe * expected_carries_moe).astype(np.float32)
         if td_rate_rec is not None and "expected_rz_targets" in df.columns:
             rz_targets = pd.to_numeric(df["expected_rz_targets"], errors="coerce").fillna(0.0).clip(lower=0.0)
             df["expected_rz_td_from_targets"] = (td_rate_rec * rz_targets).astype(np.float32)
@@ -1227,6 +1318,18 @@ class ModelTrainer:
                 opp = pd.to_numeric(df["expected_opportunities"], errors="coerce").fillna(0.0)
                 opp_safe = opp.replace(0, np.nan)
                 df["expected_td_rate_per_opportunity"] = (total_td / opp_safe).astype(np.float32)
+
+        td_components_moe: list[pd.Series] = []
+        for col in ("expected_td_from_targets_moe", "expected_td_from_carries_moe"):
+            if col in df.columns:
+                td_components_moe.append(pd.to_numeric(df[col], errors="coerce").fillna(0.0))
+        if td_components_moe:
+            total_td_moe = td_components_moe[0]
+            for comp in td_components_moe[1:]:
+                total_td_moe = total_td_moe.add(comp, fill_value=0.0)
+            total_td_moe = total_td_moe.clip(lower=0.0)
+            df["expected_td_count_structural_moe"] = total_td_moe.astype(np.float32)
+            df["expected_td_prob_structural_moe"] = (1.0 - np.exp(-total_td_moe)).astype(np.float32)
 
         def _expected_red_zone(base_col: str, share_col: str | None, out_col: str) -> None:
             if base_col in df.columns and share_col:
@@ -1266,6 +1369,10 @@ class ModelTrainer:
         _expected_red_zone("expected_targets_raw", rz_target_share, "expected_rz_targets_raw")
         _expected_red_zone("expected_carries", rz_carry_share, "expected_rz_carries")
         _expected_red_zone("expected_carries_raw", rz_carry_share, "expected_rz_carries_raw")
+        _expected_red_zone("expected_targets_moe", rz_target_share, "expected_rz_targets_moe")
+        _expected_red_zone("expected_targets_raw_moe", rz_target_share, "expected_rz_targets_raw_moe")
+        _expected_red_zone("expected_carries_moe", rz_carry_share, "expected_rz_carries_moe")
+        _expected_red_zone("expected_carries_raw_moe", rz_carry_share, "expected_rz_carries_raw_moe")
 
         def _team_factor(rate_col: str | None, out_col: str) -> None:
             if rate_col and rate_col in df.columns:
@@ -1759,6 +1866,27 @@ class ModelTrainer:
         if not source_col:
             raise ValueError(f"Problem '{problem_name}' missing source_col for derived target.")
         
+        # Optional non-shift transforms.
+        # This is used for horizon-safe labels (e.g. availability_active = 1 - is_inactive).
+        transform = str(derived_cfg.get("transform") or "").strip().lower()
+        if transform:
+            if source_col not in df.columns:
+                raise ValueError(
+                    f"Problem '{problem_name}' cannot derive target; '{source_col}' not in frame."
+                )
+            if transform == "invert_binary":
+                src = pd.to_numeric(df[source_col], errors="coerce")
+                if src.isna().any():
+                    raise ValueError(
+                        f"Problem '{problem_name}' derived target '{target_col}' has nulls in '{source_col}'."
+                    )
+                src01 = (src.astype(float) != 0.0).astype(np.float32)
+                df[target_col] = (1.0 - src01).astype(np.float32)
+                return df
+            raise ValueError(
+                f"Problem '{problem_name}' unsupported derived_target transform: {transform}"
+            )
+
         external_source = derived_cfg.get("external_source")
         if external_source == "game_by_week":
              actuals = self._ensure_team_game_actuals()
@@ -2289,12 +2417,72 @@ class ModelTrainer:
         """
         Compute per-row sample weights via shared helper.
         """
-        return compute_sample_weights_util(
+        sw = compute_sample_weights_util(
             df=df,
             base_cfg=self.sample_weight_cfg,
             problem_cfg=problem_config,
             target_col=self.target_col,
         )
+        # Opportunity-weighted td_conv_* fitting:
+        # td_per_target_label and td_per_carry_label are rate labels. To prevent
+        # tiny-denominator rows (e.g., 1 target) from dominating, weight rows by
+        # their opportunity count. This is explicit math (no imputation).
+        p = str(problem_config.get("name") or "")
+        if p == "td_conv_rec":
+            if "target" not in df.columns:
+                raise KeyError("td_conv_rec requires 'target' column for opportunity-weighted sample_weight.")
+            tgt = pd.to_numeric(df["target"], errors="coerce").fillna(0.0).astype(np.float32)
+            sw = sw.astype(np.float32, copy=False) * tgt
+        elif p == "td_conv_rush":
+            if "carry" not in df.columns:
+                raise KeyError("td_conv_rush requires 'carry' column for opportunity-weighted sample_weight.")
+            car = pd.to_numeric(df["carry"], errors="coerce").fillna(0.0).astype(np.float32)
+            sw = sw.astype(np.float32, copy=False) * car
+        return sw.astype(np.float32, copy=False)
+
+    # -------------------------------------------------------------------------
+    # Stage gating (training-time).
+    #
+    # The user wants conditional models:
+    # - snaps is "given active"
+    # - usage is "given snaps > 0"
+    # - efficiency / td_conv are "given usage > 0"
+    #
+    # Training implementation:
+    # - keep rows present so downstream merges remain key-complete,
+    # - set sample_weight=0 for rows failing the gate so they do not influence fit.
+    # -------------------------------------------------------------------------
+    def _label_gate_mask(self, df: pd.DataFrame, problem_name: str) -> pd.Series:
+        """Boolean mask of rows eligible for this stage (label-based)."""
+        if df is None or df.empty:
+            return pd.Series([], dtype=bool, index=getattr(df, "index", None))
+        idx = df.index
+        p = str(problem_name or "")
+
+        gate = pd.Series(True, index=idx, dtype=bool)
+
+        if p == "snaps":
+            # Inactive players should not influence snaps fit.
+            if "is_inactive" in df.columns:
+                ina = pd.to_numeric(df["is_inactive"], errors="coerce").fillna(0.0).astype(float)
+                gate = (ina <= 0.0)
+        elif p in ("usage_targets", "usage_carries", "usage_target_yards"):
+            # Usage models are conditional on actually playing offensive snaps.
+            if "snaps_label" in df.columns:
+                snaps = pd.to_numeric(df["snaps_label"], errors="coerce").fillna(0.0).astype(float)
+                gate = (snaps > 0.0)
+        elif p in ("efficiency_rec_yards_air", "efficiency_rec_yards_yac", "efficiency_rec_yards", "td_conv_rec"):
+            # Receiving efficiency / receiving td conversion require targets.
+            if "target" in df.columns:
+                tgt = pd.to_numeric(df["target"], errors="coerce").fillna(0.0).astype(float)
+                gate = (tgt > 0.0)
+        elif p in ("efficiency_rush_yards", "efficiency_rush_success", "td_conv_rush"):
+            # Rushing efficiency / rushing td conversion require carries.
+            if "carry" in df.columns:
+                car = pd.to_numeric(df["carry"], errors="coerce").fillna(0.0).astype(float)
+                gate = (car > 0.0)
+
+        return gate.reindex(idx).fillna(False).astype(bool)
 
 
     def _initialize_team_total_config(self, problem_name: str, df_train: pd.DataFrame) -> None:
@@ -2471,6 +2659,26 @@ class ModelTrainer:
             y_tr, y_val = y.iloc[train_idx], y.iloc[val_idx]
             sw_tr = sample_weight.iloc[train_idx] if sample_weight is not None else None
             sw_val = sample_weight.iloc[val_idx] if sample_weight is not None else None
+
+            # Stage-gating support:
+            # sample_weight may contain 0s for rows that should not influence training.
+            # Filter those rows out for fitting/validation to avoid XGBoost base_score NaNs.
+            if sw_tr is not None:
+                keep_tr = (pd.to_numeric(sw_tr, errors="coerce").fillna(0.0).to_numpy() > 0.0)
+                if keep_tr.sum() == 0:
+                    logger.warning("OOF fold %d has no train rows after gating for %s; skipping fold.", fold + 1, problem_config["name"])
+                    continue
+                X_tr = X_tr.loc[X_tr.index[keep_tr]]
+                y_tr = y_tr.loc[y_tr.index[keep_tr]]
+                sw_tr = sw_tr.loc[sw_tr.index[keep_tr]]
+            if sw_val is not None:
+                keep_val = (pd.to_numeric(sw_val, errors="coerce").fillna(0.0).to_numpy() > 0.0)
+                if keep_val.sum() == 0:
+                    logger.info("OOF fold %d has no val rows after gating for %s; skipping val.", fold + 1, problem_config["name"])
+                    continue
+                X_val = X_val.loc[X_val.index[keep_val]]
+                y_val = y_val.loc[y_val.index[keep_val]]
+                sw_val = sw_val.loc[sw_val.index[keep_val]]
             
             model = get_model_instance(model_name, problem_config, base_params)
             
@@ -2508,9 +2716,20 @@ class ModelTrainer:
             else:
                 p = model.predict(X_val)
                 
-            oof_preds[val_idx] = p
+            # Assign back into the original oof vector
+            try:
+                oof_preds[np.asarray(val_idx, dtype=int)] = p
+            except Exception:
+                # Fallback: align by index (when we filtered by weight)
+                val_positions = X.index.get_indexer(X_val.index)
+                oof_preds[val_positions] = p
             logger.info(f"  Fold {fold+1}/{n_splits} complete. Val size: {len(val_idx)}")
             
+        # Fill gated-out rows with 0.0 so downstream merges stay key-complete.
+        if sample_weight is not None:
+            sw_all = pd.to_numeric(sample_weight, errors="coerce").fillna(0.0).to_numpy()
+            oof_preds[sw_all <= 0.0] = 0.0
+
         return oof_preds
 
     def _generate_oof_predictions_moe(
@@ -2648,6 +2867,23 @@ class ModelTrainer:
             train_mask_all[train_idx] = True
             val_mask_all[val_idx] = True
 
+            # Stage-gating support via sample_weight:
+            # If sample_weight has 0s, those rows must not be used for training/prediction.
+            if sample_weight is not None:
+                sw_all = pd.to_numeric(sample_weight, errors="coerce").fillna(0.0).to_numpy()
+                train_mask_all = train_mask_all & (sw_all > 0.0)
+                val_mask_all = val_mask_all & (sw_all > 0.0)
+                if train_mask_all.sum() == 0 or val_mask_all.sum() == 0:
+                    logger.warning(
+                        "MoE OOF fold %d/%d has no rows after gating for %s (train=%d, val=%d). Skipping fold.",
+                        fold + 1,
+                        n_splits,
+                        problem_name,
+                        int(train_mask_all.sum()),
+                        int(val_mask_all.sum()),
+                    )
+                    continue
+
             # Fit per-position models and predict their own val slices.
             trained_models: dict[str, object] = {}
 
@@ -2719,6 +2955,11 @@ class ModelTrainer:
                 oof_preds[unknown_val_mask] = np.asarray(p, dtype=np.float32)
 
             logger.info("  MoE OOF fold %d/%d complete. Val size: %d", fold + 1, n_splits, int(val_mask_all.sum()))
+
+        # Fill gated-out rows with 0.0 so downstream merges stay key-complete.
+        if sample_weight is not None:
+            sw_all = pd.to_numeric(sample_weight, errors="coerce").fillna(0.0).to_numpy()
+            oof_preds[sw_all <= 0.0] = 0.0
 
         return oof_preds
 
@@ -3361,7 +3602,7 @@ class ModelTrainer:
                 # 3) Evaluate on test
                 logger.info("Evaluating regression metrics on hold-out test set…")
                 y_pred = model.predict(X_test)
-                if problem_name == "availability":
+                if str(problem_name).startswith("availability_"):
                     try:
                         aligned_test = df_test_full.loc[X_test.index] if not df_test_full.empty else df_test_full
                     except Exception:
@@ -3958,6 +4199,22 @@ class ModelTrainer:
                         prelim_features = [c for c in prelim_features if c not in feature_blacklist]
                     # Use group_col (game_id) from config
                     needed_cols = list({self.time_col, self.group_col, *target_load_cols, *prelim_features})
+
+            # Ensure gating label columns are available for conditional stage training.
+            # These columns are NOT used as model features unless explicitly included by config.
+            if needed_cols is not None and all_parquet_cols is not None:
+                gate_cols: list[str] = []
+                if problem_name == "snaps":
+                    gate_cols = ["is_inactive"]
+                elif problem_name in ("usage_targets", "usage_carries", "usage_target_yards"):
+                    gate_cols = ["snaps_label"]
+                elif problem_name in ("efficiency_rec_yards_air", "efficiency_rec_yards_yac", "efficiency_rec_yards", "td_conv_rec"):
+                    gate_cols = ["target"]
+                elif problem_name in ("efficiency_rush_yards", "efficiency_rush_success", "td_conv_rush"):
+                    gate_cols = ["carry"]
+                for c in gate_cols:
+                    if c in all_parquet_cols and c not in needed_cols:
+                        needed_cols.append(c)
             
             # Always ensure player_id is present for prediction tracking/merging
             if "player_id" not in needed_cols:
@@ -4004,6 +4261,20 @@ class ModelTrainer:
                 df_problem = df_problem.loc[:, ~df_problem.columns.duplicated()]
 
             df_problem = self._apply_problem_level_overrides(df_problem, problem_copy)
+
+            # ------------------------
+            # Audits (correctness-critical; no silent defaults)
+            # ------------------------
+            audit_dir = (self.metric_dir / self.run_id / "audits")
+            try:
+                audit_horizon_knownness(df_problem, out_dir=audit_dir)
+            except Exception as exc:
+                logger.warning("Horizon knownness audit failed for %s: %s", problem_name, exc)
+
+            if problem_name in ("td_conv_rec", "td_conv_rush"):
+                # Fail loudly if labels are inconsistent with structural math.
+                audit_td_conv_labels(df_problem, out_dir=audit_dir, raise_on_fail=True)
+
             df_problem = require_target_column(
                 df_problem,
                 self.target_col,
@@ -4042,6 +4313,18 @@ class ModelTrainer:
 
                 df_problem = self._inject_composed_features(df_problem)
 
+                # Chain-level observability per horizon (inputs side).
+                if problem_name in ("anytime_td_structured", "anytime_td"):
+                    try:
+                        diag_dir = (self.metric_dir / self.run_id / "diagnostics")
+                        diag_dir.mkdir(parents=True, exist_ok=True)
+                        summary = summarize_chain_diagnostics(df_problem)
+                        (diag_dir / f"chain_inputs_{problem_name}.json").write_text(
+                            json.dumps(summary, indent=2)
+                        )
+                    except Exception as exc:
+                        logger.warning("Failed to write chain diagnostics for %s: %s", problem_name, exc)
+
                 # STRICT STACKING: upstream OOF predictions are not defined for the earliest
                 # time blocks (no prior data to train on without peeking). Those rows must be
                 # excluded from downstream stacked training rather than imputed.
@@ -4076,6 +4359,10 @@ class ModelTrainer:
             allow_exact.update(input_preds or [])
             if self.target_col:
                 allow_exact.add(self.target_col)
+            # Allow gating label columns through leak guard (used for stage gating, not features).
+            for c in ("is_inactive", "snaps_label", "target", "carry"):
+                if c in df_problem.columns:
+                    allow_exact.add(c)
             df_problem, leak_info = enforce_leak_guard(
                 df_problem,
                 policy=DEFAULT_LEAK_POLICY,
@@ -4175,6 +4462,42 @@ class ModelTrainer:
                 df_train_full = df_train_full.sort_values([self.time_col, self.group_col]).reset_index(drop=True)
             X_train_full, y_train_full = self._apply_feature_artifacts(df_train_full, problem_name)
             sample_weight_train_full = self._compute_sample_weights(df_train_full, problem_copy)
+
+            # -----------------------------------------------------------------
+            # Apply stage-gating to sample weights (training-time conditional models).
+            # Rows that fail the gate remain in the frames (for key completeness),
+            # but receive weight=0 so they do not influence fit/OOF.
+            # -----------------------------------------------------------------
+            try:
+                gate_train = self._label_gate_mask(df_train, problem_name)
+                gate_val = self._label_gate_mask(df_val, problem_name) if not df_val.empty else pd.Series([], dtype=bool)
+                gate_test = self._label_gate_mask(df_test, problem_name) if not df_test.empty else pd.Series([], dtype=bool)
+                gate_train_full = self._label_gate_mask(df_train_full, problem_name)
+
+                # Record gate coverage for diagnostics
+                self._gates = getattr(self, "_gates", {})
+                self._gates[problem_name] = {
+                    "train_gate_rate": float(gate_train.mean()) if len(gate_train) else None,
+                    "val_gate_rate": float(gate_val.mean()) if len(gate_val) else None,
+                    "test_gate_rate": float(gate_test.mean()) if len(gate_test) else None,
+                    "train_full_gate_rate": float(gate_train_full.mean()) if len(gate_train_full) else None,
+                }
+
+                if sample_weight_train is not None and len(sample_weight_train) == len(gate_train):
+                    sample_weight_train = sample_weight_train.astype(np.float32, copy=False) * gate_train.astype(np.float32)
+                if sample_weight_val is not None and (not df_val.empty) and len(sample_weight_val) == len(gate_val):
+                    sample_weight_val = sample_weight_val.astype(np.float32, copy=False) * gate_val.astype(np.float32)
+                if sample_weight_train_full is not None and len(sample_weight_train_full) == len(gate_train_full):
+                    sample_weight_train_full = sample_weight_train_full.astype(np.float32, copy=False) * gate_train_full.astype(np.float32)
+
+                # For evaluation, restrict the displayed / metric slice to gated rows.
+                # (This keeps metrics meaningful for conditional models.)
+                if not df_test.empty and len(gate_test) == len(df_test):
+                    X_test = X_test.loc[gate_test.values]
+                    y_test = y_test.loc[gate_test.values]
+                    df_test = df_test.loc[gate_test.values].reset_index(drop=True)
+            except Exception as exc:
+                logger.warning("Failed to apply stage gating weights for %s: %s", problem_name, exc)
 
             self._sample_weights[problem_name] = {
                 "train": sample_weight_train,
@@ -4311,12 +4634,17 @@ class ModelTrainer:
                     model_key = f"{problem_name}_xgboost"
                     if model_key in self.models:
                         global_model = self.models[model_key]
-                        if hasattr(global_model, "predict_proba"):
-                            global_preds = global_model.predict_proba(X_test)
-                            if global_preds.ndim > 1:
-                                global_preds = global_preds[:, 1]
+                        # In production mode (or very small windows) the hold-out slice is empty.
+                        # Skip comparison entirely if there is no test matrix to score.
+                        if X_test is None or (hasattr(X_test, "empty") and X_test.empty):
+                            global_preds = None
                         else:
-                            global_preds = global_model.predict(X_test)
+                            if hasattr(global_model, "predict_proba"):
+                                global_preds = global_model.predict_proba(X_test)
+                                if global_preds.ndim > 1:
+                                    global_preds = global_preds[:, 1]
+                            else:
+                                global_preds = global_model.predict(X_test)
                         
                         # IMPORTANT: If MoE models were trained with a MoE-specific feature schema
                         # (e.g., using `pred_<upstream>_moe` inputs), we must evaluate MoE using
@@ -4324,10 +4652,11 @@ class ModelTrainer:
                         # feature_names mismatch and the comparison is invalid.
                         X_test_for_moe = X_test_moe if "X_test_moe" in locals() else X_test
 
-                        comparison = self._compare_global_vs_moe(
-                            problem_name, X_test_for_moe, y_test, df_test, global_preds, task_type
-                        )
-                        self.moe_comparison_results[problem_name]["comparison"] = comparison
+                        if global_preds is not None:
+                            comparison = self._compare_global_vs_moe(
+                                problem_name, X_test_for_moe, y_test, df_test, global_preds, task_type
+                            )
+                            self.moe_comparison_results[problem_name]["comparison"] = comparison
         
         # --- NEW: build composite & team conformal sum artifacts after all problems trained ---
             # Generate and store predictions for downstream models.
@@ -4426,7 +4755,7 @@ class ModelTrainer:
                                 logger.warning("Failed GLOBAL OOF injection via keys for %s: %s", problem_name, e)
 
                         raw_preds = preds.copy()
-                        if problem_name == "availability":
+                        if str(problem_name).startswith("availability_"):
                             preds = self._apply_availability_guards(df_problem, preds)
                         # Apply post-processing cap for snaps predictions
                         # Cap low-usage players (max_snap_pct < 0.25) to ceiling * 1.5
@@ -4477,7 +4806,7 @@ class ModelTrainer:
                                 except Exception as e:
                                     logger.warning("Failed MoE OOF injection via keys for %s: %s", problem_name, e)
 
-                            if problem_name == "availability":
+                            if str(problem_name).startswith("availability_"):
                                 moe_preds = self._apply_availability_guards(df_problem, moe_preds)
                             if problem_name == "snaps":
                                 moe_preds = self._apply_snaps_ceiling_cap(df_problem, moe_preds)
@@ -4489,6 +4818,25 @@ class ModelTrainer:
                                 moe_preds = self._apply_usage_target_yards_position_cap(df_problem, moe_preds)
                             if problem_name == "efficiency_rec_yards_air":
                                 moe_preds = self._apply_efficiency_rec_yards_air_cap(df_problem, moe_preds)
+
+                        # -----------------------------------------------------------------
+                        # Training-time stage gating: programmatically skip downstream models
+                        # for ineligible rows and set their predictions to 0.0.
+                        #
+                        # This keeps downstream merges key-complete and matches inference
+                        # behavior (where gated rows never get passed through the model).
+                        # -----------------------------------------------------------------
+                        try:
+                            gate_full = self._label_gate_mask(df_problem, problem_name)
+                            df_problem[f"gate_{problem_name}_global"] = gate_full.astype(np.int8)
+                            preds = np.asarray(preds, dtype=float)
+                            preds[~gate_full.to_numpy()] = 0.0
+                            if moe_preds is not None:
+                                df_problem[f"gate_{problem_name}_moe"] = gate_full.astype(np.int8)
+                                moe_preds = np.asarray(moe_preds, dtype=float)
+                                moe_preds[~gate_full.to_numpy()] = 0.0
+                        except Exception as exc:
+                            logger.warning("Failed to apply training-time stage gating for %s: %s", problem_name, exc)
                         # Store
                         pred_col = f"pred_{problem_name}"
                         # Ensure we have the keys
@@ -4499,7 +4847,7 @@ class ModelTrainer:
                         else:
                             out_df = df_problem[key_cols].copy()
                             out_df[pred_col] = preds
-                            if problem_name == "availability":
+                            if str(problem_name).startswith("availability_"):
                                 out_df[f"{pred_col}_raw"] = raw_preds
                             if moe_preds is not None:
                                 out_df[f"{pred_col}_moe"] = moe_preds
